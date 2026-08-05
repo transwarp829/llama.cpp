@@ -15,6 +15,9 @@ __kernel void kernel_moe_histogram(
     }
 
     int expert_id = input[n * n_experts + k];
+    if (expert_id == -1) { // skipped slot, owned by no expert
+        return;
+    }
     atomic_inc(&hist[expert_id]);
 }
 
@@ -57,6 +60,9 @@ __kernel void kernel_moe_scatter(
     }
 
     int val = input[n * n_experts + k];
+    if (val == -1) { // skipped slot, owned by no expert
+        return;
+    }
 
     int local_slot = atomic_inc(&slot_counter[val]);
 
@@ -138,6 +144,7 @@ __kernel void kernel_moe_scatter_stable(
             running += scan[63];
         }
         barrier(CLK_LOCAL_MEM_FENCE);
+
     }
 }
 
@@ -153,3 +160,29 @@ __kernel void kernel_moe_fill(
         post_router[tile_id * tile_size + vec_id_in_tile] = 0xFFFFFFFF;
     }
 }
+
+__kernel void kernel_moe_zero_dst(
+    __global const int * input,
+    __global float * dst,
+    uint N,
+    uint topK,
+    uint n_experts,
+    uint ne0
+) {
+    uint n = get_global_id(0);
+    uint k = get_global_id(1);
+
+    if (n >= N || k >= topK) {
+        return;
+    }
+
+    if (input[n * n_experts + k] != -1) {
+        return;
+    }
+
+    __global float * dst_row = dst + ((ulong)n * topK + k) * ne0;
+    for (uint i = get_local_id(2); i < ne0; i += get_local_size(2)) {
+        dst_row[i] = 0.0f;
+    }
+}
+
