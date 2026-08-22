@@ -1800,9 +1800,21 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
 
         if (!sched->callback_eval) {
+            const int64_t t0 = ggml_time_us();
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;
+            }
+            if (sched->debug >= 2) {
+                // sync to get the real duration of async backends (GPU)
+                // this adds per-split sync latency (~20-50 us), acceptable for profiling
+                ggml_backend_synchronize(split_backend);
+                const int64_t dt_us = ggml_time_us() - t0;
+                GGML_LOG_DEBUG("sched_split #%03d: %-8s nodes [%4d,%4d) %-24s %9.3f ms\n",
+                        split_id, ggml_backend_name(split_backend),
+                        split->i_start, split->i_end,
+                        split->graph.n_nodes > 0 ? split->graph.nodes[0]->name : "",
+                        dt_us / 1000.0);
             }
         } else {
             // similar to ggml_backend_compare_graph_backend
