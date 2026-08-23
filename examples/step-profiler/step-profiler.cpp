@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <clocale>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -21,10 +22,14 @@
 //   <prefix>.summary.csv          - per step: wall, attention, expert, router, gap, ...
 //   <prefix>.expert-per-layer.csv - per step per layer: routed expert matmul time
 //   <prefix>.attn-per-layer.csv   - per step per layer: attention time
+//   <prefix>.routing.csv          - per step per layer: activated expert ids (for cache sizing)
 //
 // prefix: env STEP_PROFILE_OUT, default "step-profile"
 //
 // usage: llama-step-profiler -m model.gguf -p "prompt" -n 100 [-t N] [-ngl N] [--cpu-moe]
+//
+// note: the callback forces the per-node compute path, so timings are contaminated
+// (CUDA graphs disabled). routing data is timing-independent and still valid.
 
 enum step_cat {
     CAT_ATTN,
@@ -60,6 +65,9 @@ struct profiler_data {
     int64_t n_layers = 0;
     std::vector<step_record> steps;
     int64_t t_node_start_us = 0;
+    std::ofstream * f_routing = nullptr;  // routing trace CSV (step,layer,expert_ids)
+    int last_routing_step = -1;           // dedupe: last captured (step, layer)
+    int last_routing_layer = -1;
 };
 
 // layer index from node name like "ffn_moe_up-3", -1 if none
@@ -126,6 +134,28 @@ static bool cb_eval(ggml_tensor * t, bool ask, void * user_data) {
         } else if (cat == CAT_ATTN) {
             if (layer >= 0 && layer < (int) data->n_layers) {
                 s.layer_attn_ms[layer] += dur_ms;
+            }
+        }
+
+        // capture activated expert ids from MUL_MAT_ID inputs (once per step/layer)
+        // ggml_mul_mat_id(ctx, as, b, ids) -> src[2] = selected expert indices
+        if (t->op == GGML_OP_MUL_MAT_ID && data->f_routing != nullptr && t->src[2] != nullptr) {
+            const int cur_step = (int) data->steps.size() - 1;
+            if (layer >= 0 && layer < (int) data->n_layers &&
+                (cur_step != data->last_routing_step || layer != data->last_routing_layer)) {
+                const ggml_tensor * ids = t->src[2];
+                const int64_t n = ids->ne[0] * ids->ne[1]; // [n_expert_used, n_tokens]
+                std::vector<int32_t> buf(n > 0 ? n : 1, 0);
+                ggml_backend_tensor_get(ids, buf.data(), 0, n * sizeof(int32_t));
+                auto & fout = *data->f_routing;
+                fout << cur_step << "," << layer;
+                for (int64_t i = 0; i < n; ++i) {
+                    fout << "," << buf[i];
+                }
+                fout << "\n";
+                fout.flush();
+                data->last_routing_step = cur_step;
+                data->last_routing_layer = layer;
             }
         }
     }
@@ -240,6 +270,7 @@ int main(int argc, char ** argv) {
     const std::string f_summary = std::string(prefix) + ".summary.csv";
     const std::string f_expert  = std::string(prefix) + ".expert-per-layer.csv";
     const std::string f_attn    = std::string(prefix) + ".attn-per-layer.csv";
+    const std::string f_routing = std::string(prefix) + ".routing.csv";
 
     std::ofstream fout(f_summary);
     if (!fout) {
@@ -252,6 +283,15 @@ int main(int argc, char ** argv) {
         fout << "," << cat_names[c];
     }
     fout << ",n_nodes,n_mm_id\n";
+
+    std::ofstream f_rout(f_routing);
+    if (!f_rout) {
+        LOG_ERR("failed to open %s\n", f_routing.c_str());
+        return 1;
+    }
+    f_rout << "step,layer,expert_ids\n";
+    f_rout.flush();
+    data.f_routing = &f_rout;
 
     auto * smpl = common_sampler_init(model, params.sampling);
 
