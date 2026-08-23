@@ -19,6 +19,8 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <algorithm>
+#include <cstdlib>
 
 //
 // llama_context
@@ -138,6 +140,20 @@ llama_context::llama_context(
 
     cparams.cb_eval           = params.cb_eval;
     cparams.cb_eval_user_data = params.cb_eval_user_data;
+
+    cparams.expert_cache = params.expert_cache;
+    if (cparams.expert_cache) {
+        expert_cache.enabled = true;
+        expert_cache.init(cparams.n_seq_max, hparams.n_layer());
+        expert_cache.dump_open();
+        // stage 2+: the model-level aggregator owns the pool; stage 1 only
+        // collects window statistics and mirrors them here
+        model.expert_cache.enabled = true;
+        // bridge the user eval callback through our wrapper (routing capture)
+        cb_eval_user.ctx = this;
+        cb_eval_user.user_cb = cparams.cb_eval;
+        cb_eval_user.user_data = cparams.cb_eval_user_data;
+    }
 
     cparams.ctx_other = nullptr;
 
@@ -481,6 +497,8 @@ llama_context::llama_context(
 llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
+
+    expert_cache.dump_close();
 
     if (!model.hparams.no_alloc) {
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
@@ -1351,7 +1369,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         res->reset();
 
         ggml_backend_sched_reset(sched.get());
-        ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+        if (expert_cache.enabled) {
+            ggml_backend_sched_set_eval_callback(sched.get(), &llama_context::cb_eval_wrapper, &cb_eval_user);
+        } else {
+            ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+        }
 
         //const auto t_start_us = ggml_time_us();
 
@@ -1813,7 +1835,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         ggml_status status;
 
+        // expose the current ubatch to the eval-callback bridge (routing capture)
+        ctx_ubatch       = &ubatch;
+        last_ec_ids      = nullptr;
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
+        ctx_ubatch       = nullptr;
 
         if (!res) {
             // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
@@ -1850,6 +1876,16 @@ int llama_context::decode(const llama_batch & batch_inp) {
         //if (n_past%100 == 0) {
         //    ggml_graph_dump_dot(gf, NULL, "llama.dot");
         //}
+
+        // expert cache: flush accounting (routing capture happens in the sched
+        // eval callback, see cb_eval_wrapper - the ids tensor buffers are only
+        // valid right after each op runs, not after the whole graph)
+        if (expert_cache.enabled) {
+            expert_cache.tokens_since_flush += (int32_t) ubatch.n_tokens;
+            if (expert_cache.tokens_since_flush >= expert_cache.K) {
+                expert_cache.flush_to_aggregator(model.expert_cache);
+            }
+        }
 
         auto * t_logits  = res->get_logits();
         auto * t_embd    = cparams.embeddings       ? res->get_embd()     : nullptr;
@@ -3502,6 +3538,66 @@ void llama_context::opt_epoch(
     llama_batch_free(batch);
 }
 
+// expert cache: sched eval-callback bridge
+//
+// captures routing ids right after each MUL_MAT_ID op runs (the ids tensor
+// buffer is only valid then; afterwards the allocator may reuse it), then
+// forwards to the user callback (e.g. step-profiler's routing capture).
+bool llama_context::cb_eval_wrapper(ggml_tensor * t, bool ask, void * user_data) {
+    llama_cb_eval_ctx * cb = (llama_cb_eval_ctx *) user_data;
+    llama_context * ctx = cb->ctx;
+
+    if (!ask && t->op == GGML_OP_MUL_MAT_ID && t->src[2] != nullptr && ctx->expert_cache.enabled) {
+        ctx->expert_cache_record_node(t);
+    }
+
+    if (cb->user_cb != nullptr) {
+        return cb->user_cb(t, ask, cb->user_data);
+    }
+    return true;
+}
+
+void llama_context::expert_cache_record_node(ggml_tensor * node) {
+    const ggml_tensor * ids_t = node->src[2];
+
+    if (ids_t == last_ec_ids) {
+        return; // gate/up/down share the same ids tensor
+    }
+    last_ec_ids = ids_t;
+
+    const int32_t n_used    = ids_t->ne[0];
+    const int64_t n_tok_ids = ids_t->ne[1];
+    const int64_t n_expert  = node->src[0]->ne[2];
+
+    // layer index from the expert weight tensor name: "blk.<N>.*"
+    const char * wname = node->src[0]->name;
+    const int il = (strncmp(wname, "blk.", 4) == 0 &&
+                    wname[4] >= '0' && wname[4] <= '9') ? atoi(wname + 4) : -1;
+    if (il < 0) {
+        return;
+    }
+
+    std::vector<int32_t> ids_cpu;
+    ids_cpu.resize((size_t) ids_t->ne[0] * ids_t->ne[1]);
+    ggml_backend_tensor_get(ids_t, ids_cpu.data(), 0, ids_cpu.size() * sizeof(int32_t));
+    const int32_t * data = ids_cpu.data();
+
+    const llama_ubatch * ub = ctx_ubatch;
+    if (ub != nullptr && ub->n_tokens == n_tok_ids) {
+        for (uint32_t j = 0; j < ub->n_tokens; ++j) {
+            const int32_t ns = ub->n_seq_id != nullptr ? ub->n_seq_id[j] : 1;
+            for (int32_t s = 0; s < ns; ++s) {
+                const llama_seq_id seq = ub->seq_id != nullptr ? ub->seq_id[j][s] : 0;
+                expert_cache.record(seq, il, data + (int64_t) j * n_used,
+                        1, n_used, n_expert);
+            }
+        }
+    } else {
+        // fallback: feed under seq 0 (should not happen for decoder graphs)
+        expert_cache.record(0, il, data, n_tok_ids, n_used, n_expert);
+    }
+}
+
 //
 // interface implementation
 //
@@ -3542,8 +3638,9 @@ llama_context_params llama_context_default_params() {
         /*.op_offload                  =*/ true,
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
-        /*.sampler                     =*/ nullptr,
-        /*.n_sampler                   =*/ 0,
+        /*.expert_cache                =*/ false,
+        /*.samplers                    =*/ nullptr,
+        /*.n_samplers                  =*/ 0,
         /*.ctx_other                   =*/ nullptr,
     };
 

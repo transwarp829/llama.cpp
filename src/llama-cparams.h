@@ -53,6 +53,7 @@ struct llama_cparams {
     bool op_offload;
     bool kv_unified;
     bool pipeline_parallel;
+    bool expert_cache;       // collect per-seq expert routing window statistics
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
 

@@ -6,6 +6,7 @@
 #include "llama-hparams.h"
 #include "llama-memory.h"
 #include "llama-vocab.h"
+#include "llama-expert-cache.h"
 
 #include <map>
 #include <memory>
@@ -590,6 +591,11 @@ struct llama_model {
 
     llama_hparams hparams = {};
     llama_vocab   vocab;
+
+    // expert cache aggregator (stage 2+: global pool snapshot / gate / LUT)
+    // statistical side state, not model data; writable even when the model
+    // is accessed through a const reference (llama_context holds one)
+    mutable llama_model_expert_cache expert_cache;
 
     // for classifier models
     std::vector<std::string> classifier_labels;
