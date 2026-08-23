@@ -7,6 +7,7 @@
 #include "llama-adapter.h"
 #include "llama-impl.h"
 #include "llama-memory.h"
+#include "llama-expert-cache.h"
 
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
@@ -280,6 +281,24 @@ private:
     const llama_model & model;
 
     llama_cparams cparams;
+
+    // expert routing window statistics (stage 1 of the expert cache)
+    llama_context_expert_cache expert_cache;
+
+    // eval-callback bridge: captures routing ids inside the sched eval
+    // callback (right after each op runs, before buffers are reused) and
+    // forwards to the user-provided callback (e.g. step-profiler)
+    struct llama_cb_eval_ctx {
+        llama_context * ctx = nullptr;
+        ggml_backend_sched_eval_callback user_cb = nullptr;
+        void * user_data = nullptr;
+    };
+    llama_cb_eval_ctx cb_eval_user;
+    const llama_ubatch * ctx_ubatch = nullptr; // current ubatch, set for the callback
+    const ggml_tensor * last_ec_ids = nullptr; // dedupe: gate/up/down share the ids tensor
+
+    static bool cb_eval_wrapper(ggml_tensor * t, bool ask, void * user_data);
+    void expert_cache_record_node(ggml_tensor * node);
 
     llama_adapter_cvec_ptr  cvec;
     llama_adapter_loras_ptr loras;
