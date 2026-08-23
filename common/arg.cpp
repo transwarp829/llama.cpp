@@ -1692,6 +1692,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_SWA_FULL"));
     add_opt(common_arg(
+        {"--expert-cache"},
+        "collect per-seq expert routing window statistics (expert cache stage 1)",
+        [](common_params & params) {
+            params.expert_cache = true;
+        }
+    ));
+    add_opt(common_arg(
         {"-ctxcp", "--ctx-checkpoints", "--swa-checkpoints"}, "N",
         string_format("max number of context checkpoints to create per slot (default: %d)"
             "[(more info)](https://github.com/ggml-org/llama.cpp/pull/15293)", params.n_ctx_checkpoints),
