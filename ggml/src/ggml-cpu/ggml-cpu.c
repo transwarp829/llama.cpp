@@ -1548,7 +1548,8 @@ static void * incr_ptr_aligned(void ** p, size_t size, size_t align) {
 
 static void ggml_compute_forward_mul_mat_id(
         const struct ggml_compute_params * params,
-              struct ggml_tensor * dst) {
+              struct ggml_tensor * dst,
+        const uint8_t * cold_mask) {
 
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
@@ -1671,6 +1672,13 @@ static void ggml_compute_forward_mul_mat_id(
                     continue;
                 }
 
+                if (cold_mask != NULL && cold_mask[i02] == 0) {
+                    // expert is handled by the warm path: zero the output row, skip compute
+                    float * dst_col = (float *) ((char *) dst->data + id*dst->nb[1] + iid1*dst->nb[2]);
+                    memset(dst_col, 0, dst->ne[0]*sizeof(float));
+                    continue;
+                }
+
                 MMID_MATRIX_ROW(i02, matrix_row_counts[i02]) = (struct mmid_row_mapping) {id, iid1};
                 matrix_row_counts[i02] += 1;
             }
@@ -1755,6 +1763,13 @@ static void ggml_compute_forward_mul_mat_id(
 }
 
 /////////////////////////////////
+
+static void ggml_compute_forward_mul_mat_id_cold(
+        const struct ggml_compute_params * params,
+              struct ggml_tensor * dst) {
+    const struct ggml_tensor * cold_mask = dst->src[3];
+    ggml_compute_forward_mul_mat_id(params, dst, (const uint8_t *) cold_mask->data);
+}
 
 static void ggml_compute_forward(struct ggml_compute_params * params, struct ggml_tensor * tensor) {
     GGML_ASSERT(params);
@@ -1887,7 +1902,11 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             } break;
         case GGML_OP_MUL_MAT_ID:
             {
-                ggml_compute_forward_mul_mat_id(params, tensor);
+                ggml_compute_forward_mul_mat_id(params, tensor, NULL);
+            } break;
+        case GGML_OP_MUL_MAT_ID_COLD:
+            {
+                ggml_compute_forward_mul_mat_id_cold(params, tensor);
             } break;
         case GGML_OP_OUT_PROD:
             {
@@ -2378,6 +2397,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_CONCAT:
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
+        case GGML_OP_MUL_MAT_ID_COLD:
         case GGML_OP_OUT_PROD:
             {
                 n_tasks = n_threads;
@@ -2913,6 +2933,7 @@ struct ggml_cplan ggml_graph_plan(
                         }
                     } break;
                 case GGML_OP_MUL_MAT_ID:
+                case GGML_OP_MUL_MAT_ID_COLD:
                     {
                         cur = 0;
                         const struct ggml_tensor * src0 = node->src[0];
