@@ -376,11 +376,14 @@ void llama_expert_pool_delegate_begin(
         st.mini_submitted = true;
         st.mini_submitted_il = il;
 
-        // accumulate per-step statistics (delegate runs on the ith==0 thread only)
-        st.s_submits    += 1;
-        st.s_getset_us  += (uint64_t) (dbg_t2 - dbg_t1);
-        st.s_ids_us     += (uint64_t) (dbg_t3 - dbg_t2);
-        st.s_comp_us    += (uint64_t) (ggml_time_us() - dbg_t3);
+        // accumulate per-layer statistics (delegate runs on the ith==0 thread only)
+        if ((size_t) ilx < st.s_layer.size()) {
+            st.s_layer[ilx].submits   += 1;
+            st.s_layer[ilx].miss_rows += (uint64_t) (ids->ne[0] - st.n_hit);
+            st.s_layer[ilx].getset_us += (uint64_t) (dbg_t2 - dbg_t1);
+            st.s_layer[ilx].ids_us    += (uint64_t) (dbg_t3 - dbg_t2);
+            st.s_layer[ilx].comp_us   += (uint64_t) (ggml_time_us() - dbg_t3);
+        }
     }
 
     // a new layer starts a new submit round (reset the combined-graph flag)
@@ -422,10 +425,11 @@ void llama_expert_pool_delegate_end(ggml_tensor * dst, void * ud) {
         memcpy(dst_col, (float *) st.host_out + (size_t) i * (row_bytes / sizeof(float)), row_bytes);
     }
 
-    // accumulate per-step statistics (delegate runs on the ith==0 thread only)
-    st.s_delegates   += 1;
-    st.s_hit_rows    += st.n_hit;
-    st.s_sync_us     += (uint64_t) (dbg_t1 - dbg_t0);
-    st.s_get_us      += (uint64_t) (ggml_time_us() - dbg_t1);
+    // accumulate per-layer statistics (delegate runs on the ith==0 thread only)
+    if ((size_t) ilx < st.s_layer.size()) {
+        st.s_layer[ilx].hit_rows += (uint64_t) st.n_hit;
+        st.s_layer[ilx].sync_us  += (uint64_t) (dbg_t1 - dbg_t0);
+        st.s_layer[ilx].get_us   += (uint64_t) (ggml_time_us() - dbg_t1);
+    }
     st.n_hit = 0;
 }
