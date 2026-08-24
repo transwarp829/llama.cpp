@@ -330,6 +330,15 @@ void llama_expert_pool_delegate_begin(
         }
     }
     if (st.n_hit == 0) {
+        // no hit: the CPU kernel computes all rows. record the miss count
+        // exactly once per layer (both gate/up nodes call begin; the second
+        // begin of the layer must not double-count).
+        if (st.mini_submitted_il != il) {
+            if ((size_t) ilx < st.s_layer.size()) {
+                st.s_layer[ilx].miss_rows += (uint64_t) ids->ne[0];
+            }
+            st.mini_submitted_il = il;
+        }
         return; // nothing to delegate
     }
     if (st.host_buf == nullptr) {
