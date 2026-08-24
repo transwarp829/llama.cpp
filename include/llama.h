@@ -1636,12 +1636,15 @@ extern "C" {
             ggml_opt_epoch_callback   callback_eval);
 
     // expert-pool delegate statistics. the counters accumulate inside the CPU
-    // MUL_MAT_ID kernel hooks; this call returns the totals since the previous
-    // call (per-decode-step usage: call once after each llama_decode) and
-    // resets them.
-    struct llama_expert_pool_stats {
-        uint64_t submits;        // mini-graph submissions to the GPU
-        uint64_t hit_rows;       // expert rows computed by the GPU delegate
+    // MUL_MAT_ID kernel hooks, per pooled layer; this call returns the totals
+    // since the previous call (per-decode-step usage: call once after each
+    // llama_decode), fills up to max_layers entries ordered by pooled-layer
+    // position, and resets them. returns the number of layers written.
+    struct llama_expert_pool_layer_stats {
+        int32_t  layer;          // actual model layer number
+        uint64_t submits;        // mini-graph submissions for this layer
+        uint64_t hit_rows;       // rows computed by the GPU delegate
+        uint64_t miss_rows;      // rows computed by the CPU kernel
         uint64_t prep_getset_us; // cur copy H2D preparation time
         uint64_t prep_ids_us;    // ids scratch prepare + upload time
         uint64_t prep_comp_us;   // graph compute submission time
@@ -1649,8 +1652,8 @@ extern "C" {
         uint64_t end_get_us;     // end() D2H copy of hit rows
     };
 
-    // snapshot-and-reset; struct is zeroed when the pool is not active
-    LLAMA_API struct llama_expert_pool_stats llama_expert_pool_get_stats(struct llama_context * ctx);
+    LLAMA_API uint32_t llama_expert_pool_get_stats(struct llama_context * ctx,
+            struct llama_expert_pool_layer_stats * out, uint32_t max_layers);
 
 #ifdef __cplusplus
 }

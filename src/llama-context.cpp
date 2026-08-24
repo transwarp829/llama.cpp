@@ -706,6 +706,7 @@ void llama_context::expert_pool_init() {
     st.cold_mask_tab.resize(n_layer, nullptr);
     st.resident.resize(n_layer);
     st.pooled_layers = pooled_ils;
+    st.s_layer.resize(pooled_ils.size());
 
     // --- resident sets: csv seed or random ---
     bool ok = false;
@@ -4782,25 +4783,30 @@ llama_context * llama_get_ctx_other(struct llama_context * ctx) {
     return ctx->get_cparams().ctx_other;
 }
 
-extern "C" struct llama_expert_pool_stats llama_expert_pool_get_stats(struct llama_context * ctx) {
-    llama_expert_pool_stats s = {};
-    if (ctx != nullptr) {
-        s = ctx->expert_pool_stats_snapshot();
+extern "C" uint32_t llama_expert_pool_get_stats(struct llama_context * ctx,
+        struct llama_expert_pool_layer_stats * out, uint32_t max_layers) {
+    if (ctx == nullptr) {
+        return 0;
     }
-    return s;
+    return ctx->expert_pool_stats_snapshot(out, max_layers);
 }
 
-struct llama_expert_pool_stats llama_context::expert_pool_stats_snapshot() {
-    llama_expert_pool_stats s = {};
+uint32_t llama_context::expert_pool_stats_snapshot(llama_expert_pool_layer_stats * out, uint32_t max_layers) {
     llama_expert_pool_state & st = model.expert_pool_state;
-    s.submits        = st.s_submits;
-    s.hit_rows       = st.s_hit_rows;
-    s.prep_getset_us = st.s_getset_us;
-    s.prep_ids_us    = st.s_ids_us;
-    s.prep_comp_us   = st.s_comp_us;
-    s.end_sync_us    = st.s_sync_us;
-    s.end_get_us     = st.s_get_us;
-    st.s_submits = st.s_hit_rows = 0;
-    st.s_getset_us = st.s_ids_us = st.s_comp_us = st.s_sync_us = st.s_get_us = 0;
-    return s;
+    const uint32_t n = (uint32_t) std::min<size_t>(st.s_layer.size(), max_layers);
+    for (uint32_t i = 0; i < n; ++i) {
+        const llama_expert_pool_state::layer_delegate_stats & src = st.s_layer[i];
+        llama_expert_pool_layer_stats & d = out[i];
+        d.layer           = st.pooled_layers[i];
+        d.submits         = src.submits;
+        d.hit_rows        = src.hit_rows;
+        d.miss_rows       = src.miss_rows;
+        d.prep_getset_us  = src.getset_us;
+        d.prep_ids_us     = src.ids_us;
+        d.prep_comp_us    = src.comp_us;
+        d.end_sync_us     = src.sync_us;
+        d.end_get_us      = src.get_us;
+        memset(const_cast<llama_expert_pool_state::layer_delegate_stats *>(&src), 0, sizeof(src));
+    }
+    return n;
 }
