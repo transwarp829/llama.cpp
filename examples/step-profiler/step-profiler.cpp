@@ -299,6 +299,13 @@ int main(int argc, char ** argv) {
     f_rout.flush();
     data.f_routing = &f_rout;
 
+    std::ofstream f_deleg(std::string(prefix) + ".delegate.csv");
+    if (!f_deleg) {
+        LOG_ERR("failed to open %s\n", (std::string(prefix) + ".delegate.csv").c_str());
+        return 1;
+    }
+    f_deleg << "step,submits,hit_rows,prep_getset_us,prep_ids_us,prep_comp_us,end_sync_us,end_get_us\n";
+
     auto * smpl = common_sampler_init(model, params.sampling);
 
     // prompt step
@@ -331,6 +338,12 @@ int main(int argc, char ** argv) {
         }
         data.steps.back().wall_ms = (ggml_time_us() - t0) / 1000.0;
         write_row(fout, step, "decode", data.steps.back());
+
+        // expert-pool delegate statistics for this step (snapshot-and-reset)
+        const llama_expert_pool_stats ps = llama_expert_pool_get_stats(ctx);
+        f_deleg << step << ',' << ps.submits << ',' << ps.hit_rows << ','
+                << ps.prep_getset_us << ',' << ps.prep_ids_us << ',' << ps.prep_comp_us << ','
+                << ps.end_sync_us << ',' << ps.end_get_us << '\n';
         step++;
 
         cur = common_sampler_sample(smpl, ctx, -1);

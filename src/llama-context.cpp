@@ -4781,3 +4781,26 @@ llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * c
 llama_context * llama_get_ctx_other(struct llama_context * ctx) {
     return ctx->get_cparams().ctx_other;
 }
+
+extern "C" struct llama_expert_pool_stats llama_expert_pool_get_stats(struct llama_context * ctx) {
+    llama_expert_pool_stats s = {};
+    if (ctx != nullptr) {
+        s = ctx->expert_pool_stats_snapshot();
+    }
+    return s;
+}
+
+struct llama_expert_pool_stats llama_context::expert_pool_stats_snapshot() {
+    llama_expert_pool_stats s = {};
+    llama_expert_pool_state & st = model.expert_pool_state;
+    s.submits        = st.s_submits;
+    s.hit_rows       = st.s_hit_rows;
+    s.prep_getset_us = st.s_getset_us;
+    s.prep_ids_us    = st.s_ids_us;
+    s.prep_comp_us   = st.s_comp_us;
+    s.end_sync_us    = st.s_sync_us;
+    s.end_get_us     = st.s_get_us;
+    st.s_submits = st.s_hit_rows = 0;
+    st.s_getset_us = st.s_ids_us = st.s_comp_us = st.s_sync_us = st.s_get_us = 0;
+    return s;
+}
