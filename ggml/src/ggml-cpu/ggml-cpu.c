@@ -1669,6 +1669,7 @@ static void ggml_compute_forward_mul_mat_id(
             g_moe_delegate_begin((struct ggml_tensor *) src0, (struct ggml_tensor *) src1,
                                  (struct ggml_tensor *) ids, dst, &skip, g_moe_delegate_ud);
             g_moe_skip = skip;
+            g_moe_active = skip != 0;
         }
 
         // initialize matrix_row_counts
