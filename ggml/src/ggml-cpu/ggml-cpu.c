@@ -98,6 +98,22 @@ struct ggml_riscv_arch_features_type {
 } ggml_riscv_arch_features = { 0 };
 #endif
 
+// moe delegate hook (set by llama.cpp, see ggml-cpu.h)
+static ggml_cpu_moe_delegate_begin_fn   g_moe_delegate_begin = 0;
+static ggml_cpu_moe_delegate_end_fn     g_moe_delegate_end   = 0;
+static void *                           g_moe_delegate_ud    = 0;
+static int32_t                          g_moe_active         = 0;
+static const int32_t *                  g_moe_skip           = 0;
+
+void ggml_cpu_set_moe_delegate(
+        ggml_cpu_moe_delegate_begin_fn begin,
+        ggml_cpu_moe_delegate_end_fn end,
+        void * user_data) {
+    g_moe_delegate_begin = begin;
+    g_moe_delegate_end   = end;
+    g_moe_delegate_ud    = user_data;
+}
+
 #if defined(_WIN32)
 
 #define WIN32_LEAN_AND_MEAN
@@ -1645,6 +1661,16 @@ static void ggml_compute_forward_mul_mat_id(
     }
 
     if (ith == 0) {
+        // moe delegate: cache-hit experts are skipped here (computed on the GPU
+        // by the delegate, which writes the dst rows itself)
+        g_moe_active = 0;
+        if (g_moe_delegate_begin != 0) {
+            const int32_t * skip = 0;
+            g_moe_delegate_begin((struct ggml_tensor *) src0, (struct ggml_tensor *) src1,
+                                 (struct ggml_tensor *) ids, dst, &skip, g_moe_delegate_ud);
+            g_moe_skip = skip;
+        }
+
         // initialize matrix_row_counts
         memset(matrix_row_counts, 0, n_as*sizeof(int64_t));
 
@@ -1671,6 +1697,11 @@ static void ggml_compute_forward_mul_mat_id(
                     continue;
                 }
 
+                if (g_moe_active && g_moe_skip[i02] >= 0) {
+                    // cache-hit expert: handled by the moe delegate on the GPU
+                    continue;
+                }
+
                 MMID_MATRIX_ROW(i02, matrix_row_counts[i02]) = (struct mmid_row_mapping) {id, iid1};
                 matrix_row_counts[i02] += 1;
             }
@@ -1684,6 +1715,10 @@ static void ggml_compute_forward_mul_mat_id(
     }
 
     ggml_barrier(params->threadpool);
+
+    if (ith == 0 && g_moe_active && g_moe_delegate_end != 0) {
+        g_moe_delegate_end(dst, g_moe_delegate_ud);
+    }
 
     for (int cur_a = 0; cur_a < n_as; ++cur_a) {
         const int64_t cne1 = matrix_row_counts[cur_a];

@@ -7,6 +7,7 @@
 #include "llama-memory.h"
 #include "llama-vocab.h"
 #include "llama-expert-cache.h"
+#include "llama-expert-pool.h"
 
 #include <map>
 #include <memory>
@@ -619,6 +620,9 @@ struct llama_model {
     // is accessed through a const reference (llama_context holds one)
     mutable llama_model_expert_cache expert_cache;
 
+    // expert pool runtime state (stage 2): GPU pool weights + mapping tables
+    mutable llama_expert_pool_state expert_pool_state;
+
     // for classifier models
     std::vector<std::string> classifier_labels;
 
@@ -769,9 +773,9 @@ struct llama_model {
     virtual void load_arch_tensors(llama_model_loader & ml) = 0;
     virtual std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const = 0;
 
-protected:
     llama_model_params params;
 
+protected:
     struct impl;
     std::unique_ptr<impl> pimpl;
 };

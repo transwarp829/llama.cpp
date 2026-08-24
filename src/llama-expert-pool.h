@@ -1,8 +1,11 @@
 #pragma once
 
 #include "llama.h"
+#include "ggml.h"
+#include "ggml-backend.h"
 
 #include <cstdint>
+#include <string>
 #include <vector>
 
 // GPU-resident expert pool (stage 2 of the expert cache, milestone 1).
@@ -66,3 +69,93 @@ struct llama_expert_pool {
     // diagnostics
     int32_t total_resident() const;
 };
+
+// ---------------------------------------------------------------
+// model-level runtime state of the expert pool (stage 2, milestone 3/4)
+//
+// holds, per pooled layer, GPU-resident pool weight tensor(s) plus the
+// host-side mapping tables consumed by the graph:
+//   - remap_tab     I32 [n_expert]: expert -> pool slot (or 0 for non-resident)
+//   - mask_tab      F32 [n_expert]: 1.0 resident, 0.0 non-resident (warm-path mask)
+//   - cold_mask_tab I8  [n_expert]: 0 resident, 1 non-resident (cold-op mask)
+// the tables are plain ggml tensors in a host buffer context so the graph
+// can read them via get_rows / as the cold op's src[3].
+// the pool is initialized once (from --expert-pool-init or random) and
+// never refreshed in the static v1; swap logic is not wired in yet.
+struct llama_expert_pool_state {
+    bool enabled = false;
+    int32_t n_slot = 0;   // slots per pooled layer
+
+    // original weight tensors, indexed by layer (null = not present); used by
+    // the graph to pair a mul_mat_id weight with its pool copy
+    std::vector<ggml_tensor *> orig_gate_up;
+    std::vector<ggml_tensor *> orig_up;
+    std::vector<ggml_tensor *> orig_gate;
+    std::vector<ggml_tensor *> orig_down;
+
+    // pool weight tensors, indexed by layer; null = not pooled / not present
+    std::vector<ggml_tensor *> w_pool_gate_up; // fused [n_ff*2, n_embd, S]
+    std::vector<ggml_tensor *> w_pool_up;      // separate [n_ff, n_embd, S]
+    std::vector<ggml_tensor *> w_pool_gate;    // separate [n_ff, n_embd, S]
+    std::vector<ggml_tensor *> w_pool_down;    // [n_embd, n_ff, S]
+
+    // mapping tables, indexed by layer
+    std::vector<ggml_tensor *> remap_tab;      // I32 [1, n_expert] (row = 1 int)
+    std::vector<ggml_tensor *> mask_tab;       // F32 [1, n_expert]
+    std::vector<ggml_tensor *> cold_mask_tab;  // I8  [n_expert]
+
+    // resident expert lists, indexed by layer (for diagnostics/serialization)
+    std::vector<std::vector<int32_t>> resident;
+
+    // pooled layer indices (filled at init, consumed by the delayed fill)
+    std::vector<int32_t> pooled_layers;
+
+    // set once the pool weights/tables have been copied (idempotent fill)
+    bool fill_done = false;
+
+    // CPU-side expert->slot table per pooled layer (int32, -1 = miss); used by the
+    // moe delegate hook inside the CPU MUL_MAT_ID kernel
+    std::vector<std::vector<int32_t>> slots;
+
+    // moe delegate runtime
+    bool delegate_ok = false;
+    ggml_backend_buffer_type_t pool_buft = nullptr;        // pool buft (device)
+    ggml_backend_t gpu_backend = nullptr;                  // target device[[truncated]
+    ggml_context *  mg_ctx    = nullptr;               // mini-graph ctx (no_alloc)
+    ggml_backend_buffer_t dg_buf = nullptr;            // GPU scratch: cur/out/ids
+    ggml_tensor * t_cur = nullptr;                     // [n_embd] F32
+    ggml_tensor * t_out = nullptr;                     // [n_ff, 8] F32
+    ggml_tensor * t_ids = nullptr;                     // [8] I32
+    ggml_tensor * mg_w  = nullptr;                     // pool weight 4D (set per call)
+    int32_t hit_slots[8]   = {0};
+    int32_t hit_cols[8]    = {0};
+    int32_t n_hit = 0;
+    size_t  sz_out_row = 0;                            // n_ff * sizeof(float)
+
+    // per-layer cached mini graphs (built once at fill time; each call only
+    // refills t_cur/t_ids and recomputes): index [il][0]=up/[1]=gate (separated),
+    // [il][0]=fused gate/up (no other entry)
+    struct mini_graph_entry {
+        ggml_cgraph * g = nullptr;
+        ggml_tensor * out = nullptr;
+    };
+    std::vector<std::vector<mini_graph_entry>> mini;
+
+    void reset();
+};
+
+// seed the pool from a csv file, one line per layer: "il,e1,e2,...".
+// layers missing from the file / with fewer entries are filled randomly.
+bool llama_expert_pool_parse_init(const std::string & path, int32_t n_layer,
+                                  int32_t n_expert, int32_t n_slot,
+                                  std::vector<std::vector<int32_t>> & resident);
+
+// random resident set per layer (fixed seed, reproducible)
+void llama_expert_pool_random(int32_t n_layer, int32_t n_expert, int32_t n_slot,
+                              std::vector<std::vector<int32_t>> & resident);
+
+// moe delegate: called by the CPU MUL_MAT_ID kernel for cache-hit experts (see ggml-cpu.h)
+void llama_expert_pool_delegate_begin(
+        ggml_tensor * src0, ggml_tensor * src1, ggml_tensor * ids, ggml_tensor * dst,
+        const int32_t ** skip_out, void * ud);
+void llama_expert_pool_delegate_end(ggml_tensor * dst, void * ud);

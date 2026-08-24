@@ -1,6 +1,7 @@
 #include "llama-context.h"
 
 #include "ggml.h"
+#include "ggml-cpu.h"
 #include "llama-arch.h"
 #include "llama-graph.h"
 #include "llama-impl.h"
@@ -10,6 +11,7 @@
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-ext.h"
+#include "llama-expert-pool.h"
 #include "llama-sampler.h"
 #include "llama.h"
 
@@ -20,6 +22,7 @@
 #include <stdexcept>
 #include <string>
 #include <algorithm>
+#include <regex>
 #include <cstdlib>
 
 //
@@ -143,6 +146,9 @@ llama_context::llama_context(
     cparams.cb_eval_user_data = params.cb_eval_user_data;
 
     cparams.expert_cache = params.expert_cache;
+
+    cparams.expert_pool      = params.expert_pool;
+    cparams.expert_pool_init = params.expert_pool_init;
     if (cparams.expert_cache) {
         expert_cache.enabled = true;
         expert_cache.init(cparams.n_seq_max, hparams.n_layer());
@@ -517,6 +523,30 @@ llama_context::~llama_context() {
         }
     }
     ggml_opt_free(opt_ctx);
+
+    // moe delegate: unregister + release scratch buffers
+    if (model.expert_pool_state.delegate_ok) {
+        ggml_cpu_set_moe_delegate(nullptr, nullptr, nullptr);
+        if (model.expert_pool_state.dg_buf) {
+            ggml_backend_buffer_free(model.expert_pool_state.dg_buf);
+            model.expert_pool_state.dg_buf = nullptr;
+        }
+        if (model.expert_pool_state.mg_ctx) {
+            ggml_free(model.expert_pool_state.mg_ctx);
+            model.expert_pool_state.mg_ctx = nullptr;
+        }
+        model.expert_pool_state.delegate_ok = false;
+    }
+
+    pool_buf.reset(); // release the pool buffer before freeing the ctx metadata
+    if (pool_ctx) {
+        ggml_free(pool_ctx);
+        pool_ctx = nullptr;
+    }
+    if (pool_tab_ctx) {
+        ggml_free(pool_tab_ctx);
+        pool_tab_ctx = nullptr;
+    }
 }
 
 void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint32_t n_seqs) {
@@ -596,6 +626,304 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
     }
 }
 
+// expert pool initialization (stage 2, static v1):
+// - find the CPU-resident MoE layers (tensors matching a cpu buft override)
+// - allocate one pool weight copy per matrix (same type/layout, expert dim = S)
+// - seed the resident sets from --expert-pool-init csv, or at random
+// - copy the resident weights into the pool and build the mapping tables
+void llama_context::expert_pool_init() {
+    llama_expert_pool_state & st = model.expert_pool_state;
+    st.reset();
+    if (cparams.expert_pool <= 0) {
+        return;
+    }
+    const int32_t n_layer = model.hparams.n_layer();
+    const int32_t n_expert = model.hparams.n_expert;
+    if (n_expert <= 0) {
+        return;
+    }
+
+    // --- find the pooled layers (MoE weights that live on the CPU) ---
+    std::vector<int32_t> pooled_ils;
+    const llama_model_tensor_buft_override * ov = model.params.tensor_buft_overrides;
+    if (ov) {
+        std::vector<std::regex> res;
+        try {
+            for (const llama_model_tensor_buft_override * o = ov; o->pattern; ++o) {
+                if (ggml_backend_buft_is_host(o->buft)) {
+                    res.emplace_back(o->pattern);
+                }
+            }
+        } catch (const std::regex_error &) {
+            res.clear();
+        }
+        if (!res.empty()) {
+            for (int32_t il = 0; il < n_layer; ++il) {
+                const llama_layer & L = model.layers[il];
+                ggml_tensor * w = L.ffn_gate_up_exps ? L.ffn_gate_up_exps :
+                                 (L.ffn_up_exps ? L.ffn_up_exps : L.ffn_gate_exps);
+                if (w == nullptr) {
+                    continue;
+                }
+                char name_buf[GGML_MAX_NAME + 1] = {0};
+                memcpy(name_buf, w->name, GGML_MAX_NAME);
+                for (const auto & re : res) {
+                    if (std::regex_search(name_buf, re)) {
+                        pooled_ils.push_back(il);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    if (pooled_ils.empty()) {
+        LLAMA_LOG_WARN("%s: no CPU-resident MoE layers found, expert pool disabled\n", __func__);
+        return;
+    }
+
+    const int32_t n_pooled = (int32_t) pooled_ils.size();
+    int32_t n_slot = cparams.expert_pool / n_pooled;
+    if (n_slot <= 0) {
+        n_slot = 1;
+    }
+
+    st.enabled = true;
+    st.n_slot  = n_slot;
+    st.orig_gate_up.resize(n_layer, nullptr);
+    st.orig_up.resize(n_layer, nullptr);
+    st.orig_gate.resize(n_layer, nullptr);
+    st.orig_down.resize(n_layer, nullptr);
+    st.w_pool_gate_up.resize(n_layer, nullptr);
+    st.w_pool_up.resize(n_layer, nullptr);
+    st.w_pool_gate.resize(n_layer, nullptr);
+    st.w_pool_down.resize(n_layer, nullptr);
+    st.remap_tab.resize(n_layer, nullptr);
+    st.mask_tab.resize(n_layer, nullptr);
+    st.cold_mask_tab.resize(n_layer, nullptr);
+    st.resident.resize(n_layer);
+    st.pooled_layers = pooled_ils;
+
+    // --- resident sets: csv seed or random ---
+    bool ok = false;
+    if (cparams.expert_pool_init && cparams.expert_pool_init[0]) {
+        ok = llama_expert_pool_parse_init(cparams.expert_pool_init, n_layer, n_expert, n_slot, st.resident);
+        if (!ok) {
+            LLAMA_LOG_WARN("%s: failed to read --expert-pool-init '%s', falling back to random\n",
+                    __func__, cparams.expert_pool_init);
+        }
+    }
+    if (!ok) {
+        llama_expert_pool_random(n_layer, n_expert, n_slot, st.resident);
+    }
+
+    // --- create pool weight tensors + mapping tables ---
+    pool_ctx     = ggml_init({ 4u*1024u*1024u, nullptr, true }); // no_alloc = true (allocated via buft)
+    pool_tab_ctx = ggml_init({ 1u*1024u*1024u, nullptr, false });
+
+    for (int32_t il : pooled_ils) {
+        const llama_layer & L = model.layers[il];
+        if (L.ffn_gate_up_exps) {
+            st.orig_gate_up[il] = L.ffn_gate_up_exps;
+            st.w_pool_gate_up[il] = ggml_new_tensor_4d(pool_ctx, L.ffn_gate_up_exps->type,
+                    L.ffn_gate_up_exps->ne[0], L.ffn_gate_up_exps->ne[1], n_slot, 1);
+        }
+        if (L.ffn_up_exps) {
+            st.orig_up[il] = L.ffn_up_exps;
+            st.w_pool_up[il] = ggml_new_tensor_4d(pool_ctx, L.ffn_up_exps->type,
+                    L.ffn_up_exps->ne[0], L.ffn_up_exps->ne[1], n_slot, 1);
+        }
+        if (L.ffn_gate_exps) {
+            st.orig_gate[il] = L.ffn_gate_exps;
+            st.w_pool_gate[il] = ggml_new_tensor_4d(pool_ctx, L.ffn_gate_exps->type,
+                    L.ffn_gate_exps->ne[0], L.ffn_gate_exps->ne[1], n_slot, 1);
+        }
+        if (L.ffn_down_exps) {
+            st.orig_down[il] = L.ffn_down_exps;
+            st.w_pool_down[il] = ggml_new_tensor_4d(pool_ctx, L.ffn_down_exps->type,
+                    L.ffn_down_exps->ne[0], L.ffn_down_exps->ne[1], n_slot, 1);
+        }
+        // remap/mask tables live in the pool buffer (same device as the pool
+        // weights) so the warm-path get_rows/mul stay on the fast device;
+        // cold_mask stays on the host because the cold op runs on the CPU.
+        st.remap_tab[il]     = ggml_new_tensor_2d(pool_ctx, GGML_TYPE_I32, 1, n_expert);
+        st.mask_tab[il]      = ggml_new_tensor_2d(pool_ctx, GGML_TYPE_F32, 1, n_expert);
+        st.cold_mask_tab[il] = ggml_new_tensor_1d(pool_tab_ctx, GGML_TYPE_I8,  n_expert);
+    }
+
+    // --- allocate the pool tensors on the fastest non-CPU buft, fallback CPU ---
+    ggml_backend_buffer_type_t pool_buft = nullptr;
+    for (const ggml_backend_buffer_type_t bt : backend_buft) {
+        if (!ggml_backend_buft_is_host(bt)) {
+            pool_buft = bt;
+            break;
+        }
+    }
+    if (!pool_buft) {
+        pool_buft = ggml_backend_cpu_buffer_type();
+    }
+    st.pool_buft = pool_buft;
+    pool_buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(pool_ctx, pool_buft));
+    if (!pool_buf) {
+        pool_buft = ggml_backend_cpu_buffer_type();
+        pool_buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(pool_ctx, pool_buft));
+    }
+    if (!pool_buf) {
+        LLAMA_LOG_ERROR("%s: expert pool allocation failed, pool disabled\n", __func__);
+        st.reset();
+        return;
+    }
+    // mark the pool tensors as weights so the scheduler keeps the warm-path
+    // mat_mul_id (and its outputs) on the pool device instead of pulling the
+    // pool tensors back to the CPU for the hot/cold merge
+    ggml_backend_buffer_set_usage(pool_buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+    LLAMA_LOG_INFO("%s: expert pool enabled: %d pooled layers, %d slots/layer (%d total)\n",
+            __func__, n_pooled, n_slot, n_pooled * n_slot);
+    {
+        size_t pool_bytes = 0;
+        for (int32_t il : pooled_ils) {
+            for (ggml_tensor * t : { st.w_pool_gate_up[il], st.w_pool_up[il],
+                                     st.w_pool_gate[il],  st.w_pool_down[il] }) {
+                if (t) { pool_bytes += ggml_nbytes(t); }
+            }
+        }
+        LLAMA_LOG_INFO("%s: pool weight bytes = %.2f GB (%.1f MiB per expert)\n",
+                __func__, pool_bytes / 1e9, pool_bytes / (double) (n_pooled * n_slot) / 1.0e6);
+    }
+
+    // the actual weight/table fill is deferred to expert_pool_fill(), called
+    // after graph_reserve: with no_alloc model tensors the weight data becomes
+    // valid only once the scheduler has placed them (see no_alloc handling)
+}
+
+void llama_context::expert_pool_fill() {
+    llama_expert_pool_state & st = model.expert_pool_state;
+    if (st.fill_done || !st.enabled || st.w_pool_down.empty()) {
+        return;
+    }
+    const int32_t n_expert = model.hparams.n_expert;
+    const int32_t n_slot = st.n_slot;
+
+    // --- fill weights + tables (model tensor data is valid now) ---
+    std::vector<int32_t> remap(n_expert, 0);
+    st.slots.resize(model.hparams.n_layer());
+    std::vector<float>   maskf(n_expert, 0.0f);
+    std::vector<uint8_t> cold(n_expert, 1);
+
+    for (size_t pi = 0; pi < st.pooled_layers.size(); ++pi) {
+        const int32_t il = st.pooled_layers[pi];
+        const llama_layer & L = model.layers[il];
+        const std::vector<int32_t> & res = st.resident[il];
+        std::fill(remap.begin(), remap.end(), 0);
+        std::fill(maskf.begin(), maskf.end(), 0.0f);
+        std::fill(cold.begin(), cold.end(), 1);
+        std::vector<int32_t> & slot_tab = st.slots[il];
+        slot_tab.assign(n_expert, -1);
+        for (int32_t s = 0; s < n_slot; ++s) {
+            const int32_t e = res[s];
+            if (e < 0 || e >= n_expert) {
+                continue;
+            }
+            remap[e] = s;
+            maskf[e] = 1.0f;
+            cold[e]  = 0;
+            slot_tab[e] = s;
+        }
+        ggml_backend_tensor_set(st.remap_tab[il],     remap.data(), 0, n_expert * sizeof(int32_t));
+        ggml_backend_tensor_set(st.mask_tab[il],      maskf.data(), 0, n_expert * sizeof(float));
+        memcpy(st.cold_mask_tab[il]->data, cold.data(), n_expert * sizeof(uint8_t));
+
+        auto copy_slots = [&](ggml_tensor * src, ggml_tensor * pw) {
+            if (src == nullptr || pw == nullptr) {
+                return;
+            }
+            // per-expert size: for quantized types use the stride, not ne0*ne1*type_size
+            const size_t sz = src->nb[2];
+            for (int32_t s = 0; s < n_slot; ++s) {
+                const int32_t e = res[s];
+                if (e < 0 || e >= n_expert) {
+                    continue;
+                }
+                ggml_backend_tensor_set(pw, (const char *) src->data + e * src->nb[2],
+                        s * pw->nb[2], sz);
+            }
+        };
+        copy_slots(L.ffn_gate_up_exps, st.w_pool_gate_up[il]);
+        copy_slots(L.ffn_up_exps,      st.w_pool_up[il]);
+        copy_slots(L.ffn_gate_exps,    st.w_pool_gate[il]);
+        copy_slots(L.ffn_down_exps,    st.w_pool_down[il]);
+    }
+    st.fill_done = true;
+
+    // --- moe delegate setup ---
+    // find the first non-host buft (pool_buft was already chosen in init)
+    // reuse pool_buft for the delegate scratch tensors
+    if (st.enabled && pool_buf) {
+        ggml_context * d_ctx = ggml_init({ 512u*1024u*1024u, nullptr, true }); // no_alloc
+        st.mg_ctx = d_ctx;
+        // note: the Qwen-style exps tensors are [n_embd, n_ff, n_expert] so
+        // ne[0] = embedding dim, ne[1] = ffn dim
+        const ggml_tensor * t0 = model.layers[st.pooled_layers[0]].ffn_up_exps != nullptr
+                               ? model.layers[st.pooled_layers[0]].ffn_up_exps
+                               : model.layers[st.pooled_layers[0]].ffn_gate_up_exps;
+        const int32_t n_embd = t0->ne[0];
+        const int32_t n_ff   = t0->ne[1] / (t0 == model.layers[st.pooled_layers[0]].ffn_gate_up_exps ? 2 : 1);
+        st.t_cur = ggml_new_tensor_1d(d_ctx, GGML_TYPE_F32, n_embd);
+        st.t_ids = ggml_new_tensor_1d(d_ctx, GGML_TYPE_I32, 8);
+        st.t_out = ggml_new_tensor_2d(d_ctx, GGML_TYPE_F32, n_ff, 8);
+        st.sz_out_row = (size_t) n_ff * sizeof(float);
+        const size_t dg_size = ggml_nbytes(st.t_cur) + ggml_nbytes(st.t_out) + ggml_nbytes(st.t_ids);
+        st.dg_buf = ggml_backend_buft_alloc_buffer(st.pool_buft, dg_size);
+        if (st.dg_buf) {
+            char * dg_base = (char *) ggml_backend_buffer_get_base(st.dg_buf);
+            ggml_backend_tensor_alloc(st.dg_buf, st.t_cur, dg_base);
+            ggml_backend_tensor_alloc(st.dg_buf, st.t_out, dg_base + ggml_nbytes(st.t_cur));
+            ggml_backend_tensor_alloc(st.dg_buf, st.t_ids, dg_base + ggml_nbytes(st.t_cur) + ggml_nbytes(st.t_out));
+            st.delegate_ok = true;
+            st.gpu_backend = nullptr;
+            for (ggml_backend_ptr & b : backends) {
+                if (!ggml_backend_is_cpu(b.get())) {
+                    st.gpu_backend = b.get();
+                    break;
+                }
+            }
+            if (st.gpu_backend != nullptr) {
+                // cache the mini graphs once: each pooled layer x matrix (0=fused
+                // gate/up, 1=up, 2=gate). per call we only refill t_cur/t_ids and
+                // recompute the cached graph.
+                st.mini.resize(st.pooled_layers.size());
+                ggml_tensor * cur_v = ggml_view_2d(d_ctx, st.t_cur, st.t_cur->ne[0], 1, sizeof(float), 0);
+                ggml_tensor * idv   = ggml_view_2d(d_ctx, st.t_ids, 8, 1, sizeof(int32_t), 0);
+                for (size_t ilx = 0; ilx < st.pooled_layers.size(); ++ilx) {
+                    const int32_t l = st.pooled_layers[ilx];
+                    st.mini[ilx].resize(4);
+                    for (int32_t which = 0; which < 3; ++which) {
+                        ggml_tensor * pw = nullptr;
+                        switch (which) {
+                            case 0: pw = st.w_pool_gate_up[l]; break;
+                            case 1: pw = st.w_pool_up[l];      break;
+                            case 2: pw = st.w_pool_gate[l];    break;
+                        }
+                        if (pw == nullptr) {
+                            continue;
+                        }
+                        ggml_tensor * out0 = ggml_mul_mat_id(d_ctx, pw, cur_v, idv);
+                        ggml_backend_tensor_alloc(st.dg_buf, out0, st.t_out->data);
+                        ggml_cgraph * g = ggml_new_graph(d_ctx);
+                        ggml_build_forward_expand(g, out0);
+                        st.mini[ilx][which].g = g;
+                        st.mini[ilx][which].out = out0;
+                    }
+                }
+                ggml_cpu_set_moe_delegate(llama_expert_pool_delegate_begin,
+                                          llama_expert_pool_delegate_end, &st);
+                LLAMA_LOG_INFO("%s: moe delegate active (%d layers, n_ff=%d)\n",
+                        __func__, (int) st.pooled_layers.size(), n_ff);
+            }
+        }
+    }
+}
+
 void llama_context::sched_reserve() {
     if (!sched_need_reserve) {
         return;
@@ -620,6 +948,8 @@ void llama_context::sched_reserve() {
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
 
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+
+    expert_pool_init();
 
     llama_memory_context_ptr mctx;
     if (memory) {
@@ -1400,6 +1730,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
         }
+
+        // first graph allocation places the model weight tensors: fill the pool now
+        expert_pool_fill();
     }
 
     // set the input data for the input tensors
@@ -3735,6 +4068,8 @@ llama_context_params llama_context_default_params() {
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
         /*.expert_cache                =*/ false,
+        /*.expert_pool                 =*/ 0,
+        /*.expert_pool_init            =*/ nullptr,
         /*.samplers                    =*/ nullptr,
         /*.n_samplers                  =*/ 0,
         /*.ctx_other                   =*/ nullptr,
