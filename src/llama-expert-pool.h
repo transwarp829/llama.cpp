@@ -134,10 +134,20 @@ struct llama_expert_pool_state {
     std::vector<int32_t> hit_cols;                     // original ids column per hit
     int32_t n_hit = 0;
     size_t  sz_out_row = 0;                            // n_ff * sizeof(float)
-    // per-step delegate statistics (accumulated since last read, see
-    // llama_expert_pool_get_stats; delegate runs on the ith==0 thread only)
-    uint64_t s_submits = 0, s_delegates = 0, s_hit_rows = 0;
-    uint64_t s_getset_us = 0, s_ids_us = 0, s_comp_us = 0, s_sync_us = 0, s_get_us = 0;
+    // per-layer delegate statistics (indexed by ilx = position in pooled_layers;
+    // accumulated since last read, see llama_expert_pool_get_stats; the delegate
+    // runs on the ith==0 thread only)
+    struct layer_delegate_stats {
+        uint64_t submits = 0;    // mini-graph submissions for this layer
+        uint64_t hit_rows = 0;   // rows computed by the GPU delegate
+        uint64_t miss_rows = 0;  // rows computed by the CPU kernel
+        uint64_t getset_us = 0;  // cur copy H2D preparation time
+        uint64_t ids_us = 0;     // ids scratch prepare + upload time
+        uint64_t comp_us = 0;    // graph compute submission time
+        uint64_t sync_us = 0;    // end() wait for GPU completion
+        uint64_t get_us = 0;     // end() D2H copy of hit rows
+    };
+    std::vector<layer_delegate_stats> s_layer;
     ggml_backend_buffer_t host_buf = nullptr;          // pinned host mirrors (fast H2D/D2H)
     void * host_cur = nullptr;                         // pinned mirror of t_cur
     void * host_ids = nullptr;                         // pinned mirror of t_ids
