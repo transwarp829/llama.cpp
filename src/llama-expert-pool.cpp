@@ -276,18 +276,22 @@ void llama_expert_pool_delegate_begin(
         const int32_t ** skip_out, void * ud) {
     llama_expert_pool_state & st = *(llama_expert_pool_state *) ud;
     *skip_out = nullptr;
+    const int64_t dbg_t0 = ggml_time_us();
     if (!st.delegate_ok || st.pooled_layers.empty()) {
         return;
     }
 
-    // find the pooled layer/matrix this node corresponds to
+    // find the pooled layer/matrix this node corresponds to (ilx = index into
+    // pooled_layers; il = actual layer number)
     int32_t il = -1;
+    int32_t ilx = -1;
     int which = -1;
-    for (int32_t i : st.pooled_layers) {
-        if      (st.orig_gate_up[i] == src0) { il = i; which = 0; break; }
-        else if (st.orig_up[i]       == src0) { il = i; which = 1; break; }
-        else if (st.orig_gate[i]     == src0) { il = i; which = 2; break; }
-        else if (st.orig_down[i]     == src0) { il = i; which = 3; break; }
+    for (size_t ix = 0; ix < st.pooled_layers.size(); ++ix) {
+        const int32_t i = st.pooled_layers[ix];
+        if      (st.orig_gate_up[i] == src0) { il = i; ilx = (int32_t) ix; which = 0; break; }
+        else if (st.orig_up[i]       == src0) { il = i; ilx = (int32_t) ix; which = 1; break; }
+        else if (st.orig_gate[i]     == src0) { il = i; ilx = (int32_t) ix; which = 2; break; }
+        else if (st.orig_down[i]     == src0) { il = i; ilx = (int32_t) ix; which = 3; break; }
     }
     if (il < 0) {
         return;
@@ -296,6 +300,8 @@ void llama_expert_pool_delegate_begin(
         // down uses the per-column expert input layout; not delegated in V2
         return;
     }
+    // remember (ilx, which) for end() to map a dst back to its output region
+    st.dst_ilx_which[dst] = std::make_pair(ilx, which);
 
     ggml_tensor * pw = pool_w_for(st, il, which);
     if (pw == nullptr) {
@@ -326,28 +332,60 @@ void llama_expert_pool_delegate_begin(
     if (st.n_hit == 0) {
         return; // nothing to delegate
     }
+    if (st.host_buf == nullptr) {
+        return; // pinned mirrors unavailable; fall back to full CPU compute
+    }
 
     // cur -> GPU scratch (generic: src1 may be 2D/3D, single token on decode)
-    {
-        std::vector<float> tmpc((size_t) ggml_nelements(src1));
-        ggml_backend_tensor_get(src1, tmpc.data(), 0, ggml_nbytes(src1));
-        ggml_backend_tensor_set(st.t_cur, tmpc.data(), 0, ggml_nbytes(st.t_cur));
-    }
+    const int64_t dbg_t1 = ggml_time_us();
+    ggml_backend_tensor_get(src1, st.host_cur, 0, ggml_nbytes(src1));
+    ggml_backend_tensor_set(st.t_cur, st.host_cur, 0, ggml_nbytes(st.t_cur));
+    const int64_t dbg_t2 = ggml_time_us();
     // hit slots -> ids scratch (padding zeros; extra columns are ignored via n_hit)
-    std::vector<int32_t> ids8((size_t) st.n_used, 0);
-    memcpy(ids8.data(), st.hit_slots.data(), (size_t) st.n_hit * sizeof(int32_t));
-    ggml_backend_tensor_set(st.t_ids, ids8.data(), 0, (size_t) st.n_used * sizeof(int32_t));
+    memset(st.host_ids, 0, (size_t) st.n_used * sizeof(int32_t));
+    memcpy(st.host_ids, st.hit_slots.data(), (size_t) st.n_hit * sizeof(int32_t));
+    ggml_backend_tensor_set(st.t_ids, st.host_ids, 0, (size_t) st.n_used * sizeof(int32_t));
+    const int64_t dbg_t3 = ggml_time_us();
 
-    // cached mini-graph: mul_mat_id(pool_w, t_cur, t_ids8) -> t_out alias
-    const llama_expert_pool_state::mini_graph_entry & m = st.mini[il][which];
+    const llama_expert_pool_state::mini_graph_entry & m = st.mini[ilx][0];
     if (m.g == nullptr) {
         st.n_hit = 0;
         return;
     }
-    const ggml_status gstatus = ggml_backend_graph_compute_async(st.gpu_backend, m.g);
-    if (gstatus != GGML_STATUS_SUCCESS) {
-        st.n_hit = 0;
-        return;
+    // combined up+gate graph: submit it once per layer (first begin of the layer
+    // submits, the second begin only scans and returns the skip table). fused
+    // gate/up (single output) or single-matrix models submit on every begin.
+    const bool combined = m.out_up != nullptr && m.out_gate != nullptr;
+    bool need_submit = !combined || !st.mini_submitted;
+    if (need_submit) {
+        const int64_t dbg_t1 = ggml_time_us();
+        ggml_backend_tensor_get(src1, st.host_cur, 0, ggml_nbytes(src1));
+        ggml_backend_tensor_set(st.t_cur, st.host_cur, 0, ggml_nbytes(st.t_cur));
+        const int64_t dbg_t2 = ggml_time_us();
+        // hit slots -> ids scratch (padding zeros; extra columns are ignored via n_hit)
+        memset(st.host_ids, 0, (size_t) st.n_used * sizeof(int32_t));
+        memcpy(st.host_ids, st.hit_slots.data(), (size_t) st.n_hit * sizeof(int32_t));
+        ggml_backend_tensor_set(st.t_ids, st.host_ids, 0, (size_t) st.n_used * sizeof(int32_t));
+        const int64_t dbg_t3 = ggml_time_us();
+
+        const ggml_status gstatus = ggml_backend_graph_compute_async(st.gpu_backend, m.g);
+        if (gstatus != GGML_STATUS_SUCCESS) {
+            st.n_hit = 0;
+            return;
+        }
+        st.mini_submitted = true;
+        st.mini_submitted_il = il;
+
+        // accumulate per-step statistics (delegate runs on the ith==0 thread only)
+        st.s_submits    += 1;
+        st.s_getset_us  += (uint64_t) (dbg_t2 - dbg_t1);
+        st.s_ids_us     += (uint64_t) (dbg_t3 - dbg_t2);
+        st.s_comp_us    += (uint64_t) (ggml_time_us() - dbg_t3);
+    }
+
+    // a new layer starts a new submit round (reset the combined-graph flag)
+    if (st.mini_submitted_il != il) {
+        st.mini_submitted = false;
     }
 
     // give the CPU kernel the slot table: experts with slot >= 0 are cache hits
@@ -359,13 +397,35 @@ void llama_expert_pool_delegate_end(ggml_tensor * dst, void * ud) {
     if (st.n_hit == 0 || !st.delegate_ok) {
         return;
     }
+    // map this dst back to (ilx, which); unknown dst -> nothing to write back
+    auto it = st.dst_ilx_which.find(dst);
+    if (it == st.dst_ilx_which.end()) {
+        st.n_hit = 0;
+        return;
+    }
+    const int32_t ilx = it->second.first;
+    const int32_t which = it->second.second;
+    const llama_expert_pool_state::mini_graph_entry & m = st.mini[ilx][0];
+    const ggml_tensor * out_t = (which == 2) ? m.out_gate : m.out_up;
+    if (out_t == nullptr) {
+        st.n_hit = 0;
+        return;
+    }
+
+    const int64_t dbg_t0 = ggml_time_us();
     const size_t row_bytes = st.sz_out_row;
     ggml_backend_synchronize(st.gpu_backend);
-    std::vector<float> tmp((size_t) st.n_hit * (row_bytes / sizeof(float)));
-    ggml_backend_tensor_get(st.t_out, tmp.data(), 0, (size_t) st.n_hit * row_bytes);
+    const int64_t dbg_t1 = ggml_time_us();
+    ggml_backend_tensor_get(out_t, st.host_out, 0, (size_t) st.n_hit * row_bytes);
     for (int i = 0; i < st.n_hit; ++i) {
         float * dst_col = (float *) ((char *) dst->data + st.hit_cols[i]*dst->nb[1]);
-        memcpy(dst_col, tmp.data() + (size_t) i * (row_bytes / sizeof(float)), row_bytes);
+        memcpy(dst_col, (float *) st.host_out + (size_t) i * (row_bytes / sizeof(float)), row_bytes);
     }
+
+    // accumulate per-step statistics (delegate runs on the ith==0 thread only)
+    st.s_delegates   += 1;
+    st.s_hit_rows    += st.n_hit;
+    st.s_sync_us     += (uint64_t) (dbg_t1 - dbg_t0);
+    st.s_get_us      += (uint64_t) (ggml_time_us() - dbg_t1);
     st.n_hit = 0;
 }
