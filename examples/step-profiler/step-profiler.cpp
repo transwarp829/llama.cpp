@@ -1,4 +1,5 @@
 #include "arg.h"
+#include "chat.h"
 #include "common.h"
 #include "log.h"
 #include "llama.h"
@@ -282,7 +283,26 @@ int main(int argc, char ** argv) {
 
     const llama_vocab * vocab = llama_model_get_vocab(model);
     const bool add_bos = llama_vocab_get_add_bos(vocab);
-    std::vector<llama_token> tokens = common_tokenize(ctx, params.prompt, add_bos, true);
+    std::string prompt = params.prompt;
+    // chat-template mode (like llama-cli -cnv): STEP_PROFILE_CHAT_FILE
+    // = text file used as the user message; the model's own chat template
+    // (from GGUF metadata) is applied before tokenizing.
+    const char * chat_file = getenv("STEP_PROFILE_CHAT_FILE");
+    if (chat_file != nullptr && chat_file[0] != '\0') {
+        std::ifstream fin(chat_file);
+        if (!fin) {
+            LOG_ERR("%s: failed to open chat file %s\n", __func__, chat_file);
+            return 1;
+        }
+        std::string content((std::istreambuf_iterator<char>(fin)), std::istreambuf_iterator<char>());
+        common_chat_templates_ptr tmpls = common_chat_templates_init(model, "");
+        common_chat_templates_inputs inputs;
+        inputs.messages = {{"user", content}};
+        common_chat_params cp = common_chat_templates_apply(tmpls.get(), inputs);
+        prompt = cp.prompt;
+        LOG_INF("%s: chat template applied (%d chars), prompt %zu chars\n", __func__, (int) content.size(), prompt.size());
+    }
+    std::vector<llama_token> tokens = common_tokenize(ctx, prompt, false, true);
 
     if (tokens.empty()) {
         LOG_ERR("%s: there are not input tokens to process - (try to provide a prompt with '-p')\n", __func__);
