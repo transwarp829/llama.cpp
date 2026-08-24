@@ -7,6 +7,8 @@
 #include <cstdint>
 #include <string>
 #include <vector>
+#include <unordered_map>
+#include <utility>
 
 // GPU-resident expert pool (stage 2 of the expert cache, milestone 1).
 //
@@ -132,15 +134,33 @@ struct llama_expert_pool_state {
     std::vector<int32_t> hit_cols;                     // original ids column per hit
     int32_t n_hit = 0;
     size_t  sz_out_row = 0;                            // n_ff * sizeof(float)
+    // per-step delegate statistics (accumulated since last read, see
+    // llama_expert_pool_get_stats; delegate runs on the ith==0 thread only)
+    uint64_t s_submits = 0, s_delegates = 0, s_hit_rows = 0;
+    uint64_t s_getset_us = 0, s_ids_us = 0, s_comp_us = 0, s_sync_us = 0, s_get_us = 0;
+    ggml_backend_buffer_t host_buf = nullptr;          // pinned host mirrors (fast H2D/D2H)
+    void * host_cur = nullptr;                         // pinned mirror of t_cur
+    void * host_ids = nullptr;                         // pinned mirror of t_ids
+    void * host_out = nullptr;                         // pinned mirror of t_out hit rows
 
     // per-layer cached mini graphs (built once at fill time; each call only
     // refills t_cur/t_ids and recomputes): index [il][0]=up/[1]=gate (separated),
     // [il][0]=fused gate/up (no other entry)
     struct mini_graph_entry {
         ggml_cgraph * g = nullptr;
-        ggml_tensor * out = nullptr;
+        ggml_tensor * out_up = nullptr;    // up output (nullptr when fused single)
+        ggml_tensor * out_gate = nullptr;  // gate output (nullptr when fused single)
     };
     std::vector<std::vector<mini_graph_entry>> mini;
+
+    // fused up+gate submission state: the first begin of a layer submits the
+    // combined graph; the second begin only scans ids and returns the skip table.
+    // end() uses this map to find (il, which) for a given dst tensor.
+    std::unordered_map<const ggml_tensor *, std::pair<int32_t, int32_t>> dst_ilx_which;
+    ggml_tensor * t_out_up = nullptr;      // [n_ff, n_used] up hit output (GPU)
+    ggml_tensor * t_out_gate = nullptr;    // [n_ff, n_used] gate hit output (GPU)
+    bool mini_submitted = false;           // combined graph already submitted this step
+    int32_t mini_submitted_il = -1;        // which layer submitted it
 
     void reset();
 };

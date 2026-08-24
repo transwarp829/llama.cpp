@@ -527,6 +527,10 @@ llama_context::~llama_context() {
     // moe delegate: unregister + release scratch buffers
     if (model.expert_pool_state.delegate_ok) {
         ggml_cpu_set_moe_delegate(nullptr, nullptr, nullptr);
+        if (model.expert_pool_state.host_buf) {
+            ggml_backend_buffer_free(model.expert_pool_state.host_buf);
+            model.expert_pool_state.host_buf = nullptr;
+        }
         if (model.expert_pool_state.dg_buf) {
             ggml_backend_buffer_free(model.expert_pool_state.dg_buf);
             model.expert_pool_state.dg_buf = nullptr;
@@ -872,15 +876,18 @@ void llama_context::expert_pool_fill() {
         st.n_used = n_used;
         st.t_cur = ggml_new_tensor_1d(d_ctx, GGML_TYPE_F32, n_embd);
         st.t_ids = ggml_new_tensor_1d(d_ctx, GGML_TYPE_I32, n_used);
-        st.t_out = ggml_new_tensor_2d(d_ctx, GGML_TYPE_F32, n_ff, n_used);
+        st.t_out_up   = ggml_new_tensor_2d(d_ctx, GGML_TYPE_F32, n_ff, n_used);
+        st.t_out_gate = ggml_new_tensor_2d(d_ctx, GGML_TYPE_F32, n_ff, n_used);
         st.sz_out_row = (size_t) n_ff * sizeof(float);
-        const size_t dg_size = ggml_nbytes(st.t_cur) + ggml_nbytes(st.t_out) + ggml_nbytes(st.t_ids);
+        const size_t dg_size = ggml_nbytes(st.t_cur) + ggml_nbytes(st.t_ids)
+                             + ggml_nbytes(st.t_out_up) + ggml_nbytes(st.t_out_gate);
         st.dg_buf = ggml_backend_buft_alloc_buffer(st.pool_buft, dg_size);
         if (st.dg_buf) {
             char * dg_base = (char *) ggml_backend_buffer_get_base(st.dg_buf);
             ggml_backend_tensor_alloc(st.dg_buf, st.t_cur, dg_base);
-            ggml_backend_tensor_alloc(st.dg_buf, st.t_out, dg_base + ggml_nbytes(st.t_cur));
-            ggml_backend_tensor_alloc(st.dg_buf, st.t_ids, dg_base + ggml_nbytes(st.t_cur) + ggml_nbytes(st.t_out));
+            ggml_backend_tensor_alloc(st.dg_buf, st.t_ids, dg_base + ggml_nbytes(st.t_cur));
+            ggml_backend_tensor_alloc(st.dg_buf, st.t_out_up, dg_base + ggml_nbytes(st.t_cur) + ggml_nbytes(st.t_ids));
+            ggml_backend_tensor_alloc(st.dg_buf, st.t_out_gate, dg_base + ggml_nbytes(st.t_cur) + ggml_nbytes(st.t_ids) + ggml_nbytes(st.t_out_up));
             st.delegate_ok = true;
             st.gpu_backend = nullptr;
             for (ggml_backend_ptr & b : backends) {
@@ -890,31 +897,54 @@ void llama_context::expert_pool_fill() {
                 }
             }
             if (st.gpu_backend != nullptr) {
-                // cache the mini graphs once: each pooled layer x matrix (0=fused
-                // gate/up, 1=up, 2=gate). per call we only refill t_cur/t_ids and
-                // recompute the cached graph.
+                // pinned host mirrors for the mini-graph inputs/outputs: copies
+                // to/from pageable memory go through a staged path, so keep the
+                // scratch on pinned memory (small: cur + ids + hit rows).
+                const size_t cb = ggml_nbytes(st.t_cur);
+                const size_t ib = ggml_nbytes(st.t_ids);
+                const size_t ob = (size_t) n_ff * n_used * sizeof(float);
+                st.host_buf = ggml_backend_buft_alloc_buffer(
+                        ggml_backend_dev_host_buffer_type(ggml_backend_get_device(st.gpu_backend)),
+                        cb + ib + ob);
+                if (st.host_buf) {
+                    char * hb = (char *) ggml_backend_buffer_get_base(st.host_buf);
+                    st.host_cur  = hb;
+                    st.host_ids  = hb + cb;
+                    st.host_out  = hb + cb + ib;
+                }
+                // cache the mini graphs once: per pooled layer one graph with
+                // both up and gate (separated models) or the fused gate/up node.
+                // per call we only refill t_cur/t_ids and recompute the cached graph.
                 st.mini.resize(st.pooled_layers.size());
                 ggml_tensor * cur_v = ggml_view_2d(d_ctx, st.t_cur, st.t_cur->ne[0], 1, sizeof(float), 0);
                 ggml_tensor * idv   = ggml_view_2d(d_ctx, st.t_ids, n_used, 1, sizeof(int32_t), 0);
                 for (size_t ilx = 0; ilx < st.pooled_layers.size(); ++ilx) {
                     const int32_t l = st.pooled_layers[ilx];
                     st.mini[ilx].resize(4);
-                    for (int32_t which = 0; which < 3; ++which) {
-                        ggml_tensor * pw = nullptr;
-                        switch (which) {
-                            case 0: pw = st.w_pool_gate_up[l]; break;
-                            case 1: pw = st.w_pool_up[l];      break;
-                            case 2: pw = st.w_pool_gate[l];    break;
-                        }
-                        if (pw == nullptr) {
-                            continue;
-                        }
-                        ggml_tensor * out0 = ggml_mul_mat_id(d_ctx, pw, cur_v, idv);
-                        ggml_backend_tensor_alloc(st.dg_buf, out0, st.t_out->data);
-                        ggml_cgraph * g = ggml_new_graph(d_ctx);
+                    auto & m = st.mini[ilx][0];
+                    ggml_cgraph * g = ggml_new_graph(d_ctx);
+                    if (st.w_pool_gate_up[l]) {
+                        // fused gate/up: single node
+                        ggml_tensor * out0 = ggml_mul_mat_id(d_ctx, st.w_pool_gate_up[l], cur_v, idv);
+                        ggml_backend_tensor_alloc(st.dg_buf, out0, st.t_out_up->data);
                         ggml_build_forward_expand(g, out0);
-                        st.mini[ilx][which].g = g;
-                        st.mini[ilx][which].out = out0;
+                        m.g = g;
+                        m.out_up = out0;
+                    } else {
+                        // separated up/gate: one combined graph, two outputs
+                        if (st.w_pool_up[l]) {
+                            ggml_tensor * out_up = ggml_mul_mat_id(d_ctx, st.w_pool_up[l], cur_v, idv);
+                            ggml_backend_tensor_alloc(st.dg_buf, out_up, st.t_out_up->data);
+                            ggml_build_forward_expand(g, out_up);
+                            m.out_up = out_up;
+                        }
+                        if (st.w_pool_gate[l]) {
+                            ggml_tensor * out_gate = ggml_mul_mat_id(d_ctx, st.w_pool_gate[l], cur_v, idv);
+                            ggml_backend_tensor_alloc(st.dg_buf, out_gate, st.t_out_gate->data);
+                            ggml_build_forward_expand(g, out_gate);
+                            m.out_gate = out_gate;
+                        }
+                        m.g = g;
                     }
                 }
                 ggml_cpu_set_moe_delegate(llama_expert_pool_delegate_begin,
