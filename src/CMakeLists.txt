@@ -18,6 +18,7 @@ add_library(llama
             llama-context.cpp
             llama-cparams.cpp
             llama-expert-cache.cpp
+            llama-expert-pool.cpp
             llama-grammar.cpp
             llama-graph.cpp
             llama-hparams.cpp
