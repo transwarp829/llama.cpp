@@ -55,6 +55,8 @@ struct llama_context {
     //   - changing attention type
     //   - etc.
     void sched_reserve();
+    void expert_pool_init();
+    void expert_pool_fill();
 
     void synchronize();
 
@@ -382,6 +384,12 @@ private:
     std::vector<ggml_backend_t>             backend_ptrs;
     std::vector<ggml_backend_buffer_type_t> backend_buft;
     std::vector<size_t>                     backend_buf_exp_size; // expected buffer sizes
+
+    // expert pool (stage 2): pooled weight context/buffer + tables context
+    // (kept alive as long as the context; pointers also stored in model.expert_pool_state)
+    ggml_context * pool_ctx  = nullptr;
+    ggml_context * pool_tab_ctx = nullptr;
+    ggml_backend_buffer_ptr pool_buf;
 
     llm_graph_result_ptr gf_res_prev;
     llm_graph_result_ptr gf_res_reserve;

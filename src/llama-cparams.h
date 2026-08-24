@@ -55,6 +55,9 @@ struct llama_cparams {
     bool pipeline_parallel;
     bool expert_cache;       // collect per-seq expert routing window statistics
 
+    int32_t expert_pool;       // total expert-pool slots (0 = disabled)
+    const char * expert_pool_init; // csv file to seed the pool, null = random
+
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
 
     enum llama_context_type ctx_type;

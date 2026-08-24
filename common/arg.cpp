@@ -1699,6 +1699,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ));
     add_opt(common_arg(
+        {"-nep", "--expert-pool"}, "N",
+        "keep the top-N experts per pooled MoE layer resident in the GPU (expert pool stage 2; 0 = disabled)",
+        [](common_params & params, int value) {
+            params.expert_pool = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--expert-pool-init"}, "FILE",
+        "seed the expert pool from a csv file, one line per layer: \"layer,e1,e2,...\" (default: random)",
+        [](common_params & params, const std::string & value) {
+            params.expert_pool_init = value;
+        }
+    ));
+    add_opt(common_arg(
         {"-ctxcp", "--ctx-checkpoints", "--swa-checkpoints"}, "N",
         string_format("max number of context checkpoints to create per slot (default: %d)"
             "[(more info)](https://github.com/ggml-org/llama.cpp/pull/15293)", params.n_ctx_checkpoints),
