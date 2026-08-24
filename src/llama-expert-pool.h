@@ -127,8 +127,9 @@ struct llama_expert_pool_state {
     ggml_tensor * t_out = nullptr;                     // [n_ff, 8] F32
     ggml_tensor * t_ids = nullptr;                     // [8] I32
     ggml_tensor * mg_w  = nullptr;                     // pool weight 4D (set per call)
-    int32_t hit_slots[8]   = {0};
-    int32_t hit_cols[8]    = {0};
+    int32_t n_used = 0;                                // top-k (hparams.n_expert_used)
+    std::vector<int32_t> hit_slots;                    // hit slots per ids row (size = n_used)
+    std::vector<int32_t> hit_cols;                     // original ids column per hit
     int32_t n_hit = 0;
     size_t  sz_out_row = 0;                            // n_ff * sizeof(float)
 
