@@ -235,8 +235,14 @@ int main(int argc, char ** argv) {
 
     profiler_data data;
 
-    params.cb_eval = cb_eval;
-    params.cb_eval_user_data = &data;
+    const char * no_cb = getenv("STEP_PROFILE_NO_CB");
+    if (no_cb == nullptr) {
+        params.cb_eval = cb_eval;
+        params.cb_eval_user_data = &data;
+        LOG_INF("%s: cb profiling enabled (set STEP_PROFILE_NO_CB=1 for wall-only timing)\n", __func__);
+    } else {
+        LOG_INF("%s: cb profiling disabled (wall-only)\n", __func__);
+    }
     params.warmup = false;
 
     auto llama_init = common_init_from_params(params);
@@ -328,6 +334,8 @@ int main(int argc, char ** argv) {
         step++;
 
         cur = common_sampler_sample(smpl, ctx, -1);
+        printf("%s", common_token_to_piece(ctx, cur).c_str());
+        fflush(stdout);
         if (llama_vocab_is_eog(vocab, cur)) {
             break;
         }

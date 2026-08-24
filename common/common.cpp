@@ -1749,6 +1749,8 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.swa_full          = params.swa_full;
     cparams.kv_unified        = params.kv_unified;
     cparams.expert_cache      = params.expert_cache;
+    cparams.expert_pool       = params.expert_pool;
+    cparams.expert_pool_init  = params.expert_pool_init.empty() ? nullptr : params.expert_pool_init.c_str();
 
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;

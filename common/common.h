@@ -573,6 +573,9 @@ struct common_params {
     bool kv_unified        = false; // enable unified KV cache
     bool expert_cache      = false; // collect per-seq expert routing window statistics
 
+    int32_t expert_pool        = 0;      // total expert-pool slots (0 = disabled)
+    std::string expert_pool_init;         // csv file to seed the pool (empty = random)
+
     bool input_prefix_bos  = false; // prefix BOS to user inputs, preceding input_prefix
     bool verbose_prompt    = false; // print prompt tokens before generation
     bool display_prompt    = true;  // print prompt before generation
