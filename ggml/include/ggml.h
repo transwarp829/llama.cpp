@@ -512,7 +512,6 @@ extern "C" {
 
         GGML_OP_MUL_MAT,
         GGML_OP_MUL_MAT_ID,
-        GGML_OP_MUL_MAT_ID_COLD,
         GGML_OP_OUT_PROD,
 
         GGML_OP_SCALE,
@@ -1457,17 +1456,6 @@ extern "C" {
             struct ggml_tensor  * as,
             struct ggml_tensor  * b,
             struct ggml_tensor  * ids);
-
-    // indirect matrix multiplication with a per-expert cold mask (CPU only).
-    // experts with cold_mask[i] == 0 are skipped (output rows zeroed); used by
-    // the expert-pool cold path where pool-resident experts are computed by the
-    // GPU warm path instead.
-    GGML_API struct ggml_tensor * ggml_mul_mat_id_cold(
-            struct ggml_context * ctx,
-            struct ggml_tensor  * as,
-            struct ggml_tensor  * b,
-            struct ggml_tensor  * ids,
-            struct ggml_tensor  * cold_mask);
 
     // A: m columns, n rows,
     // B: p columns, n rows,
