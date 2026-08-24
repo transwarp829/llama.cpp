@@ -868,9 +868,11 @@ void llama_context::expert_pool_fill() {
                                : model.layers[st.pooled_layers[0]].ffn_gate_up_exps;
         const int32_t n_embd = t0->ne[0];
         const int32_t n_ff   = t0->ne[1] / (t0 == model.layers[st.pooled_layers[0]].ffn_gate_up_exps ? 2 : 1);
+        const int32_t n_used = (int32_t) model.hparams.n_expert_used;
+        st.n_used = n_used;
         st.t_cur = ggml_new_tensor_1d(d_ctx, GGML_TYPE_F32, n_embd);
-        st.t_ids = ggml_new_tensor_1d(d_ctx, GGML_TYPE_I32, 8);
-        st.t_out = ggml_new_tensor_2d(d_ctx, GGML_TYPE_F32, n_ff, 8);
+        st.t_ids = ggml_new_tensor_1d(d_ctx, GGML_TYPE_I32, n_used);
+        st.t_out = ggml_new_tensor_2d(d_ctx, GGML_TYPE_F32, n_ff, n_used);
         st.sz_out_row = (size_t) n_ff * sizeof(float);
         const size_t dg_size = ggml_nbytes(st.t_cur) + ggml_nbytes(st.t_out) + ggml_nbytes(st.t_ids);
         st.dg_buf = ggml_backend_buft_alloc_buffer(st.pool_buft, dg_size);
@@ -893,7 +895,7 @@ void llama_context::expert_pool_fill() {
                 // recompute the cached graph.
                 st.mini.resize(st.pooled_layers.size());
                 ggml_tensor * cur_v = ggml_view_2d(d_ctx, st.t_cur, st.t_cur->ne[0], 1, sizeof(float), 0);
-                ggml_tensor * idv   = ggml_view_2d(d_ctx, st.t_ids, 8, 1, sizeof(int32_t), 0);
+                ggml_tensor * idv   = ggml_view_2d(d_ctx, st.t_ids, n_used, 1, sizeof(int32_t), 0);
                 for (size_t ilx = 0; ilx < st.pooled_layers.size(); ++ilx) {
                     const int32_t l = st.pooled_layers[ilx];
                     st.mini[ilx].resize(4);
