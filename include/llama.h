@@ -1635,6 +1635,23 @@ extern "C" {
             ggml_opt_epoch_callback   callback_train,
             ggml_opt_epoch_callback   callback_eval);
 
+    // expert-pool delegate statistics. the counters accumulate inside the CPU
+    // MUL_MAT_ID kernel hooks; this call returns the totals since the previous
+    // call (per-decode-step usage: call once after each llama_decode) and
+    // resets them.
+    struct llama_expert_pool_stats {
+        uint64_t submits;        // mini-graph submissions to the GPU
+        uint64_t hit_rows;       // expert rows computed by the GPU delegate
+        uint64_t prep_getset_us; // cur copy H2D preparation time
+        uint64_t prep_ids_us;    // ids scratch prepare + upload time
+        uint64_t prep_comp_us;   // graph compute submission time
+        uint64_t end_sync_us;    // end() wait for GPU completion
+        uint64_t end_get_us;     // end() D2H copy of hit rows
+    };
+
+    // snapshot-and-reset; struct is zeroed when the pool is not active
+    LLAMA_API struct llama_expert_pool_stats llama_expert_pool_get_stats(struct llama_context * ctx);
+
 #ifdef __cplusplus
 }
 #endif
