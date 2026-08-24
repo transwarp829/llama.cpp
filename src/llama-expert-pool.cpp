@@ -161,7 +161,10 @@ void llama_expert_pool_state::reset() {
     t_cur = nullptr;
     t_out = nullptr;
     t_ids = nullptr;
+    n_used = 0;
     n_hit = 0;
+    hit_slots.clear();
+    hit_cols.clear();
 }
 
 // parse seed csv: one line per layer "il,e1,e2,...". layers missing from the
@@ -304,6 +307,10 @@ void llama_expert_pool_delegate_begin(
     if (st.slots[il].empty()) {
         return;
     }
+    if ((int) st.hit_slots.size() < (int) ids->ne[0]) {
+        st.hit_slots.resize(ids->ne[0]);
+        st.hit_cols.resize(ids->ne[0]);
+    }
     for (int id = 0; id < (int) ids->ne[0]; ++id) {
         const int32_t e = *((const int32_t *) ((const char *) ids->data + id*ids->nb[0]));
         if (e < 0 || e >= (int32_t) st.slots[il].size()) {
@@ -326,10 +333,10 @@ void llama_expert_pool_delegate_begin(
         ggml_backend_tensor_get(src1, tmpc.data(), 0, ggml_nbytes(src1));
         ggml_backend_tensor_set(st.t_cur, tmpc.data(), 0, ggml_nbytes(st.t_cur));
     }
-    // hit slots -> ids scratch (padded to 8; extra columns are ignored via n_hit)
-    int32_t ids8[8] = {0};
-    memcpy(ids8, st.hit_slots, (size_t) st.n_hit * sizeof(int32_t));
-    ggml_backend_tensor_set(st.t_ids, ids8, 0, sizeof(ids8));
+    // hit slots -> ids scratch (padding zeros; extra columns are ignored via n_hit)
+    std::vector<int32_t> ids8((size_t) st.n_used, 0);
+    memcpy(ids8.data(), st.hit_slots.data(), (size_t) st.n_hit * sizeof(int32_t));
+    ggml_backend_tensor_set(st.t_ids, ids8.data(), 0, (size_t) st.n_used * sizeof(int32_t));
 
     // cached mini-graph: mul_mat_id(pool_w, t_cur, t_ids8) -> t_out alias
     const llama_expert_pool_state::mini_graph_entry & m = st.mini[il][which];
