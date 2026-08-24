@@ -244,6 +244,9 @@ private:
 public:
     uint32_t graph_max_nodes(uint32_t n_tokens) const;
 
+    // snapshot-and-reset expert-pool delegate statistics (public API support)
+    struct llama_expert_pool_stats expert_pool_stats_snapshot();
+
     // can reuse the llm_graph_result instance of the context (for example to update a memory module)
     llm_graph_result * get_gf_res_reserve() const;
 
