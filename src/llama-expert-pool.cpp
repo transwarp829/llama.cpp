@@ -361,6 +361,14 @@ void llama_expert_pool_delegate_begin(
         st.n_hit = 0;
         return;
     }
+    // a new layer starts a new submit round: reset the combined-graph flag
+    // BEFORE deciding whether this layer has to submit (need_submit below
+    // reads it; using the previous layer's leftover value would skip the
+    // submission and write stale GPU data back to this layer's dst).
+    if (st.mini_submitted_il != il) {
+        st.mini_submitted = false;
+    }
+
     // combined up+gate graph: submit it once per layer (first begin of the layer
     // submits, the second begin only scans and returns the skip table). fused
     // gate/up (single output) or single-matrix models submit on every begin.
@@ -393,11 +401,6 @@ void llama_expert_pool_delegate_begin(
             st.s_layer[ilx].ids_us    += (uint64_t) (dbg_t3 - dbg_t2);
             st.s_layer[ilx].comp_us   += (uint64_t) (ggml_time_us() - dbg_t3);
         }
-    }
-
-    // a new layer starts a new submit round (reset the combined-graph flag)
-    if (st.mini_submitted_il != il) {
-        st.mini_submitted = false;
     }
 
     // give the CPU kernel the slot table: experts with slot >= 0 are cache hits
