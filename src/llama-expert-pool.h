@@ -76,13 +76,9 @@ struct llama_expert_pool {
 // ---------------------------------------------------------------
 // model-level runtime state of the expert pool (stage 2, milestone 3/4)
 //
-// holds, per pooled layer, GPU-resident pool weight tensor(s) plus the
-// host-side mapping tables consumed by the graph:
-//   - remap_tab     I32 [n_expert]: expert -> pool slot (or 0 for non-resident)
-//   - mask_tab      F32 [n_expert]: 1.0 resident, 0.0 non-resident (warm-path mask)
-//   - cold_mask_tab I8  [n_expert]: 0 resident, 1 non-resident (cold-op mask)
-// the tables are plain ggml tensors in a host buffer context so the graph
-// can read them via get_rows / as the cold op's src[3].
+// holds, per pooled layer, GPU-resident pool weight tensors plus the
+// host-side slot table consumed by the moe delegate hook inside the CPU
+// MUL_MAT_ID kernel (slots[il]: expert id -> slot, -1 = miss/full CPU).
 // the pool is initialized once (from --expert-pool-init or random) and
 // never refreshed in the static v1; swap logic is not wired in yet.
 struct llama_expert_pool_state {
@@ -100,11 +96,6 @@ struct llama_expert_pool_state {
     std::vector<ggml_tensor *> w_pool_up;      // separate [n_ff, n_embd, S]
     std::vector<ggml_tensor *> w_pool_gate;    // separate [n_ff, n_embd, S]
     std::vector<ggml_tensor *> w_pool_down;    // [n_embd, n_ff, S]
-
-    // mapping tables, indexed by layer
-    std::vector<ggml_tensor *> remap_tab;      // I32 [1, n_expert] (row = 1 int)
-    std::vector<ggml_tensor *> mask_tab;       // F32 [1, n_expert]
-    std::vector<ggml_tensor *> cold_mask_tab;  // I8  [n_expert]
 
     // resident expert lists, indexed by layer (for diagnostics/serialization)
     std::vector<std::vector<int32_t>> resident;
@@ -171,14 +162,14 @@ struct llama_expert_pool_state {
     // combined graph; the second begin only scans ids and returns the skip table.
     // end() uses this map to find (il, which) for a given dst tensor.
     std::unordered_map<const ggml_tensor *, std::pair<int32_t, int32_t>> dst_ilx_which;
-    ggml_tensor * t_out_down = nullptr;    // [n_embd, n_used] F32 down hit output (GPU) — chain result
+    ggml_tensor * t_out_down = nullptr;    // [n_embd, n_used] F32 down hit output (GPU), the chain result
     void * host_out_down = nullptr;        // pinned mirror of t_out_down
     bool mini_submitted = false;           // combined graph already submitted this step
     int32_t mini_submitted_il = -1;        // which layer submitted it
     ggml_backend_event_t ev = nullptr;     // per-submit completion event (end() waits only its own graph)
 
     // runtime routing log (GGML_EXPPOOL_ROUTING_LOG=<path>; ONLY for analysis,
-    // writes the raw ids seen by the delegate: "step,layer,id0,id1,..." — the
+    // writes the raw ids seen by the delegate: "step,layer,id0,id1,..."  - the
     // same format as the CB-on capture, but from the REAL NO_CB execution).
     FILE * rt_log = nullptr;               // opened lazily on first begin
     bool   rt_log_tried = false;           // env already checked (avoid re-getenv)
