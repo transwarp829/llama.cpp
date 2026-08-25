@@ -1,5 +1,6 @@
 #include "llama-graph.h"
 
+#include "llama-expert-pool.h"
 #include "llama-impl.h"
 #include "llama-model.h"
 #include "llama-batch.h"
@@ -1964,7 +1965,38 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     const int64_t n_tokens = cur->ne[1];
     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
 
+    // expert-chain reuse mode (expert-pool mini graphs): both the routing
+    // probs and the selected experts are supplied by the caller, so the whole
+    // routing section is skipped and `weights` is fixed to 1. the chain below
+    // (gate/up -> activation -> down) is then built EXACTLY as the main graph
+    // would, so every model variant is inherited automatically.
+    const bool chain_only = probs_in != nullptr && selected_experts_in != nullptr;
+
+    // hoisted out of the routing section: the chain could jump straight to
+    // build_expert_chain, so this must hold the caller's ids before that jump
+    ggml_tensor * selected_experts = selected_experts_in;
+
     ggml_tensor * logits = nullptr;
+    ggml_tensor * weights = nullptr;
+
+    // let the expert pool know the real chain parameters for this layer
+    // (exactly as the model's graph builder passed them); pool mini graphs
+    // reuse build_moe_ffn itself with these values, so every arch/variant is
+    // inherited automatically instead of being replicated
+    if (cparams.expert_pool > 0 && il >= 0) {
+        llama_expert_pool_register_chain(il, (int) type_op, norm_w, w_scale, (uint32_t) gating_op);
+    }
+
+    if (chain_only) {
+        // never used in chain_only mode (the chain returns before the
+        // weighted merge), but keep the tensor in the graph so that a
+        // weight_before_ffn model still has a valid `weights` source;
+        // its value is never read here (no_alloc ctx: no ggml_set_f32!)
+        weights = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, n_expert_used, n_tokens);
+        cb(weights, "ffn_moe_weights_ones", il);
+        ggml_build_forward_expand(gf, weights);
+        goto build_expert_chain;
+    }
 
     if (probs_in == nullptr) {
         logits = build_lora_mm(gate_inp, cur); // [n_expert, n_tokens]
@@ -2049,7 +2081,6 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     }
 
     // select experts
-    ggml_tensor * selected_experts = selected_experts_in;
     if (selected_experts == nullptr) {
         selected_experts = ggml_argsort_top_k(ctx0, selection_probs, n_expert_used); // [n_expert_used, n_tokens]
         cb(selected_experts->src[0], "ffn_moe_argsort", il);
@@ -2065,7 +2096,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         probs = ggml_reshape_3d(ctx0, probs, 1, n_expert, n_tokens);
     }
 
-    ggml_tensor * weights = ggml_get_rows(ctx0, probs, selected_experts); // [1, n_expert_used, n_tokens]
+    weights = ggml_get_rows(ctx0, probs, selected_experts); // [1, n_expert_used, n_tokens]
     cb(weights, "ffn_moe_weights", il);
 
 
@@ -2099,6 +2130,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     //call early so that topk-moe can be used
     ggml_build_forward_expand(gf, weights);
 
+build_expert_chain:
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
 
     if (weight_before_ffn) {
@@ -2256,6 +2288,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     if (down_exps_b) {
         experts = ggml_add_id(ctx0, experts, down_exps_b, selected_experts);
         cb(experts, "ffn_moe_down_biased", il);
+    }
+
+    // chain_only mode: return the raw down output; the caller (expert-pool
+    // mini graph) handles weighting/merging itself on the CPU side
+    if (chain_only) {
+        ggml_build_forward_expand(gf, experts);
+        return experts;
     }
 
     if (!weight_before_ffn) {

@@ -720,6 +720,14 @@ void llama_context::expert_pool_init() {
     if (!ok) {
         llama_expert_pool_random(n_layer, n_expert, n_slot, st.resident);
     }
+    if (getenv("GGML_CUDA_GRAPH_DEBUG")) {
+        fprintf(stderr, "[gdbg] fill post-parse resident[0][0..6]=");
+        for (int32_t s = 0; s < 7; ++s) { fprintf(stderr, "%d ", st.resident[0][s]); }
+        fprintf(stderr, " resident[%d][0..3]=", n_layer - 1);
+        for (int32_t s = 0; s < 4; ++s) { fprintf(stderr, "%d ", st.resident[n_layer - 1][s]); }
+        fprintf(stderr, " (ok=%d path='%s')\n", ok, cparams.expert_pool_init ? "set" : "null");
+        fflush(stderr);
+    }
 
     // --- create pool weight tensors + mapping tables ---
     pool_ctx     = ggml_init({ 4u*1024u*1024u, nullptr, true }); // no_alloc = true (allocated via buft)
@@ -837,6 +845,14 @@ void llama_context::expert_pool_fill() {
         ggml_backend_tensor_set(st.remap_tab[il],     remap.data(), 0, n_expert * sizeof(int32_t));
         ggml_backend_tensor_set(st.mask_tab[il],      maskf.data(), 0, n_expert * sizeof(float));
         memcpy(st.cold_mask_tab[il]->data, cold.data(), n_expert * sizeof(uint8_t));
+        if (getenv("GGML_CUDA_GRAPH_DEBUG")) {
+            fprintf(stderr, "[gdbg] fill il=%d slot_tab[0..8]=", il);
+            for (int32_t e = 0; e < 8; ++e) {
+                fprintf(stderr, "%d:%d ", e, slot_tab[e]);
+            }
+            fprintf(stderr, " res[0..3]=%d,%d,%d,%d\n", res[0], res[1], res[2], res[3]);
+            fflush(stderr);
+        }
 
         auto copy_slots = [&](ggml_tensor * src, ggml_tensor * pw) {
             if (src == nullptr || pw == nullptr) {
@@ -875,20 +891,17 @@ void llama_context::expert_pool_fill() {
         const int32_t n_ff   = t0->ne[1] / (t0 == model.layers[st.pooled_layers[0]].ffn_gate_up_exps ? 2 : 1);
         const int32_t n_used = (int32_t) model.hparams.n_expert_used;
         st.n_used = n_used;
+        // shared per-step inputs/outputs live in one scratch buffer; the
+        // per-layer chain intermediates are allocated per layer below
         st.t_cur = ggml_new_tensor_1d(d_ctx, GGML_TYPE_F32, n_embd);
         st.t_ids = ggml_new_tensor_1d(d_ctx, GGML_TYPE_I32, n_used);
-        st.t_out_up   = ggml_new_tensor_2d(d_ctx, GGML_TYPE_F32, n_ff, n_used);
-        st.t_out_gate = ggml_new_tensor_2d(d_ctx, GGML_TYPE_F32, n_ff, n_used);
-        st.sz_out_row = (size_t) n_ff * sizeof(float);
-        const size_t dg_size = ggml_nbytes(st.t_cur) + ggml_nbytes(st.t_ids)
-                             + ggml_nbytes(st.t_out_up) + ggml_nbytes(st.t_out_gate);
+        st.sz_out_row = (size_t) n_embd * sizeof(float);
+        const size_t dg_size = ggml_nbytes(st.t_cur) + ggml_nbytes(st.t_ids);
         st.dg_buf = ggml_backend_buft_alloc_buffer(st.pool_buft, dg_size);
         if (st.dg_buf) {
             char * dg_base = (char *) ggml_backend_buffer_get_base(st.dg_buf);
             ggml_backend_tensor_alloc(st.dg_buf, st.t_cur, dg_base);
             ggml_backend_tensor_alloc(st.dg_buf, st.t_ids, dg_base + ggml_nbytes(st.t_cur));
-            ggml_backend_tensor_alloc(st.dg_buf, st.t_out_up, dg_base + ggml_nbytes(st.t_cur) + ggml_nbytes(st.t_ids));
-            ggml_backend_tensor_alloc(st.dg_buf, st.t_out_gate, dg_base + ggml_nbytes(st.t_cur) + ggml_nbytes(st.t_ids) + ggml_nbytes(st.t_out_up));
             st.delegate_ok = true;
             st.gpu_backend = nullptr;
             for (ggml_backend_ptr & b : backends) {
@@ -898,55 +911,172 @@ void llama_context::expert_pool_fill() {
                 }
             }
             if (st.gpu_backend != nullptr) {
+                st.ev = ggml_backend_event_new(ggml_backend_get_device(st.gpu_backend));
                 // pinned host mirrors for the mini-graph inputs/outputs: copies
                 // to/from pageable memory go through a staged path, so keep the
                 // scratch on pinned memory (small: cur + ids + hit rows).
                 const size_t cb = ggml_nbytes(st.t_cur);
                 const size_t ib = ggml_nbytes(st.t_ids);
-                const size_t ob = (size_t) n_ff * n_used * sizeof(float);
+                const size_t db = (size_t) n_embd * n_used * sizeof(float);
                 st.host_buf = ggml_backend_buft_alloc_buffer(
                         ggml_backend_dev_host_buffer_type(ggml_backend_get_device(st.gpu_backend)),
-                        cb + ib + ob);
+                        cb + ib + db);
                 if (st.host_buf) {
                     char * hb = (char *) ggml_backend_buffer_get_base(st.host_buf);
                     st.host_cur  = hb;
                     st.host_ids  = hb + cb;
-                    st.host_out  = hb + cb + ib;
+                    st.host_out_down = hb + cb + ib;
                 }
-                // cache the mini graphs once: per pooled layer one graph with
-                // both up and gate (separated models) or the fused gate/up node.
-                // per call we only refill t_cur/t_ids and recompute the cached graph.
+                // per layer: build the whole-chain mini graph by calling the
+                // model's OWN build_moe_ffn in chain_only mode. every variant
+                // (activation op, clamps, fused gate_up vs separated, scales,
+                // biases, weight_before_ffn) is inherited from the main graph
+                // builder — the pool never replicates model logic.
                 st.mini.resize(st.pooled_layers.size());
-                ggml_tensor * cur_v = ggml_view_2d(d_ctx, st.t_cur, st.t_cur->ne[0], 1, sizeof(float), 0);
-                ggml_tensor * idv   = ggml_view_2d(d_ctx, st.t_ids, n_used, 1, sizeof(int32_t), 0);
                 for (size_t ilx = 0; ilx < st.pooled_layers.size(); ++ilx) {
                     const int32_t l = st.pooled_layers[ilx];
-                    st.mini[ilx].resize(4);
+                    st.mini[ilx].resize(1);
                     auto & m = st.mini[ilx][0];
-                    ggml_cgraph * g = ggml_new_graph(d_ctx);
-                    if (st.w_pool_gate_up[l]) {
-                        // fused gate/up: single node
-                        ggml_tensor * out0 = ggml_mul_mat_id(d_ctx, st.w_pool_gate_up[l], cur_v, idv);
-                        ggml_backend_tensor_alloc(st.dg_buf, out0, st.t_out_up->data);
-                        ggml_build_forward_expand(g, out0);
-                        m.g = g;
-                        m.out_up = out0;
-                    } else {
-                        // separated up/gate: one combined graph, two outputs
-                        if (st.w_pool_up[l]) {
-                            ggml_tensor * out_up = ggml_mul_mat_id(d_ctx, st.w_pool_up[l], cur_v, idv);
-                            ggml_backend_tensor_alloc(st.dg_buf, out_up, st.t_out_up->data);
-                            ggml_build_forward_expand(g, out_up);
-                            m.out_up = out_up;
-                        }
-                        if (st.w_pool_gate[l]) {
-                            ggml_tensor * out_gate = ggml_mul_mat_id(d_ctx, st.w_pool_gate[l], cur_v, idv);
-                            ggml_backend_tensor_alloc(st.dg_buf, out_gate, st.t_out_gate->data);
-                            ggml_build_forward_expand(g, out_gate);
-                            m.out_gate = out_gate;
-                        }
-                        m.g = g;
+                    // guards: layers whose chain cannot be replicated exactly
+                    // are skipped (no delegation for them, safe fallback).
+                    // per-expert scale/bias on the GATE/UP path is dangerous:
+                    // the main graph applies it before the swiglu merge, and the
+                    // GPU chain would miss it. down-side scale/bias is fine: the
+                    // main graph's down scale/bias node operates on the FULL
+                    // down dst (including delegated hit columns), so both chains
+                    // are scaled identically after the write-back.
+                    const auto & cp = llama_expert_pool_get_chain(l);
+                    const llama_layer & L = model.layers[l];
+                    if (cp.type_op < 0) {
+                        LLAMA_LOG_WARN("%s: no chain params registered for layer %d, delegation disabled\n",
+                                __func__, l);
+                        continue;
                     }
+                    if (L.ffn_up_exps_s || L.ffn_gate_exps_s ||
+                        L.ffn_gate_up_exps_b || L.ffn_up_exps_b || L.ffn_gate_exps_b) {
+                        LLAMA_LOG_WARN("%s: gate/up-side per-expert scale/bias tensors present for layer %d, delegation disabled\n",
+                                __func__, l);
+                        continue;
+                    }
+                    if (st.w_pool_down[l] == nullptr) {
+                        LLAMA_LOG_WARN("%s: no pooled down weights for layer %d, delegation disabled\n",
+                                __func__, l);
+                        continue;
+                    }
+                    // temporary per-layer graph builder (the built tensors/graph
+                    // live in gres->ctx_compute, so only gres must stay alive)
+                    std::unique_ptr<llm_graph_result> gres = std::make_unique<llm_graph_result>(64);
+                    llama_ubatch ub {};
+                    ub.n_tokens = 1;
+                    ub.n_seqs = 1;
+                    ub.n_seqs_unq = 1;
+                    llm_graph_params gp {};
+                    gp.arch = model.arch;
+                    gp.hparams = model.hparams;
+                    gp.cparams = cparams;
+                    gp.ubatch = ub;
+                    gp.gtype = LLM_GRAPH_TYPE_DECODER;
+                    gp.sched = nullptr;
+                    gp.backend_cpu = nullptr;
+                    gp.cvec = cvec.get();
+                    gp.loras = loras.get();
+                    gp.mctx = nullptr;
+                    gp.cross = nullptr;
+                    gp.samplers = {};
+                    gp.n_outputs = 1;
+                    gp.cb = {};
+                    gp.res = gres.get();
+                    llm_graph_context gc(gp);
+
+                    ggml_tensor * cur_v = ggml_view_2d(gc.ctx0, st.t_cur, n_embd, 1, sizeof(float), 0);
+                    ggml_tensor * idv   = ggml_view_2d(gc.ctx0, st.t_ids, n_used, 1, sizeof(int32_t), 0);
+
+                    ggml_tensor * experts = gc.build_moe_ffn(
+                            cur_v,                    // cur
+                            nullptr,                  // gate_inp
+                            nullptr,                  // gate_inp_b
+                            st.w_pool_up[l],          // up_exps
+                            nullptr,                  // up_exps_b
+                            st.w_pool_gate[l],        // gate_exps
+                            nullptr,                  // gate_exps_b
+                            st.w_pool_down[l],        // down_exps
+                            nullptr,                  // down_exps_b
+                            nullptr,                  // exp_probs_b
+                            model.hparams.n_expert,
+                            n_used,
+                            (llm_ffn_op_type) cp.type_op,
+                            cp.norm_w,
+                            cp.w_scale,
+                            (llama_expert_gating_func_type) cp.gating_op,
+                            l,                        // il
+                            cur_v,                    // probs_in (chain_only marker; never read)
+                            st.w_pool_gate_up[l],     // gate_up_exps
+                            nullptr,                  // gate_up_exps_b
+                            nullptr,                  // up_exps_s
+                            nullptr,                  // gate_exps_s
+                            nullptr,                  // down_exps_s
+                            idv);                     // selected_experts_in
+
+                    // allocate every chain output + referenced unallocated leaf
+                    // into a per-layer GPU buffer (skip views and already
+                    // allocated pool weights)
+                    ggml_cgraph * g = gres->get_gf();
+                    // tag every node so the CUDA backend can recognize pool
+                    // mini graphs (GGML_EXPPOOL_DIRECT_LAUNCH fast path);
+                    // names are metadata only, no effect on execution.
+                    for (int ni = 0; ni < ggml_graph_n_nodes(g); ++ni) {
+                        ggml_format_name(ggml_graph_node(g, ni), "expool.mini.%zd.%d", ilx, ni);
+                    }
+                    std::vector<ggml_tensor *> need;
+                    const auto mark = [&](ggml_tensor * t) {
+                        if (t == nullptr || t->data != nullptr || t->view_src != nullptr) {
+                            return;
+                        }
+                        if (std::find(need.begin(), need.end(), t) == need.end()) {
+                            need.push_back(t);
+                        }
+                    };
+                    for (int i = 0; i < ggml_graph_n_nodes(g); ++i) {
+                        ggml_tensor * n = ggml_graph_node(g, i);
+                        mark(n);
+                        for (int src = 0; src < GGML_MAX_SRC; ++src) {
+                            mark(n->src[src]);
+                        }
+                    }
+                    mark(experts);
+                    size_t total = 0;
+                    for (auto t : need) {
+                        total += GGML_PAD(ggml_nbytes(t), 256);
+                    }
+                    ggml_backend_buffer_t lbuf = ggml_backend_buft_alloc_buffer(st.pool_buft, total);
+                    if (lbuf == nullptr) {
+                        LLAMA_LOG_ERROR("%s: per-layer scratch alloc failed (%zu bytes), delegation disabled for layer %d\n",
+                                __func__, total, l);
+                        continue;
+                    }
+                    {
+                        char * base = (char *) ggml_backend_buffer_get_base(lbuf);
+                        char * off  = base;
+                        for (auto t : need) {
+                            ggml_backend_tensor_alloc(lbuf, t, off);
+                            off += GGML_PAD(ggml_nbytes(t), 256);
+                        }
+                        // views were created before their source tensors were
+                        // allocated (no_alloc ctx) -> wire them up now, the
+                        // same way ggml_backend_view_init does for sched graphs
+                        for (int i = 0; i < ggml_graph_n_nodes(g); ++i) {
+                            ggml_tensor * n = ggml_graph_node(g, i);
+                            if (n->view_src != nullptr) {
+                                n->buffer = n->view_src->buffer;
+                                n->data = (char *) n->view_src->data + n->view_offs;
+                            }
+                        }
+                    }
+                    st.layer_bufs.push_back(lbuf);
+
+                    m.g = g;
+                    m.out_down = experts;
+                    m.gres = gres.release();
                 }
                 ggml_cpu_set_moe_delegate(llama_expert_pool_delegate_begin,
                                           llama_expert_pool_delegate_end, &st);

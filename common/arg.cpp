@@ -1700,7 +1700,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ));
     add_opt(common_arg(
         {"-nep", "--expert-pool"}, "N",
-        "keep the top-N experts per pooled MoE layer resident in the GPU (expert pool stage 2; 0 = disabled)",
+        "total number of expert slots across all pooled MoE layers (expert pool stage 2; 0 = disabled)",
         [](common_params & params, int value) {
             params.expert_pool = value;
         }
