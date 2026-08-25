@@ -720,14 +720,6 @@ void llama_context::expert_pool_init() {
     if (!ok) {
         llama_expert_pool_random(n_layer, n_expert, n_slot, st.resident);
     }
-    if (getenv("GGML_CUDA_GRAPH_DEBUG")) {
-        fprintf(stderr, "[gdbg] fill post-parse resident[0][0..6]=");
-        for (int32_t s = 0; s < 7; ++s) { fprintf(stderr, "%d ", st.resident[0][s]); }
-        fprintf(stderr, " resident[%d][0..3]=", n_layer - 1);
-        for (int32_t s = 0; s < 4; ++s) { fprintf(stderr, "%d ", st.resident[n_layer - 1][s]); }
-        fprintf(stderr, " (ok=%d path='%s')\n", ok, cparams.expert_pool_init ? "set" : "null");
-        fflush(stderr);
-    }
 
     // --- create pool weight tensors + mapping tables ---
     pool_ctx     = ggml_init({ 4u*1024u*1024u, nullptr, true }); // no_alloc = true (allocated via buft)
@@ -845,14 +837,6 @@ void llama_context::expert_pool_fill() {
         ggml_backend_tensor_set(st.remap_tab[il],     remap.data(), 0, n_expert * sizeof(int32_t));
         ggml_backend_tensor_set(st.mask_tab[il],      maskf.data(), 0, n_expert * sizeof(float));
         memcpy(st.cold_mask_tab[il]->data, cold.data(), n_expert * sizeof(uint8_t));
-        if (getenv("GGML_CUDA_GRAPH_DEBUG")) {
-            fprintf(stderr, "[gdbg] fill il=%d slot_tab[0..8]=", il);
-            for (int32_t e = 0; e < 8; ++e) {
-                fprintf(stderr, "%d:%d ", e, slot_tab[e]);
-            }
-            fprintf(stderr, " res[0..3]=%d,%d,%d,%d\n", res[0], res[1], res[2], res[3]);
-            fflush(stderr);
-        }
 
         auto copy_slots = [&](ggml_tensor * src, ggml_tensor * pw) {
             if (src == nullptr || pw == nullptr) {

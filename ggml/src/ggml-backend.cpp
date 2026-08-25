@@ -460,16 +460,6 @@ enum ggml_status ggml_backend_graph_compute(ggml_backend_t backend, struct ggml_
 
 enum ggml_status ggml_backend_graph_compute_async(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     GGML_ASSERT(backend);
-    if (getenv("GGML_CUDA_GRAPH_DEBUG")) {
-        static int n_dbg = 0;
-        if (n_dbg++ < 400) {
-            const char * nm = (cgraph->n_nodes > 0 && cgraph->nodes[0]) ? cgraph->nodes[0]->name : "?";
-            fprintf(stderr, "[gdbg] async backend=%s cg=%p n=%d uid=%llu first=%s\n",
-                    ggml_backend_name(backend), (void *) cgraph, cgraph->n_nodes,
-                    (unsigned long long) cgraph->uid, nm);
-            fflush(stderr);
-        }
-    }
     return backend->iface.graph_compute(backend, cgraph);
 }
 

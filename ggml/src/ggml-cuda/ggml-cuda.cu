@@ -1878,20 +1878,6 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
 
-    if (getenv("GGML_CUDA_GRAPH_DEBUG") && dst->ne[2] <= 8) {
-        static std::atomic<int> n_dbg(0);
-        if (n_dbg.fetch_add(1) < 500) {
-            fprintf(stderr, "[gdbg] needs_sync src0=%d src1=%d dst=%d ne2=%lld mmid=%d "
-                    "mmq=%d mmf=%d\n",
-                    src0->type, src1->type, dst->type, (long long) dst->ne[2],
-                    get_mmvq_mmid_max_batch(src0->type, cc),
-                    ggml_cuda_should_use_mmq(src0->type, cc, src1->ne[2], src0->ne[2]),
-                    ggml_cuda_should_use_mmf(src0->type, cc, WARP_SIZE, src0->ne, src0->nb,
-                                             src1->ne[2], /*mul_mat_id=*/true));
-            fflush(stderr);
-        }
-    }
-
     if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
         return true;
     }
@@ -4445,17 +4431,15 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     const void * graph_key = nullptr;
 
 #ifdef USE_CUDA_GRAPH
-    bool graph_compatible = false;
-    bool properties_changed = false;
     graph_key = ggml_cuda_graph_get_key(cgraph);
 
     ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
 
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
     if (graph->is_enabled()) {
-        graph_compatible = ggml_cuda_graph_check_compability(cgraph);
+        const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
         if (graph_compatible) {
-            properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
+            const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
 
             if (!graph->warmup_complete) {
                 // Warmup: need at least 2 calls with no property change on the 2nd call
@@ -4479,21 +4463,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
             }
         }
     }
-
-    if (getenv("GGML_CUDA_GRAPH_DEBUG")) {
-        static std::atomic<int> n_dbg(0);
-        if (n_dbg.fetch_add(1) < 2000) {
-            fprintf(stderr, "[gdbg] compute cg=%p n=%d uid=%llu key=%p compat=%d enabled=%d warmup=%d "
-                    "props_changed=%d use=%d upd=%d inst=%p\n",
-                    (void *) cgraph, cgraph->n_nodes, (unsigned long long) cgraph->uid, graph_key,
-                    graph_compatible, graph->is_enabled(), graph->warmup_complete,
-                    properties_changed, use_cuda_graph, cuda_graph_update_required,
-                    (void *) graph->instance);
-            fflush(stderr);
-        }
-    }
 #endif // USE_CUDA_GRAPH
-
     if (use_cuda_graph && cuda_graph_update_required) {
         // Start CUDA graph capture
         {
