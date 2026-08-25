@@ -276,14 +276,6 @@ bool llama_expert_pool_parse_init(const std::string & path, int32_t n_layer,
             }
         }
         const int32_t m = (int32_t) dedup.size();
-        if (getenv("GGML_CUDA_GRAPH_DEBUG")) {
-            fprintf(stderr, "[gdbg] parse il=%d n_slot=%d n_expert=%d dedup[0..3]=", il, n_slot, n_expert);
-            for (int32_t q = 0; q < 4 && q < (int32_t) dedup.size(); ++q) {
-                fprintf(stderr, "%d ", dedup[q]);
-            }
-            fprintf(stderr, "(line: %.60s)\n", line.c_str());
-            fflush(stderr);
-        }
         for (int32_t s = 0; s < m; ++s) {
             resident[il][s] = dedup[s];
         }
@@ -385,6 +377,9 @@ void llama_expert_pool_delegate_begin(
         if (ilx == 0 && st.logged_il != il) {
             st.log_step += 1;
             st.logged_il = -1;
+            // step boundary: flush the PREVIOUS step's lines (1 syscall/step,
+            // vs per-line fflush which cost measurable time on the hot path)
+            fflush(st.rt_log);
         }
         if (st.logged_il != il) {
             st.logged_il = il;
@@ -394,7 +389,6 @@ void llama_expert_pool_delegate_begin(
                 fprintf(st.rt_log, ",%d", e);
             }
             fputc('\n', st.rt_log);
-            fflush(st.rt_log);
         }
     }
     const bool is_down = (which == 3);
