@@ -5,6 +5,7 @@
 #include "ggml-backend.h"
 
 #include <cstdint>
+#include <cstdio>
 #include <string>
 #include <vector>
 #include <unordered_map>
@@ -151,26 +152,39 @@ struct llama_expert_pool_state {
     ggml_backend_buffer_t host_buf = nullptr;          // pinned host mirrors (fast H2D/D2H)
     void * host_cur = nullptr;                         // pinned mirror of t_cur
     void * host_ids = nullptr;                         // pinned mirror of t_ids
-    void * host_out = nullptr;                         // pinned mirror of t_out hit rows
+    bool async_d2h = false;                            // stream-ordered D2H in begin (GGML_EXPPOOL_ASYNC_D2H=1)
 
     // per-layer cached mini graphs (built once at fill time; each call only
-    // refills t_cur/t_ids and recomputes): index [il][0]=up/[1]=gate (separated),
-    // [il][0]=fused gate/up (no other entry)
+    // refills t_cur/t_ids and recomputes). each entry owns the llm_graph
+    // context/result that built it (the chain is built by calling
+    // build_moe_ffn(chain_only) with pool weights, so the model's own
+    // activation variants are reused verbatim).
     struct mini_graph_entry {
-        ggml_cgraph * g = nullptr;
-        ggml_tensor * out_up = nullptr;    // up output (nullptr when fused single)
-        ggml_tensor * out_gate = nullptr;  // gate output (nullptr when fused single)
+        ggml_cgraph * g = nullptr;         // the built whole-chain graph
+        ggml_tensor * out_down = nullptr;  // down output (chain result)
+        void * gres = nullptr;             // llm_graph_result* (owned)
     };
     std::vector<std::vector<mini_graph_entry>> mini;
+    std::vector<ggml_backend_buffer_t> layer_bufs; // per-layer chain scratch (freed in reset)
+    std::vector<ggml_tensor *> layer_out_down;     // per-layer chain result tensors
 
     // fused up+gate submission state: the first begin of a layer submits the
     // combined graph; the second begin only scans ids and returns the skip table.
     // end() uses this map to find (il, which) for a given dst tensor.
     std::unordered_map<const ggml_tensor *, std::pair<int32_t, int32_t>> dst_ilx_which;
-    ggml_tensor * t_out_up = nullptr;      // [n_ff, n_used] up hit output (GPU)
-    ggml_tensor * t_out_gate = nullptr;    // [n_ff, n_used] gate hit output (GPU)
+    ggml_tensor * t_out_down = nullptr;    // [n_embd, n_used] F32 down hit output (GPU) — chain result
+    void * host_out_down = nullptr;        // pinned mirror of t_out_down
     bool mini_submitted = false;           // combined graph already submitted this step
     int32_t mini_submitted_il = -1;        // which layer submitted it
+    ggml_backend_event_t ev = nullptr;     // per-submit completion event (end() waits only its own graph)
+
+    // runtime routing log (GGML_EXPPOOL_ROUTING_LOG=<path>; ONLY for analysis,
+    // writes the raw ids seen by the delegate: "step,layer,id0,id1,..." — the
+    // same format as the CB-on capture, but from the REAL NO_CB execution).
+    FILE * rt_log = nullptr;               // opened lazily on first begin
+    bool   rt_log_tried = false;           // env already checked (avoid re-getenv)
+    uint64_t log_step = 0;                 // current decode step (incremented at ilx==0)
+    int32_t logged_il = -1;                // last logged layer id (dedup per step)
 
     void reset();
 };
@@ -184,6 +198,21 @@ bool llama_expert_pool_parse_init(const std::string & path, int32_t n_layer,
 // random resident set per layer (fixed seed, reproducible)
 void llama_expert_pool_random(int32_t n_layer, int32_t n_expert, int32_t n_slot,
                               std::vector<std::vector<int32_t>> & resident);
+
+struct llama_chain_params {
+    int      type_op  = -1;      // llm_ffn_op_type as int (-1 = not registered)
+    bool     norm_w   = false;
+    float    w_scale  = 1.0f;
+    uint32_t gating_op = 0;
+};
+
+// registered by build_moe_ffn at the real call site (il >= 0, pool active):
+// exact per-layer chain parameters of THIS model. pool mini graphs look them
+// up and call build_moe_ffn(chain_only) with the same values, so every
+// arch/variant is handled by the same code without per-model replication.
+void llama_expert_pool_register_chain(int il, int type_op, bool norm_w, float w_scale, uint32_t gating_op);
+const llama_chain_params & llama_expert_pool_get_chain(int il);
+void llama_expert_pool_clear_chain();
 
 // moe delegate: called by the CPU MUL_MAT_ID kernel for cache-hit experts (see ggml-cpu.h)
 void llama_expert_pool_delegate_begin(
