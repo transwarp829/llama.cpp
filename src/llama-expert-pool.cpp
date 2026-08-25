@@ -3,7 +3,36 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 
+#include "llama-graph.h"   // llm_graph_result (mini chain owner, deleted in reset)
+
 #include <algorithm>
+
+// ---- per-layer chain param registry (see llama-expert-pool.h) ----
+namespace {
+    std::vector<llama_chain_params> g_chain; // indexed by layer id
+}
+
+void llama_expert_pool_register_chain(int il, int type_op, bool norm_w, float w_scale, uint32_t gating_op) {
+    if (il < 0) {
+        return;
+    }
+    if ((size_t) il >= g_chain.size()) {
+        g_chain.resize(il + 1);
+    }
+    g_chain[il] = { type_op, norm_w, w_scale, gating_op };
+}
+
+const llama_chain_params & llama_expert_pool_get_chain(int il) {
+    static const llama_chain_params none {};
+    if (il < 0 || (size_t) il >= g_chain.size() || g_chain[il].type_op < 0) {
+        return none;
+    }
+    return g_chain[il];
+}
+
+void llama_expert_pool_clear_chain() {
+    g_chain.clear();
+}
 
 void llama_expert_pool::init(int32_t n_layer, int32_t n_expert, int32_t n_slot, int64_t expert_size) {
     enabled   = true;
@@ -157,6 +186,21 @@ void llama_expert_pool_state::reset() {
     slots.clear();
     delegate_ok = false;
     gpu_backend = nullptr;
+    // free the per-layer chain graphs and their scratch buffers (built in
+    // expert_pool_fill via build_moe_ffn(chain_only))
+    for (auto & x : mini) {
+        for (auto & m : x) {
+            delete (llm_graph_result *) m.gres;
+        }
+    }
+    mini.clear();
+    for (ggml_backend_buffer_t b : layer_bufs) {
+        ggml_backend_buffer_free(b);
+    }
+    layer_bufs.clear();
+    layer_out_down.clear();
+
+    async_d2h = getenv("GGML_EXPPOOL_ASYNC_D2H") != nullptr && getenv("GGML_EXPPOOL_ASYNC_D2H")[0] == '1';
     dg_buf = nullptr;
     t_cur = nullptr;
     t_out = nullptr;
@@ -165,6 +209,15 @@ void llama_expert_pool_state::reset() {
     n_hit = 0;
     hit_slots.clear();
     hit_cols.clear();
+
+    // runtime routing log cleanup (GGML_EXPPOOL_ROUTING_LOG)
+    if (rt_log != nullptr) {
+        fclose(rt_log);
+    }
+    rt_log = nullptr;
+    rt_log_tried = false;
+    log_step = 0;
+    logged_il = -1;
 }
 
 // parse seed csv: one line per layer "il,e1,e2,...". layers missing from the
@@ -223,6 +276,14 @@ bool llama_expert_pool_parse_init(const std::string & path, int32_t n_layer,
             }
         }
         const int32_t m = (int32_t) dedup.size();
+        if (getenv("GGML_CUDA_GRAPH_DEBUG")) {
+            fprintf(stderr, "[gdbg] parse il=%d n_slot=%d n_expert=%d dedup[0..3]=", il, n_slot, n_expert);
+            for (int32_t q = 0; q < 4 && q < (int32_t) dedup.size(); ++q) {
+                fprintf(stderr, "%d ", dedup[q]);
+            }
+            fprintf(stderr, "(line: %.60s)\n", line.c_str());
+            fflush(stderr);
+        }
         for (int32_t s = 0; s < m; ++s) {
             resident[il][s] = dedup[s];
         }
@@ -296,10 +357,47 @@ void llama_expert_pool_delegate_begin(
     if (il < 0) {
         return;
     }
-    if (which == 3) {
-        // down uses the per-column expert input layout; not delegated in V2
+    // delegation targets the decode shape only (one token per call). larger
+    // batches that stay on the CPU (e.g. speculative-verification, below the
+    // scheduler's offload_min_batch) would be silently corrupted: the skip
+    // table is per-expert while the mini graph carries a single token, so
+    // non-first tokens' hit rows would be skipped and never computed.
+    // bail out to the full CPU path for those. (must sit before the
+    // dst_ilx_which insert below so end() ignores the node entirely.)
+    if (ids->ne[1] != 1) {
         return;
     }
+    // --- runtime routing log (env-gated, B=1 decode rows only): write the raw
+    // expert ids the delegate actually sees, one line per (step, pooled layer).
+    // step counting: the first begin of each step is the first pooled layer
+    // (up fires before gate/down in build order), so ilx==0 starts a new step.
+    if (!st.rt_log_tried) {
+        st.rt_log_tried = true;
+        const char * lp = getenv("GGML_EXPPOOL_ROUTING_LOG");
+        if (lp != nullptr && lp[0] != '\0') {
+            st.rt_log = fopen(lp, "w");
+            if (st.rt_log != nullptr) {
+                fprintf(st.rt_log, "step,layer,expert_ids\n");
+            }
+        }
+    }
+    if (st.rt_log != nullptr) {
+        if (ilx == 0 && st.logged_il != il) {
+            st.log_step += 1;
+            st.logged_il = -1;
+        }
+        if (st.logged_il != il) {
+            st.logged_il = il;
+            fprintf(st.rt_log, "%llu,%d", (unsigned long long) st.log_step, il);
+            for (int id = 0; id < (int) ids->ne[0]; ++id) {
+                const int32_t e = *((const int32_t *) ((const char *) ids->data + id*ids->nb[0]));
+                fprintf(st.rt_log, ",%d", e);
+            }
+            fputc('\n', st.rt_log);
+            fflush(st.rt_log);
+        }
+    }
+    const bool is_down = (which == 3);
     // remember (ilx, which) for end() to map a dst back to its output region
     st.dst_ilx_which[dst] = std::make_pair(ilx, which);
 
@@ -345,37 +443,27 @@ void llama_expert_pool_delegate_begin(
         return; // pinned mirrors unavailable; fall back to full CPU compute
     }
 
-    // cur -> GPU scratch (generic: src1 may be 2D/3D, single token on decode)
-    const int64_t dbg_t1 = ggml_time_us();
-    ggml_backend_tensor_get(src1, st.host_cur, 0, ggml_nbytes(src1));
-    ggml_backend_tensor_set(st.t_cur, st.host_cur, 0, ggml_nbytes(st.t_cur));
-    const int64_t dbg_t2 = ggml_time_us();
-    // hit slots -> ids scratch (padding zeros; extra columns are ignored via n_hit)
-    memset(st.host_ids, 0, (size_t) st.n_used * sizeof(int32_t));
-    memcpy(st.host_ids, st.hit_slots.data(), (size_t) st.n_hit * sizeof(int32_t));
-    ggml_backend_tensor_set(st.t_ids, st.host_ids, 0, (size_t) st.n_used * sizeof(int32_t));
-    const int64_t dbg_t3 = ggml_time_us();
-
     const llama_expert_pool_state::mini_graph_entry & m = st.mini[ilx][0];
     if (m.g == nullptr) {
         st.n_hit = 0;
         return;
     }
-    // a new layer starts a new submit round: reset the combined-graph flag
-    // BEFORE deciding whether this layer has to submit (need_submit below
-    // reads it; using the previous layer's leftover value would skip the
-    // submission and write stale GPU data back to this layer's dst).
+    // a new layer starts a new submit round: reset BEFORE deciding whether
+    // this layer has to submit. the whole-chain graph is submitted ONCE per
+    // layer, by whichever MoE kernel fires first this layer (up is always
+    // first in build order); later begins only scan and return skip tables.
     if (st.mini_submitted_il != il) {
         st.mini_submitted = false;
     }
+    if (st.mini_submitted) {
+        *skip_out = st.slots[il].data();
+        return;
+    }
 
-    // combined up+gate graph: submit it once per layer (first begin of the layer
-    // submits, the second begin only scans and returns the skip table). fused
-    // gate/up (single output) or single-matrix models submit on every begin.
-    const bool combined = m.out_up != nullptr && m.out_gate != nullptr;
-    bool need_submit = !combined || !st.mini_submitted;
-    if (need_submit) {
+    {
         const int64_t dbg_t1 = ggml_time_us();
+        // input copy: token activations (src1) into t_cur; the down stage's
+        // swiglu input is produced on-GPU by this same graph (no H2D needed)
         ggml_backend_tensor_get(src1, st.host_cur, 0, ggml_nbytes(src1));
         ggml_backend_tensor_set(st.t_cur, st.host_cur, 0, ggml_nbytes(st.t_cur));
         const int64_t dbg_t2 = ggml_time_us();
@@ -390,12 +478,14 @@ void llama_expert_pool_delegate_begin(
             st.n_hit = 0;
             return;
         }
+        ggml_backend_event_record(st.ev, st.gpu_backend);
         st.mini_submitted = true;
         st.mini_submitted_il = il;
 
         // accumulate per-layer statistics (delegate runs on the ith==0 thread only)
         if ((size_t) ilx < st.s_layer.size()) {
             st.s_layer[ilx].submits   += 1;
+            st.s_layer[ilx].hit_rows  += (uint64_t) st.n_hit;
             st.s_layer[ilx].miss_rows += (uint64_t) (ids->ne[0] - st.n_hit);
             st.s_layer[ilx].getset_us += (uint64_t) (dbg_t2 - dbg_t1);
             st.s_layer[ilx].ids_us    += (uint64_t) (dbg_t3 - dbg_t2);
@@ -412,7 +502,10 @@ void llama_expert_pool_delegate_end(ggml_tensor * dst, void * ud) {
     if (st.n_hit == 0 || !st.delegate_ok) {
         return;
     }
-    // map this dst back to (ilx, which); unknown dst -> nothing to write back
+    // map this dst back to (ilx, which); unknown dst -> nothing to write back.
+    // with the whole-chain mini graph the ONLY end that does work is the down
+    // kernel's (gate/up hit results live entirely on-GPU now); every other
+    // end just drops n_hit so a stray call cannot double-write.
     auto it = st.dst_ilx_which.find(dst);
     if (it == st.dst_ilx_which.end()) {
         st.n_hit = 0;
@@ -420,26 +513,37 @@ void llama_expert_pool_delegate_end(ggml_tensor * dst, void * ud) {
     }
     const int32_t ilx = it->second.first;
     const int32_t which = it->second.second;
+    const bool is_down = (which == 3);
+    if (!is_down) {
+        st.n_hit = 0;
+        return;
+    }
     const llama_expert_pool_state::mini_graph_entry & m = st.mini[ilx][0];
-    const ggml_tensor * out_t = (which == 2) ? m.out_gate : m.out_up;
+    const ggml_tensor * out_t = m.out_down;
     if (out_t == nullptr) {
         st.n_hit = 0;
         return;
     }
 
     const int64_t dbg_t0 = ggml_time_us();
-    const size_t row_bytes = st.sz_out_row;
-    ggml_backend_synchronize(st.gpu_backend);
+    // down outputs are [n_embd, n_used]: row = n_embd floats, dst->nb[1] is
+    // the column stride in bytes
+    const size_t row_bytes = dst->nb[1];
+    void * host_out = st.host_out_down;
+    // wait for THIS layer's whole-chain graph (event recorded at submit), then
+    // pull the hit columns synchronously; by now the GPU had the whole CPU
+    // miss-kernel time to finish, so the wait is usually near-zero
+    ggml_backend_event_synchronize(st.ev);
+    ggml_backend_tensor_get(out_t, host_out, 0, (size_t) st.n_hit * row_bytes);
     const int64_t dbg_t1 = ggml_time_us();
-    ggml_backend_tensor_get(out_t, st.host_out, 0, (size_t) st.n_hit * row_bytes);
     for (int i = 0; i < st.n_hit; ++i) {
         float * dst_col = (float *) ((char *) dst->data + st.hit_cols[i]*dst->nb[1]);
-        memcpy(dst_col, (float *) st.host_out + (size_t) i * (row_bytes / sizeof(float)), row_bytes);
+        memcpy(dst_col, (float *) host_out + (size_t) i * (row_bytes / sizeof(float)), row_bytes);
     }
 
-    // accumulate per-layer statistics (delegate runs on the ith==0 thread only)
+    // accumulate per-layer statistics; hit_rows is recorded in begin (once per
+    // layer), so end only records timings.
     if ((size_t) ilx < st.s_layer.size()) {
-        st.s_layer[ilx].hit_rows += (uint64_t) st.n_hit;
         st.s_layer[ilx].sync_us  += (uint64_t) (dbg_t1 - dbg_t0);
         st.s_layer[ilx].get_us   += (uint64_t) (ggml_time_us() - dbg_t1);
     }
