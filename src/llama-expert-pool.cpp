@@ -213,6 +213,7 @@ void llama_expert_pool_state::reset() {
     rt_log_tried = false;
     log_step = 0;
     logged_il = -1;
+    rt_step_done = false;
 }
 
 // parse seed csv: one line per layer "il,e1,e2,...". layers missing from the
@@ -344,9 +345,12 @@ void llama_expert_pool_delegate_begin(
         }
     }
     if (st.rt_log != nullptr) {
-        if (ilx == 0 && st.logged_il != il) {
+        // new decode step when the FIRST pooled layer logs again after the
+        // LAST one did (a layer-id-change test breaks with one pooled layer)
+        if (ilx == 0 && st.rt_step_done) {
             st.log_step += 1;
             st.logged_il = -1;
+            st.rt_step_done = false;
             // step boundary: flush the PREVIOUS step's lines (1 syscall/step,
             // vs per-line fflush which cost measurable time on the hot path)
             fflush(st.rt_log);
@@ -359,6 +363,9 @@ void llama_expert_pool_delegate_begin(
                 fprintf(st.rt_log, ",%d", e);
             }
             fputc('\n', st.rt_log);
+            if (ilx == (int32_t) st.pooled_layers.size() - 1) {
+                st.rt_step_done = true;
+            }
         }
     }
     // remember (ilx, which) for end() to map a dst back to its output region
@@ -400,6 +407,9 @@ void llama_expert_pool_delegate_begin(
             }
             st.mini_submitted_il = il;
         }
+        // nothing was delegated this call; clear a possible stale submit flag
+        // so a hit on a later step cannot be answered with old GPU output
+        st.mini_submitted = false;
         return; // nothing to delegate
     }
     if (st.host_buf == nullptr) {
@@ -511,4 +521,7 @@ void llama_expert_pool_delegate_end(ggml_tensor * dst, void * ud) {
         st.s_layer[ilx].get_us   += (uint64_t) (ggml_time_us() - dbg_t1);
     }
     st.n_hit = 0;
+    // re-arm for a possible next step with the same single pooled layer
+    // (begin only re-arms on a layer change, which never fires in that case)
+    st.mini_submitted = false;
 }
