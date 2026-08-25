@@ -284,6 +284,18 @@ int main(int argc, char ** argv) {
     const llama_vocab * vocab = llama_model_get_vocab(model);
     const bool add_bos = llama_vocab_get_add_bos(vocab);
     std::string prompt = params.prompt;
+    // -f/--file: read the prompt file (common's prompt_file field is parsed but
+    // not consumed by any common function in this tree; read it here). only
+    // used when -p/--prompt was not given on the command line.
+    if (prompt.empty() && !params.prompt_file.empty()) {
+        std::ifstream fin(params.prompt_file);
+        if (!fin) {
+            LOG_ERR("%s: failed to open prompt file %s\n", __func__, params.prompt_file.c_str());
+            return 1;
+        }
+        prompt.assign((std::istreambuf_iterator<char>(fin)), std::istreambuf_iterator<char>());
+        LOG_INF("%s: prompt file loaded (%zu chars)\n", __func__, prompt.size());
+    }
     // chat-template mode (like llama-cli -cnv): STEP_PROFILE_CHAT_FILE
     // = text file used as the user message; the model's own chat template
     // (from GGUF metadata) is applied before tokenizing.
