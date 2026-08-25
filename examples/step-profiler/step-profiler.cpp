@@ -301,11 +301,6 @@ int main(int argc, char ** argv) {
         common_chat_params cp = common_chat_templates_apply(tmpls.get(), inputs);
         prompt = cp.prompt;
         LOG_INF("%s: chat template applied (%d chars), prompt %zu chars\n", __func__, (int) content.size(), prompt.size());
-        fprintf(stderr, "[dbg-chat] prompt head: %.500s\n", prompt.c_str());
-        std::ofstream fpd("chat_prompt_debug.txt");
-        fpd << prompt;
-        fpd.close();
-        fprintf(stderr, "[dbg-chat] dumped full prompt to chat_prompt_debug.txt (%zu chars)\n", prompt.size());
     }
     std::vector<llama_token> tokens = common_tokenize(ctx, prompt, false, true);
 
