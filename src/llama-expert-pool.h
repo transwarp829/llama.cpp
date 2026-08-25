@@ -87,9 +87,8 @@ struct llama_expert_pool {
 // never refreshed in the static v1; swap logic is not wired in yet.
 struct llama_expert_pool_state {
     bool enabled = false;
-    int32_t n_slot = 0;   // slots per pooled layer
 
-    // original weight tensors, indexed by layer (null = not present); used by
+    // the original weight tensors, indexed by layer (null = not present); used by
     // the graph to pair a mul_mat_id weight with its pool copy
     std::vector<ggml_tensor *> orig_gate_up;
     std::vector<ggml_tensor *> orig_up;
@@ -189,10 +188,13 @@ struct llama_expert_pool_state {
     void reset();
 };
 
-// seed the pool from a csv file, one line per layer: "il,e1,e2,...".
-// layers missing from the file / with fewer entries are filled randomly.
+// seed the pool from a csv file, one line per layer: "il,e1,e2,...". the
+// per-layer slot count = number of entries on that layer's line (the file
+// itself determines the distribution; nothing is padded with random experts).
+// layers missing from the file get zero slots (the layer falls back to full
+// CPU compute). returns false only if the file cannot be opened.
 bool llama_expert_pool_parse_init(const std::string & path, int32_t n_layer,
-                                  int32_t n_expert, int32_t n_slot,
+                                  int32_t n_expert,
                                   std::vector<std::vector<int32_t>> & resident);
 
 // random resident set per layer (fixed seed, reproducible)

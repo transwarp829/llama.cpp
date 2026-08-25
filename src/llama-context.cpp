@@ -692,7 +692,6 @@ void llama_context::expert_pool_init() {
     }
 
     st.enabled = true;
-    st.n_slot  = n_slot;
     st.orig_gate_up.resize(n_layer, nullptr);
     st.orig_up.resize(n_layer, nullptr);
     st.orig_gate.resize(n_layer, nullptr);
@@ -711,7 +710,7 @@ void llama_context::expert_pool_init() {
     // --- resident sets: csv seed or random ---
     bool ok = false;
     if (cparams.expert_pool_init && cparams.expert_pool_init[0]) {
-        ok = llama_expert_pool_parse_init(cparams.expert_pool_init, n_layer, n_expert, n_slot, st.resident);
+        ok = llama_expert_pool_parse_init(cparams.expert_pool_init, n_layer, n_expert, st.resident);
         if (!ok) {
             LLAMA_LOG_WARN("%s: failed to read --expert-pool-init '%s', falling back to random\n",
                     __func__, cparams.expert_pool_init);
@@ -727,25 +726,36 @@ void llama_context::expert_pool_init() {
 
     for (int32_t il : pooled_ils) {
         const llama_layer & L = model.layers[il];
+        // per-layer slot count = the pool file's line length for this layer;
+        // zero-slot layers get no pool tensors (delegate falls back to CPU).
+        const int32_t s_il = (int32_t) st.resident[il].size();
         if (L.ffn_gate_up_exps) {
             st.orig_gate_up[il] = L.ffn_gate_up_exps;
-            st.w_pool_gate_up[il] = ggml_new_tensor_4d(pool_ctx, L.ffn_gate_up_exps->type,
-                    L.ffn_gate_up_exps->ne[0], L.ffn_gate_up_exps->ne[1], n_slot, 1);
+            if (s_il > 0) {
+                st.w_pool_gate_up[il] = ggml_new_tensor_4d(pool_ctx, L.ffn_gate_up_exps->type,
+                        L.ffn_gate_up_exps->ne[0], L.ffn_gate_up_exps->ne[1], s_il, 1);
+            }
         }
         if (L.ffn_up_exps) {
             st.orig_up[il] = L.ffn_up_exps;
-            st.w_pool_up[il] = ggml_new_tensor_4d(pool_ctx, L.ffn_up_exps->type,
-                    L.ffn_up_exps->ne[0], L.ffn_up_exps->ne[1], n_slot, 1);
+            if (s_il > 0) {
+                st.w_pool_up[il] = ggml_new_tensor_4d(pool_ctx, L.ffn_up_exps->type,
+                        L.ffn_up_exps->ne[0], L.ffn_up_exps->ne[1], s_il, 1);
+            }
         }
         if (L.ffn_gate_exps) {
             st.orig_gate[il] = L.ffn_gate_exps;
-            st.w_pool_gate[il] = ggml_new_tensor_4d(pool_ctx, L.ffn_gate_exps->type,
-                    L.ffn_gate_exps->ne[0], L.ffn_gate_exps->ne[1], n_slot, 1);
+            if (s_il > 0) {
+                st.w_pool_gate[il] = ggml_new_tensor_4d(pool_ctx, L.ffn_gate_exps->type,
+                        L.ffn_gate_exps->ne[0], L.ffn_gate_exps->ne[1], s_il, 1);
+            }
         }
         if (L.ffn_down_exps) {
             st.orig_down[il] = L.ffn_down_exps;
-            st.w_pool_down[il] = ggml_new_tensor_4d(pool_ctx, L.ffn_down_exps->type,
-                    L.ffn_down_exps->ne[0], L.ffn_down_exps->ne[1], n_slot, 1);
+            if (s_il > 0) {
+                st.w_pool_down[il] = ggml_new_tensor_4d(pool_ctx, L.ffn_down_exps->type,
+                        L.ffn_down_exps->ne[0], L.ffn_down_exps->ne[1], s_il, 1);
+            }
         }
         // remap/mask tables live in the pool buffer (same device as the pool
         // weights) so the warm-path get_rows/mul stay on the fast device;
@@ -782,8 +792,12 @@ void llama_context::expert_pool_init() {
     // pool tensors back to the CPU for the hot/cold merge
     ggml_backend_buffer_set_usage(pool_buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
 
-    LLAMA_LOG_INFO("%s: expert pool enabled: %d pooled layers, %d slots/layer (%d total)\n",
-            __func__, n_pooled, n_slot, n_pooled * n_slot);
+    int32_t tot_slots = 0;
+    for (int32_t il : pooled_ils) {
+        tot_slots += (int32_t) st.resident[il].size();
+    }
+    LLAMA_LOG_INFO("%s: expert pool enabled: %d pooled layers, %d slots total (? %d/layer if uniform)\n",
+            __func__, n_pooled, tot_slots, n_slot);
     {
         size_t pool_bytes = 0;
         for (int32_t il : pooled_ils) {
@@ -793,7 +807,8 @@ void llama_context::expert_pool_init() {
             }
         }
         LLAMA_LOG_INFO("%s: pool weight bytes = %.2f GB (%.1f MiB per expert)\n",
-                __func__, pool_bytes / 1e9, pool_bytes / (double) (n_pooled * n_slot) / 1.0e6);
+                __func__, pool_bytes / 1e9,
+                tot_slots > 0 ? pool_bytes / (double) tot_slots / 1.0e6 : 0.0);
     }
 
     // the actual weight/table fill is deferred to expert_pool_fill(), called
@@ -807,7 +822,6 @@ void llama_context::expert_pool_fill() {
         return;
     }
     const int32_t n_expert = model.hparams.n_expert;
-    const int32_t n_slot = st.n_slot;
 
     // --- fill weights + tables (model tensor data is valid now) ---
     std::vector<int32_t> remap(n_expert, 0);
@@ -824,7 +838,7 @@ void llama_context::expert_pool_fill() {
         std::fill(cold.begin(), cold.end(), 1);
         std::vector<int32_t> & slot_tab = st.slots[il];
         slot_tab.assign(n_expert, -1);
-        for (int32_t s = 0; s < n_slot; ++s) {
+        for (int32_t s = 0; s < (int32_t) res.size(); ++s) {
             const int32_t e = res[s];
             if (e < 0 || e >= n_expert) {
                 continue;
@@ -844,7 +858,7 @@ void llama_context::expert_pool_fill() {
             }
             // per-expert size: for quantized types use the stride, not ne0*ne1*type_size
             const size_t sz = src->nb[2];
-            for (int32_t s = 0; s < n_slot; ++s) {
+            for (int32_t s = 0; s < (int32_t) res.size(); ++s) {
                 const int32_t e = res[s];
                 if (e < 0 || e >= n_expert) {
                     continue;
