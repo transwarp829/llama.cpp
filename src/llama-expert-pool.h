@@ -166,6 +166,9 @@ struct llama_expert_pool_state {
     void * host_out_down = nullptr;        // pinned mirror of t_out_down
     bool mini_submitted = false;           // combined graph already submitted this step
     int32_t mini_submitted_il = -1;        // which layer submitted it
+                                           // note: begin re-arms on a layer CHANGE,
+                                           // end() re-arms after write-back (either
+                                           // alone misses the single-pool-layer case)
     ggml_backend_event_t ev = nullptr;     // per-submit completion event (end() waits only its own graph)
 
     // runtime routing log (GGML_EXPPOOL_ROUTING_LOG=<path>; ONLY for analysis,
@@ -175,6 +178,8 @@ struct llama_expert_pool_state {
     bool   rt_log_tried = false;           // env already checked (avoid re-getenv)
     uint64_t log_step = 0;                 // current decode step (incremented at ilx==0)
     int32_t logged_il = -1;                // last logged layer id (dedup per step)
+    bool   rt_step_done = false;           // last pooled layer logged since the last
+                                           // step advance (single-layer-safe step detect)
 
     void reset();
 };
