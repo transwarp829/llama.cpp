@@ -173,7 +173,6 @@ int32_t llama_expert_pool::total_resident() const {
 
 void llama_expert_pool_state::reset() {
     enabled = false;
-    n_slot = 0;
     w_pool_gate_up.clear();
     w_pool_up.clear();
     w_pool_gate.clear();
@@ -221,22 +220,17 @@ void llama_expert_pool_state::reset() {
 }
 
 // parse seed csv: one line per layer "il,e1,e2,...". layers missing from the
-// file (or with fewer than n_slot entries) are filled randomly; extra entries
-// are truncated. returns false on parse error (bad line / bad il).
+// file get zero slots (full CPU fallback); the per-layer slot count is the
+// line length, i.e. the pool file itself defines the budget distribution.
+// returns false only on open failure.
 bool llama_expert_pool_parse_init(const std::string & path, int32_t n_layer,
-                                  int32_t n_expert, int32_t n_slot,
+                                  int32_t n_expert,
                                   std::vector<std::vector<int32_t>> & resident) {
     std::ifstream f(path);
     if (!f) {
         return false;
     }
-    resident.assign(n_layer, std::vector<int32_t>(n_slot, -1));
-    std::mt19937 rng(0);
-    for (int32_t il = 0; il < n_layer; ++il) {
-        for (int32_t s = 0; s < n_slot; ++s) {
-            resident[il][s] = (int32_t) (rng() % n_expert);
-        }
-    }
+    resident.assign(n_layer, std::vector<int32_t>());
     std::string line;
     while (std::getline(f, line)) {
         std::istringstream ss(line);
@@ -261,34 +255,14 @@ bool llama_expert_pool_parse_init(const std::string & path, int32_t n_layer,
             }
             experts.push_back(e);
         }
-        if (experts.empty()) {
-            continue;
-        }
-        // use up to n_slot entries, dedup
-        std::fill(resident[il].begin(), resident[il].end(), -1);
+        // dedup, keep order (the file writer emits already-deduped lists)
         std::vector<int32_t> dedup;
         for (int32_t e : experts) {
             if (std::find(dedup.begin(), dedup.end(), e) == dedup.end()) {
                 dedup.push_back(e);
             }
-            if ((int32_t) dedup.size() == n_slot) {
-                break;
-            }
         }
-        const int32_t m = (int32_t) dedup.size();
-        for (int32_t s = 0; s < m; ++s) {
-            resident[il][s] = dedup[s];
-        }
-        while ((int32_t) dedup.size() < n_slot) {
-            const int32_t e = (int32_t) (rng() % n_expert);
-            if (std::find(dedup.begin(), dedup.end(), e) == dedup.end()) {
-                dedup.push_back(e);
-            }
-        }
-        const int32_t k = (int32_t) dedup.size();
-        for (int32_t s = 0; s < k; ++s) {
-            resident[il][s] = dedup[s];
-        }
+        resident[il] = dedup;
     }
     return true;
 }
