@@ -527,6 +527,10 @@ llama_context::~llama_context() {
     // moe delegate: unregister + release scratch buffers
     if (model.expert_pool_state.delegate_ok) {
         ggml_cpu_set_moe_delegate(nullptr, nullptr, nullptr);
+        if (model.expert_pool_state.ev != nullptr) {
+            ggml_backend_event_free(model.expert_pool_state.ev);
+            model.expert_pool_state.ev = nullptr;
+        }
         if (model.expert_pool_state.host_buf) {
             ggml_backend_buffer_free(model.expert_pool_state.host_buf);
             model.expert_pool_state.host_buf = nullptr;
@@ -546,10 +550,6 @@ llama_context::~llama_context() {
     if (pool_ctx) {
         ggml_free(pool_ctx);
         pool_ctx = nullptr;
-    }
-    if (pool_tab_ctx) {
-        ggml_free(pool_tab_ctx);
-        pool_tab_ctx = nullptr;
     }
 }
 
@@ -634,7 +634,7 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
 // - find the CPU-resident MoE layers (tensors matching a cpu buft override)
 // - allocate one pool weight copy per matrix (same type/layout, expert dim = S)
 // - seed the resident sets from --expert-pool-init csv, or at random
-// - copy the resident weights into the pool and build the mapping tables
+// - copy the resident weights into the pool and fill the slot tables
 void llama_context::expert_pool_init() {
     llama_expert_pool_state & st = model.expert_pool_state;
     st.reset();
@@ -700,9 +700,6 @@ void llama_context::expert_pool_init() {
     st.w_pool_up.resize(n_layer, nullptr);
     st.w_pool_gate.resize(n_layer, nullptr);
     st.w_pool_down.resize(n_layer, nullptr);
-    st.remap_tab.resize(n_layer, nullptr);
-    st.mask_tab.resize(n_layer, nullptr);
-    st.cold_mask_tab.resize(n_layer, nullptr);
     st.resident.resize(n_layer);
     st.pooled_layers = pooled_ils;
     st.s_layer.resize(pooled_ils.size());
@@ -720,9 +717,8 @@ void llama_context::expert_pool_init() {
         llama_expert_pool_random(n_layer, n_expert, n_slot, st.resident);
     }
 
-    // --- create pool weight tensors + mapping tables ---
-    pool_ctx     = ggml_init({ 4u*1024u*1024u, nullptr, true }); // no_alloc = true (allocated via buft)
-    pool_tab_ctx = ggml_init({ 1u*1024u*1024u, nullptr, false });
+    // --- create pool weight tensors ---
+    pool_ctx = ggml_init({ 4u*1024u*1024u, nullptr, true }); // no_alloc = true (allocated via buft)
 
     for (int32_t il : pooled_ils) {
         const llama_layer & L = model.layers[il];
@@ -757,12 +753,6 @@ void llama_context::expert_pool_init() {
                         L.ffn_down_exps->ne[0], L.ffn_down_exps->ne[1], s_il, 1);
             }
         }
-        // remap/mask tables live in the pool buffer (same device as the pool
-        // weights) so the warm-path get_rows/mul stay on the fast device;
-        // cold_mask stays on the host because the cold op runs on the CPU.
-        st.remap_tab[il]     = ggml_new_tensor_2d(pool_ctx, GGML_TYPE_I32, 1, n_expert);
-        st.mask_tab[il]      = ggml_new_tensor_2d(pool_ctx, GGML_TYPE_F32, 1, n_expert);
-        st.cold_mask_tab[il] = ggml_new_tensor_1d(pool_tab_ctx, GGML_TYPE_I8,  n_expert);
     }
 
     // --- allocate the pool tensors on the fastest non-CPU buft, fallback CPU ---
@@ -823,19 +813,13 @@ void llama_context::expert_pool_fill() {
     }
     const int32_t n_expert = model.hparams.n_expert;
 
-    // --- fill weights + tables (model tensor data is valid now) ---
-    std::vector<int32_t> remap(n_expert, 0);
+    // --- fill weights + slot tables (model tensor data is valid now) ---
     st.slots.resize(model.hparams.n_layer());
-    std::vector<float>   maskf(n_expert, 0.0f);
-    std::vector<uint8_t> cold(n_expert, 1);
 
     for (size_t pi = 0; pi < st.pooled_layers.size(); ++pi) {
         const int32_t il = st.pooled_layers[pi];
         const llama_layer & L = model.layers[il];
         const std::vector<int32_t> & res = st.resident[il];
-        std::fill(remap.begin(), remap.end(), 0);
-        std::fill(maskf.begin(), maskf.end(), 0.0f);
-        std::fill(cold.begin(), cold.end(), 1);
         std::vector<int32_t> & slot_tab = st.slots[il];
         slot_tab.assign(n_expert, -1);
         for (int32_t s = 0; s < (int32_t) res.size(); ++s) {
@@ -843,14 +827,8 @@ void llama_context::expert_pool_fill() {
             if (e < 0 || e >= n_expert) {
                 continue;
             }
-            remap[e] = s;
-            maskf[e] = 1.0f;
-            cold[e]  = 0;
             slot_tab[e] = s;
         }
-        ggml_backend_tensor_set(st.remap_tab[il],     remap.data(), 0, n_expert * sizeof(int32_t));
-        ggml_backend_tensor_set(st.mask_tab[il],      maskf.data(), 0, n_expert * sizeof(float));
-        memcpy(st.cold_mask_tab[il]->data, cold.data(), n_expert * sizeof(uint8_t));
 
         auto copy_slots = [&](ggml_tensor * src, ggml_tensor * pw) {
             if (src == nullptr || pw == nullptr) {
@@ -929,7 +907,7 @@ void llama_context::expert_pool_fill() {
                 // model's OWN build_moe_ffn in chain_only mode. every variant
                 // (activation op, clamps, fused gate_up vs separated, scales,
                 // biases, weight_before_ffn) is inherited from the main graph
-                // builder — the pool never replicates model logic.
+                // builder - the pool never replicates model logic.
                 st.mini.resize(st.pooled_layers.size());
                 for (size_t ilx = 0; ilx < st.pooled_layers.size(); ++ilx) {
                     const int32_t l = st.pooled_layers[ilx];

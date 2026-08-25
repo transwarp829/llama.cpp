@@ -6,6 +6,9 @@
 #include "llama-graph.h"   // llm_graph_result (mini chain owner, deleted in reset)
 
 #include <algorithm>
+#include <fstream>
+#include <random>
+#include <sstream>
 
 // ---- per-layer chain param registry (see llama-expert-pool.h) ----
 namespace {
@@ -167,19 +170,12 @@ int32_t llama_expert_pool::total_resident() const {
     return total;
 }
 
-#include <random>
-#include <fstream>
-#include <sstream>
-
 void llama_expert_pool_state::reset() {
     enabled = false;
     w_pool_gate_up.clear();
     w_pool_up.clear();
     w_pool_gate.clear();
     w_pool_down.clear();
-    remap_tab.clear();
-    mask_tab.clear();
-    cold_mask_tab.clear();
     resident.clear();
     pooled_layers.clear();
     slots.clear();
@@ -365,7 +361,6 @@ void llama_expert_pool_delegate_begin(
             fputc('\n', st.rt_log);
         }
     }
-    const bool is_down = (which == 3);
     // remember (ilx, which) for end() to map a dst back to its output region
     st.dst_ilx_which[dst] = std::make_pair(ilx, which);
 
