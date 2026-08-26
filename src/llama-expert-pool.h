@@ -115,6 +115,9 @@ struct llama_expert_pool_state {
     bool direct_mount = false;   // main-graph mount mode (GGML_EXPPOOL_MOUNT=1):
                                  // the hook only supplies skip tables + stats,
                                  // end() does no D2H write-back
+    bool rtlog_only = false;     // GGML_EXPPOOL_ROUTING_LOG with no pool: the
+                                 // hook only feeds the routing log (no slots,
+                                 // no delegation); set in expert_pool_init()
     ggml_backend_buffer_type_t pool_buft = nullptr;        // pool buft (device)
     ggml_backend_t gpu_backend = nullptr;                  // target device[[truncated]
     ggml_context *  mg_ctx    = nullptr;               // mini-graph ctx (no_alloc)
