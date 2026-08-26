@@ -277,6 +277,12 @@ bool llama_expert_pool_parse_init(const std::string & path, int32_t n_layer,
                 continue;
             }
             int32_t e = std::atoi(tok.c_str());
+            if (e == -1) {
+                // explicit empty slot: keeps a zero slice in the pool table
+                // (weight copy skips non-resident entries). maps nothing.
+                experts.push_back(e);
+                continue;
+            }
             if (e < 0 || e >= n_expert) {
                 continue;
             }
