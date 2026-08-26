@@ -1504,6 +1504,13 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
                 struct mmid_row_mapping row_mapping = MMID_MATRIX_ROW(cur_a, _i12);
                 const int id       = row_mapping.i1; // selected expert index
 
+                if (g_moe_active && g_moe_skip && g_moe_skip[cur_a] >= 0) {
+                    // placeholder row of a delegated (cache-hit) column: the
+                    // delegate fills this dst column at its original position;
+                    // the row only exists to keep later rows' mapping stable
+                    continue;
+                }
+
                 const int64_t  i11 = id % ne11;
                 const int64_t  i12 = row_mapping.i2; // row index in src1
 
@@ -1650,6 +1657,17 @@ static void ggml_compute_forward_mul_mat_id(
 
                 if (i02 == -1) {
                     memset((char *) dst->data + id*nb1 + iid1*nb2, 0, ne0*sizeof(float));
+                    continue;
+                }
+
+                if (g_moe_active && g_moe_skip[i02] >= 0) {
+                    // cache-hit expert: computed by the moe delegate. register a
+                    // PLACEHOLDER row so later rows keep their (i1, i2) mapping -
+                    // dst columns of the remaining rows must not shift when some
+                    // columns are delegated (the delegate writes hit columns at
+                    // their original positions itself)
+                    MMID_MATRIX_ROW(i02, matrix_row_counts[i02]) = (struct mmid_row_mapping) {id, iid1};
+                    matrix_row_counts[i02] += 1;
                     continue;
                 }
 
