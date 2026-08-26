@@ -199,6 +199,8 @@ int32_t llama_expert_pool::total_resident() const {
 
 void llama_expert_pool_state::reset() {
     enabled = false;
+    delegate_ok = false;
+    direct_mount = false;
     rtlog_only = false;
     w_pool_gate_up.clear();
     w_pool_up.clear();
