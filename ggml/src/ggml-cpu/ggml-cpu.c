@@ -1699,7 +1699,13 @@ static void ggml_compute_forward_mul_mat_id(
                 }
 
                 if (g_moe_active && g_moe_skip[i02] >= 0) {
-                    // cache-hit expert: handled by the moe delegate on the GPU
+                    // cache-hit expert: computed by the moe delegate. register a
+                    // PLACEHOLDER row so later rows keep their (i1, i2) mapping -
+                    // dst columns of the remaining rows must not shift when some
+                    // columns are delegated (the delegate writes hit columns at
+                    // their original positions itself)
+                    MMID_MATRIX_ROW(i02, matrix_row_counts[i02]) = (struct mmid_row_mapping) {id, iid1};
+                    matrix_row_counts[i02] += 1;
                     continue;
                 }
 
