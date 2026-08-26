@@ -199,6 +199,7 @@ int32_t llama_expert_pool::total_resident() const {
 
 void llama_expert_pool_state::reset() {
     enabled = false;
+    rtlog_only = false;
     w_pool_gate_up.clear();
     w_pool_up.clear();
     w_pool_gate.clear();
@@ -328,7 +329,10 @@ void llama_expert_pool_delegate_begin(
     llama_expert_pool_state & st = *(llama_expert_pool_state *) ud;
     *skip_out = nullptr;
     const int64_t dbg_t0 = ggml_time_us();
-    if (!st.delegate_ok || st.pooled_layers.empty()) {
+    if (st.pooled_layers.empty()) {
+        return;
+    }
+    if (!st.delegate_ok && !st.rtlog_only) {
         return;
     }
 
@@ -351,9 +355,11 @@ void llama_expert_pool_delegate_begin(
     // batches that stay on the CPU (e.g. speculative-verification, below the
     // scheduler's offload_min_batch) would be silently corrupted: the skip
     // table is per-expert while the mini graph carries a single token, so
-    // non-first tokens' hit rows would be skipped and never computed.
-    // bail out to the full CPU path for those. (must sit before the
+    // non-first tokens' hit rows would be skipped and never computed. bail
+    // out to the full CPU path for those. (must sit before the
     // dst_ilx_which insert below so end() ignores the node entirely.)
+    // the routing-log block above must stay ahead of this check: ids rows are
+    // only valid per single token, so B>1 calls must not be logged either.
     if (ids->ne[1] != 1) {
         return;
     }
@@ -394,6 +400,11 @@ void llama_expert_pool_delegate_begin(
                 st.rt_step_done = true;
             }
         }
+    }
+    // routing-log-only mode: the ids are logged above; delegate state stays
+    // untouched (no slots exist to consult, nothing to submit or skip)
+    if (st.rtlog_only) {
+        return;
     }
     // --- direct-mount mode: no mini graph, no event, no D2H. the GPU chain
     // runs inside the main graph itself (build_moe_ffn mount branch); this

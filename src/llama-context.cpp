@@ -525,7 +525,9 @@ llama_context::~llama_context() {
     ggml_opt_free(opt_ctx);
 
     // moe delegate: unregister + release scratch buffers
-    if (model.expert_pool_state.delegate_ok) {
+    // (rtlog_only registers the hook with delegate_ok left false, so it must
+    // be listed here too - otherwise a dangling ud survives destruction)
+    if (model.expert_pool_state.delegate_ok || model.expert_pool_state.rtlog_only) {
         ggml_cpu_set_moe_delegate(nullptr, nullptr, nullptr);
         if (model.expert_pool_state.ev != nullptr) {
             ggml_backend_event_free(model.expert_pool_state.ev);
@@ -544,6 +546,7 @@ llama_context::~llama_context() {
             model.expert_pool_state.mg_ctx = nullptr;
         }
         model.expert_pool_state.delegate_ok = false;
+        model.expert_pool_state.rtlog_only = false;
     }
 
     pool_buf.reset(); // release the pool buffer before freeing the ctx metadata
@@ -643,6 +646,39 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
 void llama_context::expert_pool_init() {
     llama_expert_pool_state & st = model.expert_pool_state;
     st.reset();
+    // routing-log-only mode: capture the native routing stream of a pool-free
+    // run (e.g. pure -cmoe) to build a true native pool. register the delegate
+    // hook here, before the early returns below can disable it.
+    const char * rt_env = getenv("GGML_EXPPOOL_ROUTING_LOG");
+    if (cparams.expert_pool <= 0 && rt_env != nullptr && rt_env[0] != '\0') {
+        const int32_t n_layer = model.hparams.n_layer();
+        st.rtlog_only = true;
+        st.pooled_layers.clear();
+        for (int32_t il = 0; il < n_layer; ++il) {
+            const llama_layer & L = model.layers[il];
+            if (L.ffn_gate_up_exps || L.ffn_up_exps || L.ffn_gate_exps) {
+                st.orig_gate_up.resize(n_layer, nullptr);
+                st.orig_up.resize(n_layer, nullptr);
+                st.orig_gate.resize(n_layer, nullptr);
+                st.orig_down.resize(n_layer, nullptr);
+                if (L.ffn_gate_up_exps) {
+                    st.orig_gate_up[il] = L.ffn_gate_up_exps;
+                }
+                if (L.ffn_up_exps) {
+                    st.orig_up[il] = L.ffn_up_exps;
+                }
+                if (L.ffn_gate_exps) {
+                    st.orig_gate[il] = L.ffn_gate_exps;
+                }
+                st.pooled_layers.push_back(il);
+            }
+        }
+        ggml_cpu_set_moe_delegate(llama_expert_pool_delegate_begin,
+                                  llama_expert_pool_delegate_end, &st);
+        LLAMA_LOG_INFO("%s: routing-log-only mode (%d MoE layers, no delegation)\n",
+                __func__, (int) st.pooled_layers.size());
+        return;
+    }
     if (cparams.expert_pool <= 0) {
         return;
     }
