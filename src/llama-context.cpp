@@ -857,8 +857,17 @@ void llama_context::expert_pool_init() {
         m.remap = ggml_new_tensor_2d(pool_tab_ctx, GGML_TYPE_I32, 1, n_expert);
         llama_expert_pool_register_mount(il, m);
     }
+    // mount routing tables on the pool device (the GPU chain reads them in-graph;
+    // a host-side table would pull the gate_up MUL_MAT_ID onto the CPU path)
+    ggml_backend_buffer_type_t tab_buft = ggml_backend_cpu_buffer_type();
+    for (const ggml_backend_buffer_type_t bt : backend_buft) {
+        if (!ggml_backend_buft_is_host(bt)) {
+            tab_buft = bt;
+            break;
+        }
+    }
     ggml_backend_buffer_ptr tab_buf(ggml_backend_alloc_ctx_tensors_from_buft(
-            pool_tab_ctx, ggml_backend_cpu_buffer_type()));
+            pool_tab_ctx, tab_buft));
     if (!tab_buf) {
         LLAMA_LOG_ERROR("%s: mount table allocation failed, direct mount disabled\n", __func__);
         st.direct_mount = false;
