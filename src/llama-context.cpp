@@ -826,15 +826,15 @@ void llama_context::expert_pool_init() {
                         __func__, il);
                 continue;
             }
-            llama_expert_pool_mount m;
+            if (!st.w_pool_down[il]) {
+                continue;
+            }
+            llama_expert_pool_mount & m = llama_expert_pool_get_mount(il);
             m.active  = true;
             m.w_up      = st.w_pool_up[il];
             m.w_gate    = st.w_pool_gate[il];
             m.w_down    = st.w_pool_down[il];
             m.w_gate_up = st.w_pool_gate_up[il];
-            if (!m.w_down) {
-                continue;
-            }
         }
     }
 
