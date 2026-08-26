@@ -551,6 +551,11 @@ llama_context::~llama_context() {
         ggml_free(pool_ctx);
         pool_ctx = nullptr;
     }
+    mount_tab_buf.reset();
+    if (pool_tab_ctx) {
+        ggml_free(pool_tab_ctx);
+        pool_tab_ctx = nullptr;
+    }
 }
 
 void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint32_t n_seqs) {
@@ -724,35 +729,106 @@ void llama_context::expert_pool_init() {
         const llama_layer & L = model.layers[il];
         // per-layer slot count = the pool file's line length for this layer;
         // zero-slot layers get no pool tensors (delegate falls back to CPU).
+        // one EXTRA slice (index s_il) is allocated as a zero SENTINEL: the
+        // direct-mount remap routes non-resident experts there so their GPU
+        // chain output is exactly zero. the whole pool buffer is cleared once
+        // below; copy_slots never writes the sentinel slice.
         const int32_t s_il = (int32_t) st.resident[il].size();
         if (L.ffn_gate_up_exps) {
             st.orig_gate_up[il] = L.ffn_gate_up_exps;
             if (s_il > 0) {
                 st.w_pool_gate_up[il] = ggml_new_tensor_4d(pool_ctx, L.ffn_gate_up_exps->type,
-                        L.ffn_gate_up_exps->ne[0], L.ffn_gate_up_exps->ne[1], s_il, 1);
+                        L.ffn_gate_up_exps->ne[0], L.ffn_gate_up_exps->ne[1], s_il + 1, 1);
             }
         }
         if (L.ffn_up_exps) {
             st.orig_up[il] = L.ffn_up_exps;
             if (s_il > 0) {
                 st.w_pool_up[il] = ggml_new_tensor_4d(pool_ctx, L.ffn_up_exps->type,
-                        L.ffn_up_exps->ne[0], L.ffn_up_exps->ne[1], s_il, 1);
+                        L.ffn_up_exps->ne[0], L.ffn_up_exps->ne[1], s_il + 1, 1);
             }
         }
         if (L.ffn_gate_exps) {
             st.orig_gate[il] = L.ffn_gate_exps;
             if (s_il > 0) {
                 st.w_pool_gate[il] = ggml_new_tensor_4d(pool_ctx, L.ffn_gate_exps->type,
-                        L.ffn_gate_exps->ne[0], L.ffn_gate_exps->ne[1], s_il, 1);
+                        L.ffn_gate_exps->ne[0], L.ffn_gate_exps->ne[1], s_il + 1, 1);
             }
         }
         if (L.ffn_down_exps) {
             st.orig_down[il] = L.ffn_down_exps;
             if (s_il > 0) {
                 st.w_pool_down[il] = ggml_new_tensor_4d(pool_ctx, L.ffn_down_exps->type,
-                        L.ffn_down_exps->ne[0], L.ffn_down_exps->ne[1], s_il, 1);
+                        L.ffn_down_exps->ne[0], L.ffn_down_exps->ne[1], s_il + 1, 1);
             }
         }
+    }
+
+    // --- direct-mount registration (GGML_EXPPOOL_MOUNT=1) ---
+    // registered HERE, not at first fill: sched_reserve() builds probe graphs
+    // before the first process_ubatch, and the mount adds nodes, so the probe
+    // must see the same topology as real runs. the remap/mask tables are
+    // plain pool-buffer tensors (created before the alloc below so they land
+    // in pool_buf); their CONTENT is written by expert_pool_fill(), which
+    // fills every element (sentinel default + resident override).
+    // NOTE: the gate only skips REGISTRATION - never the allocation below.
+    llama_expert_pool_clear_mount();
+    const char * mount_env = getenv("GGML_EXPPOOL_MOUNT");
+    if (mount_env == nullptr || mount_env[0] != '1') {
+        st.direct_mount = false;
+    } else {
+        st.direct_mount = true;
+        for (int32_t il : pooled_ils) {
+            const int32_t s_il = (int32_t) st.resident[il].size();
+            if (s_il <= 0) {
+                continue;
+            }
+            const llama_layer & L = model.layers[il];
+            if (L.ffn_up_exps_s || L.ffn_gate_exps_s ||
+                L.ffn_gate_up_exps_b || L.ffn_up_exps_b || L.ffn_gate_exps_b) {
+                LLAMA_LOG_WARN("%s: gate/up-side per-expert scale/bias on layer %d, direct mount disabled for it\n",
+                        __func__, il);
+                continue;
+            }
+            llama_expert_pool_mount m;
+            m.active  = true;
+            m.w_up      = st.w_pool_up[il];
+            m.w_gate    = st.w_pool_gate[il];
+            m.w_down    = st.w_pool_down[il];
+            m.w_gate_up = st.w_pool_gate_up[il];
+            if (!m.w_down) {
+                continue;
+            }
+        }
+    }
+
+    // --- mount routing tables live in a HOST buffer, not the device pool ---
+    // the scheduler manages per-backend copies of cross-backend tensors; a
+    // table in pool_buf gets such a copy for the graph's CPU side and our
+    // updates to the device instance never reach it (the merge then acts on
+    // stale/zero masks). host-side tables are read fresh at each execution.
+    if (st.direct_mount) {
+        pool_tab_ctx = ggml_init({ 1u*1024u*1024u, nullptr, true }); // no_alloc
+    }
+    for (int32_t il : pooled_ils) {
+        if (!st.direct_mount) {
+            break;
+        }
+        llama_expert_pool_mount & m = llama_expert_pool_get_mount(il);
+        if (!m.active) {
+            continue;
+        }
+        m.remap = ggml_new_tensor_2d(pool_tab_ctx, GGML_TYPE_I32, 1, n_expert);
+        m.mask  = ggml_new_tensor_2d(pool_tab_ctx, GGML_TYPE_F32, 1, n_expert);
+        llama_expert_pool_register_mount(il, m);
+    }
+    ggml_backend_buffer_ptr tab_buf(ggml_backend_alloc_ctx_tensors_from_buft(
+            pool_tab_ctx, ggml_backend_cpu_buffer_type()));
+    if (!tab_buf) {
+        LLAMA_LOG_ERROR("%s: mount table allocation failed, direct mount disabled\n", __func__);
+        st.direct_mount = false;
+    } else {
+        tab_buf.swap(mount_tab_buf);
     }
 
     // --- allocate the pool tensors on the fastest non-CPU buft, fallback CPU ---
@@ -781,6 +857,37 @@ void llama_context::expert_pool_init() {
     // mat_mul_id (and its outputs) on the pool device instead of pulling the
     // pool tensors back to the CPU for the hot/cold merge
     ggml_backend_buffer_set_usage(pool_buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+    // zero the whole pool buffer ONCE: fresh backend buffers are not
+    // guaranteed zeroed, and the sentinel slices must read exactly zero
+    ggml_backend_buffer_clear(pool_buf.get(), 0);
+
+    // --- fill the mount routing tables HERE, not in expert_pool_fill ---
+    // their content depends only on the resident lists (known at this point),
+    // and sched_reserve() builds its probe graph right after this function
+    // returns: the tables must already hold their FINAL values before the
+    // first graph is built (a graph may latch the initial state; the observed
+    // corruption was consistent with the merge reading mask == 0 forever).
+    if (st.direct_mount) {
+        for (int32_t il : pooled_ils) {
+            llama_expert_pool_mount & m = llama_expert_pool_get_mount(il);
+            if (!m.active || m.remap == nullptr) {
+                continue;
+            }
+            const std::vector<int32_t> & res = st.resident[il];
+            std::vector<int32_t> rmp(n_expert, (int32_t) res.size());
+            std::vector<float>   msk(n_expert, 0.0f);
+            for (int32_t s = 0; s < (int32_t) res.size(); ++s) {
+                const int32_t e = res[s];
+                if (e >= 0 && e < n_expert) {
+                    rmp[e] = s;
+                    msk[e] = 1.0f;
+                }
+            }
+            ggml_backend_tensor_set(m.remap, rmp.data(), 0, n_expert * sizeof(int32_t));
+            ggml_backend_tensor_set(m.mask,  msk.data(), 0, n_expert * sizeof(float));
+        }
+    }
 
     int32_t tot_slots = 0;
     for (int32_t il : pooled_ils) {
@@ -822,12 +929,35 @@ void llama_context::expert_pool_fill() {
         const std::vector<int32_t> & res = st.resident[il];
         std::vector<int32_t> & slot_tab = st.slots[il];
         slot_tab.assign(n_expert, -1);
+
+        // direct-mount routing tables: write every element (sentinel default =
+        // this layer's slot count, mask 0), then residents override.
+        // note: these tables are ALSO written in expert_pool_init (before the
+        // first probe graph is built); this second write keeps them correct
+        // if fill() ever runs with a refreshed resident set
+        llama_expert_pool_mount & m = llama_expert_pool_get_mount(il);
+        const bool has_mount = st.direct_mount && m.active && m.remap != nullptr;
+        std::vector<int32_t> rmp;
+        std::vector<float>   msk;
+        if (has_mount) {
+            rmp.assign(n_expert, (int32_t) res.size());
+            msk.assign(n_expert, 0.0f);
+        }
+
         for (int32_t s = 0; s < (int32_t) res.size(); ++s) {
             const int32_t e = res[s];
             if (e < 0 || e >= n_expert) {
                 continue;
             }
             slot_tab[e] = s;
+            if (has_mount) {
+                rmp[e] = s;
+                msk[e] = 1.0f;
+            }
+        }
+        if (has_mount) {
+            ggml_backend_tensor_set(m.remap, rmp.data(), 0, n_expert * sizeof(int32_t));
+            ggml_backend_tensor_set(m.mask,  msk.data(), 0, n_expert * sizeof(float));
         }
 
         auto copy_slots = [&](ggml_tensor * src, ggml_tensor * pw) {
@@ -853,6 +983,16 @@ void llama_context::expert_pool_fill() {
     st.fill_done = true;
 
     // --- moe delegate setup ---
+    // direct mount: only the hook is needed (zero/scan/skip-table); no mini
+    // graphs, no GPU scratch buffers, no events
+    if (st.direct_mount) {
+        st.delegate_ok = true; // lets begin()'s mount branch engage
+        ggml_cpu_set_moe_delegate(llama_expert_pool_delegate_begin,
+                                  llama_expert_pool_delegate_end, &st);
+        LLAMA_LOG_INFO("%s: direct mount active (%d layers), in-graph merge\n",
+                __func__, (int) st.pooled_layers.size());
+        return;
+    }
     // find the first non-host buft (pool_buft was already chosen in init)
     // reuse pool_buft for the delegate scratch tensors
     if (st.enabled && pool_buf) {

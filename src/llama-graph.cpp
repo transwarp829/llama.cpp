@@ -1978,6 +1978,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     ggml_tensor * logits = nullptr;
     ggml_tensor * weights = nullptr;
+    ggml_tensor * mount_out  = nullptr; // direct-mount GPU chain result (weighted)
+    ggml_tensor * mount_mask = nullptr; // [1, n_used, T] 1.0 resident column
 
     // let the expert pool know the real chain parameters for this layer
     // (exactly as the model's graph builder passed them); pool mini graphs
@@ -1988,13 +1990,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     }
 
     if (chain_only) {
-        // never used in chain_only mode (the chain returns before the
-        // weighted merge), but keep the tensor in the graph so that a
-        // weight_before_ffn model still has a valid `weights` source;
-        // its value is never read here (no_alloc ctx: no ggml_set_f32!)
-        weights = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, n_expert_used, n_tokens);
-        cb(weights, "ffn_moe_weights_ones", il);
-        ggml_build_forward_expand(gf, weights);
+        // weights are never read: the chain returns the raw down output
+        // before the weighted merge (and an unused placeholder tensor would
+        // have no backend assignment -> galloc "buffer_id -1" abort)
         goto build_expert_chain;
     }
 
@@ -2129,6 +2127,53 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     //call early so that topk-moe can be used
     ggml_build_forward_expand(gf, weights);
+
+    // expert-pool direct mount: a second, GPU-resident copy of the expert
+    // chain runs inside THIS graph (chain_only over the pool weights, same
+    // activation variants), while the CPU chain below keeps the original
+    // weights. non-resident experts route to a zero sentinel slice (index =
+    // slot count) so their GPU output is exactly zero; the column-mask merge
+    // takes the GPU result for hit columns and the CPU result for miss
+    // columns. the delegate hook makes the CPU kernel skip hit rows, so each
+    // column is computed exactly once. (lookup stays scoped here: the
+    // chain_only goto above must not cross an initialized declaration)
+    // direct mount serves the decode path only, matching the delegate hook's
+    // B=1 guard: prefill/verify batches keep the pure CPU chain (the hook
+    // declines them), so graph topology and hook engagement key on the same
+    // n_tokens==1 condition.
+    if (!chain_only && cparams.expert_pool > 0 && il >= 0 && n_tokens == 1) {
+        const llama_expert_pool_mount & mnt = llama_expert_pool_get_mount(il);
+        if (mnt.active) {
+            // gather remapped ids/hit mask. get_rows wants the lookup table
+            // per token ([1, n_expert, T], same layout as the routing-probs
+            // gather above); our tables are shared across tokens, so tile
+            // them with repeat_4d. mul_mat_id then wants the ids column-major
+            // [n_used, T].
+            ggml_tensor * remap3 = ggml_repeat_4d(ctx0, mnt.remap, 1, n_expert, n_tokens, 1);
+            ggml_tensor * ids_remap = ggml_get_rows(ctx0, remap3, selected_experts);
+            ids_remap = ggml_reshape_2d(ctx0, ids_remap, n_expert_used, n_tokens);
+            cb(ids_remap, "ffn_moe_ids_remap", il);
+
+            mount_out = build_moe_ffn(cur, gate_inp, gate_inp_b,
+                mnt.w_up, nullptr, mnt.w_gate, nullptr, mnt.w_down, nullptr, exp_probs_b,
+                n_expert, n_expert_used, type_op, norm_w, w_scale, gating_op, -1,
+                cur, mnt.w_gate_up, nullptr, nullptr, nullptr, nullptr, ids_remap);
+            cb(mount_out, "ffn_moe_mount", il);
+
+            // chain_only returns the UNWEIGHTED down output; the CPU chain
+            // below multiplies by routing weights after the merge, so apply
+            // them on the GPU side here (weight_before_ffn models weight both
+            // chains inside)
+            if (!weight_before_ffn) {
+                mount_out = ggml_mul(ctx0, mount_out, weights);
+                cb(mount_out, "ffn_moe_mount_weighted", il);
+            }
+
+            ggml_tensor * mask3 = ggml_repeat_4d(ctx0, mnt.mask, 1, n_expert, n_tokens, 1);
+            mount_mask = ggml_get_rows(ctx0, mask3, selected_experts);   // [1, n_used, T]
+            cb(mount_mask, "ffn_moe_hit_mask", il);
+        }
+    }
 
 build_expert_chain:
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);

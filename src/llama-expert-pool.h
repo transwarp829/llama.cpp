@@ -112,6 +112,9 @@ struct llama_expert_pool_state {
 
     // moe delegate runtime
     bool delegate_ok = false;
+    bool direct_mount = false;   // main-graph mount mode (GGML_EXPPOOL_MOUNT=1):
+                                 // the hook only supplies skip tables + stats,
+                                 // end() does no D2H write-back
     ggml_backend_buffer_type_t pool_buft = nullptr;        // pool buft (device)
     ggml_backend_t gpu_backend = nullptr;                  // target device[[truncated]
     ggml_context *  mg_ctx    = nullptr;               // mini-graph ctx (no_alloc)
@@ -217,3 +220,24 @@ void llama_expert_pool_delegate_begin(
         ggml_tensor * src0, ggml_tensor * src1, ggml_tensor * ids, ggml_tensor * dst,
         const int32_t ** skip_out, void * ud);
 void llama_expert_pool_delegate_end(ggml_tensor * dst, void * ud);
+
+// ---------------------------------------------------------------
+// direct mount (main-graph execution): per-layer tensors that let
+// build_moe_ffn run a second, GPU-resident chain over the pool
+// weights inside the MAIN graph. non-resident expert columns route
+// to a zero sentinel slice (index = per-layer slot count) and yield
+// exact zeros; a column-mask merge with the CPU chain (which the
+// delegate hook reduces to miss rows only) produces the final output.
+struct llama_expert_pool_mount {
+    bool active = false;
+    ggml_tensor * w_gate_up = nullptr; // [n_ff*2, n_embd, S+1] or null
+    ggml_tensor * w_up      = nullptr; // [n_ff, n_embd, S+1] or null
+    ggml_tensor * w_gate    = nullptr;
+    ggml_tensor * w_down    = nullptr;
+    ggml_tensor * remap     = nullptr; // I32 [1, n_expert] expert -> slot, sentinel = S
+    ggml_tensor * mask      = nullptr; // F32 [1, n_expert] 1.0 resident, 0.0 miss
+};
+
+void llama_expert_pool_register_mount(int il, const llama_expert_pool_mount & mount);
+llama_expert_pool_mount & llama_expert_pool_get_mount(int il);
+void llama_expert_pool_clear_mount();
