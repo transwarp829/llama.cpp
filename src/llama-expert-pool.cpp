@@ -37,6 +37,33 @@ void llama_expert_pool_clear_chain() {
     g_chain.clear();
 }
 
+// ---- direct-mount registry (see llama-expert-pool.h) ----
+namespace {
+    std::vector<llama_expert_pool_mount> g_mount; // indexed by layer id
+}
+
+void llama_expert_pool_register_mount(int il, const llama_expert_pool_mount & mount) {
+    if (il < 0) {
+        return;
+    }
+    if ((size_t) il >= g_mount.size()) {
+        g_mount.resize(il + 1);
+    }
+    g_mount[il] = mount;
+}
+
+llama_expert_pool_mount & llama_expert_pool_get_mount(int il) {
+    static llama_expert_pool_mount none {};
+    if (il < 0 || (size_t) il >= g_mount.size()) {
+        return none;
+    }
+    return g_mount[il];
+}
+
+void llama_expert_pool_clear_mount() {
+    g_mount.clear();
+}
+
 void llama_expert_pool::init(int32_t n_layer, int32_t n_expert, int32_t n_slot, int64_t expert_size) {
     enabled   = true;
     this->n_layer   = n_layer;
@@ -368,6 +395,70 @@ void llama_expert_pool_delegate_begin(
             }
         }
     }
+    // --- direct-mount mode: no mini graph, no event, no D2H. the GPU chain
+    // runs inside the main graph itself (build_moe_ffn mount branch); this
+    // hook only zeroes the columns the CPU kernel will skip and hands out
+    // the skip table so each column is computed exactly once.
+    if (st.direct_mount) {
+        // decode batches only (matches the main-graph mount gate on
+        // n_tokens==1): larger batches keep the pure CPU chain, their ids are
+        // [n_used, T] and the single-token scan/zeroing here would corrupt
+        // both the skip table and unrelated dst regions
+        if (!st.delegate_ok || ids->ne[1] != 1) {
+            return;
+        }
+        const llama_expert_pool_mount & mnt = llama_expert_pool_get_mount(il);
+        if (!mnt.active) {
+            return; // this tensor's matrix has no mount: full CPU compute
+        }
+        // scan ids -> hit slots
+        st.n_hit = 0;
+        if (st.slots[il].empty()) {
+            return;
+        }
+        if ((int) st.hit_slots.size() < (int) ids->ne[0]) {
+            st.hit_slots.resize(ids->ne[0]);
+            st.hit_cols.resize(ids->ne[0]);
+        }
+        for (int id = 0; id < (int) ids->ne[0]; ++id) {
+            const int32_t e = *((const int32_t *) ((const char *) ids->data + id*ids->nb[0]));
+            if (e < 0 || e >= (int32_t) st.slots[il].size()) {
+                return;
+            }
+            const int32_t s = st.slots[il][e];
+            if (s >= 0) {
+                st.hit_slots[st.n_hit] = s;
+                st.hit_cols[st.n_hit]  = id;
+                st.n_hit += 1;
+            }
+        }
+        if (st.n_hit == 0) {
+            // no hit: the CPU kernel computes all rows (count once per layer)
+            if (st.mini_submitted_il != il) {
+                if ((size_t) ilx < st.s_layer.size()) {
+                    st.s_layer[ilx].miss_rows += (uint64_t) ids->ne[0];
+                }
+                st.mini_submitted_il = il;
+            }
+            return;
+        }
+        // the in-graph merge reads every column of dst, but the kernel leaves
+        // skipped rows holding stale arena data -> zero them so the masked
+        // merge takes exactly the mounted chain's output
+        const size_t rowb = (size_t) dst->ne[0] * sizeof(float);
+        char * dbase = (char *) dst->data;
+        for (int i = 0; i < st.n_hit; ++i) {
+            memset(dbase + (size_t) st.hit_cols[i]*dst->nb[1], 0, rowb);
+        }
+        if ((size_t) ilx < st.s_layer.size()) {
+            st.s_layer[ilx].submits   += 1;
+            st.s_layer[ilx].hit_rows  += (uint64_t) st.n_hit;
+            st.s_layer[ilx].miss_rows += (uint64_t) (ids->ne[0] - st.n_hit);
+        }
+        *skip_out = st.slots[il].data();
+        return;
+    }
+
     // remember (ilx, which) for end() to map a dst back to its output region
     st.dst_ilx_which[dst] = std::make_pair(ilx, which);
 
@@ -472,6 +563,10 @@ void llama_expert_pool_delegate_begin(
 
 void llama_expert_pool_delegate_end(ggml_tensor * dst, void * ud) {
     llama_expert_pool_state & st = *(llama_expert_pool_state *) ud;
+    if (st.direct_mount) {
+        st.n_hit = 0; // merge happened in-graph; nothing to write back
+        return;
+    }
     if (st.n_hit == 0 || !st.delegate_ok) {
         return;
     }
