@@ -1979,7 +1979,6 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     ggml_tensor * logits = nullptr;
     ggml_tensor * weights = nullptr;
     ggml_tensor * mount_out  = nullptr; // direct-mount GPU chain result (weighted)
-    ggml_tensor * mount_mask = nullptr; // [1, n_used, T] 1.0 resident column
 
     // let the expert pool know the real chain parameters for this layer
     // (exactly as the model's graph builder passed them); pool mini graphs
@@ -2131,12 +2130,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // expert-pool direct mount: a second, GPU-resident copy of the expert
     // chain runs inside THIS graph (chain_only over the pool weights, same
     // activation variants), while the CPU chain below keeps the original
-    // weights. non-resident experts route to a zero sentinel slice (index =
-    // slot count) so their GPU output is exactly zero; the column-mask merge
-    // takes the GPU result for hit columns and the CPU result for miss
-    // columns. the delegate hook makes the CPU kernel skip hit rows, so each
-    // column is computed exactly once. (lookup stays scoped here: the
-    // chain_only goto above must not cross an initialized declaration)
+    // weights. non-resident experts route to a -1 skip slot (PR #26631), so
+    // the GPU chain writes exact zeros for them; the CPU chain (hook-delegated
+    // to miss rows, hit columns zeroed by the hook) is the other half. the
+    // merge is a single add below: hit col = 0(cpu) + gpu, miss col = cpu + 0.
     // direct mount serves the decode path only, matching the delegate hook's
     // B=1 guard: prefill/verify batches keep the pure CPU chain (the hook
     // declines them), so graph topology and hook engagement key on the same
@@ -2169,9 +2166,6 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 cb(mount_out, "ffn_moe_mount_weighted", il);
             }
 
-            ggml_tensor * mask3 = ggml_repeat_4d(ctx0, mnt.mask, 1, n_expert, n_tokens, 1);
-            mount_mask = ggml_get_rows(ctx0, mask3, selected_experts);   // [1, n_used, T]
-            cb(mount_mask, "ffn_moe_hit_mask", il);
         }
     }
 
@@ -2345,6 +2339,13 @@ build_expert_chain:
     if (!weight_before_ffn) {
         experts = ggml_mul(ctx0, experts, weights);
         cb(experts, "ffn_moe_weighted", il);
+    }
+
+    if (mount_out != nullptr) {
+        // direct-mount merge (single add): hit col = 0(cpu, hook) + gpu,
+        // miss col = cpu + 0(-1 skip slot). mount_out is already weighted.
+        experts = ggml_add(ctx0, experts, mount_out);
+        cb(experts, "ffn_moe_mount_merged", il);
     }
 
     ggml_build_forward_expand(gf, experts);

@@ -233,12 +233,11 @@ void llama_expert_pool_delegate_end(ggml_tensor * dst, void * ud);
 // delegate hook reduces to miss rows only) produces the final output.
 struct llama_expert_pool_mount {
     bool active = false;
-    ggml_tensor * w_gate_up = nullptr; // [n_ff*2, n_embd, S+1] or null
-    ggml_tensor * w_up      = nullptr; // [n_ff, n_embd, S+1] or null
+    ggml_tensor * w_gate_up = nullptr; // [n_ff*2, n_embd, S] or null
+    ggml_tensor * w_up      = nullptr; // [n_ff, n_embd, S] or null
     ggml_tensor * w_gate    = nullptr;
     ggml_tensor * w_down    = nullptr;
-    ggml_tensor * remap     = nullptr; // I32 [1, n_expert] expert -> slot, sentinel = S
-    ggml_tensor * mask      = nullptr; // F32 [1, n_expert] 1.0 resident, 0.0 miss
+    ggml_tensor * remap     = nullptr; // I32 [1, n_expert] expert -> slot, or -1 (skip, PR#26631)
 };
 
 void llama_expert_pool_register_mount(int il, const llama_expert_pool_mount & mount);

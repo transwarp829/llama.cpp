@@ -774,28 +774,28 @@ void llama_context::expert_pool_init() {
             st.orig_gate_up[il] = L.ffn_gate_up_exps;
             if (s_il > 0) {
                 st.w_pool_gate_up[il] = ggml_new_tensor_4d(pool_ctx, L.ffn_gate_up_exps->type,
-                        L.ffn_gate_up_exps->ne[0], L.ffn_gate_up_exps->ne[1], s_il + 1, 1);
+                        L.ffn_gate_up_exps->ne[0], L.ffn_gate_up_exps->ne[1], s_il, 1);
             }
         }
         if (L.ffn_up_exps) {
             st.orig_up[il] = L.ffn_up_exps;
             if (s_il > 0) {
                 st.w_pool_up[il] = ggml_new_tensor_4d(pool_ctx, L.ffn_up_exps->type,
-                        L.ffn_up_exps->ne[0], L.ffn_up_exps->ne[1], s_il + 1, 1);
+                        L.ffn_up_exps->ne[0], L.ffn_up_exps->ne[1], s_il, 1);
             }
         }
         if (L.ffn_gate_exps) {
             st.orig_gate[il] = L.ffn_gate_exps;
             if (s_il > 0) {
                 st.w_pool_gate[il] = ggml_new_tensor_4d(pool_ctx, L.ffn_gate_exps->type,
-                        L.ffn_gate_exps->ne[0], L.ffn_gate_exps->ne[1], s_il + 1, 1);
+                        L.ffn_gate_exps->ne[0], L.ffn_gate_exps->ne[1], s_il, 1);
             }
         }
         if (L.ffn_down_exps) {
             st.orig_down[il] = L.ffn_down_exps;
             if (s_il > 0) {
                 st.w_pool_down[il] = ggml_new_tensor_4d(pool_ctx, L.ffn_down_exps->type,
-                        L.ffn_down_exps->ne[0], L.ffn_down_exps->ne[1], s_il + 1, 1);
+                        L.ffn_down_exps->ne[0], L.ffn_down_exps->ne[1], s_il, 1);
             }
         }
     }
@@ -855,7 +855,6 @@ void llama_context::expert_pool_init() {
             continue;
         }
         m.remap = ggml_new_tensor_2d(pool_tab_ctx, GGML_TYPE_I32, 1, n_expert);
-        m.mask  = ggml_new_tensor_2d(pool_tab_ctx, GGML_TYPE_F32, 1, n_expert);
         llama_expert_pool_register_mount(il, m);
     }
     ggml_backend_buffer_ptr tab_buf(ggml_backend_alloc_ctx_tensors_from_buft(
@@ -911,17 +910,14 @@ void llama_context::expert_pool_init() {
                 continue;
             }
             const std::vector<int32_t> & res = st.resident[il];
-            std::vector<int32_t> rmp(n_expert, (int32_t) res.size());
-            std::vector<float>   msk(n_expert, 0.0f);
+            std::vector<int32_t> rmp(n_expert, -1);
             for (int32_t s = 0; s < (int32_t) res.size(); ++s) {
                 const int32_t e = res[s];
                 if (e >= 0 && e < n_expert) {
                     rmp[e] = s;
-                    msk[e] = 1.0f;
                 }
             }
             ggml_backend_tensor_set(m.remap, rmp.data(), 0, n_expert * sizeof(int32_t));
-            ggml_backend_tensor_set(m.mask,  msk.data(), 0, n_expert * sizeof(float));
         }
     }
 
@@ -974,10 +970,11 @@ void llama_context::expert_pool_fill() {
         llama_expert_pool_mount & m = llama_expert_pool_get_mount(il);
         const bool has_mount = st.direct_mount && m.active && m.remap != nullptr;
         std::vector<int32_t> rmp;
-        std::vector<float>   msk;
         if (has_mount) {
-            rmp.assign(n_expert, (int32_t) res.size());
-            msk.assign(n_expert, 0.0f);
+            // non-resident experts map to -1 (skip slot, PR#26631): the GPU
+            // chain writes exact zeros there, so a plain add of the two chains
+            // is the whole merge (hit col: 0(cpu) + gpu; miss col: cpu + 0)
+            rmp.assign(n_expert, -1);
         }
 
         for (int32_t s = 0; s < (int32_t) res.size(); ++s) {
@@ -988,12 +985,10 @@ void llama_context::expert_pool_fill() {
             slot_tab[e] = s;
             if (has_mount) {
                 rmp[e] = s;
-                msk[e] = 1.0f;
             }
         }
         if (has_mount) {
             ggml_backend_tensor_set(m.remap, rmp.data(), 0, n_expert * sizeof(int32_t));
-            ggml_backend_tensor_set(m.mask,  msk.data(), 0, n_expert * sizeof(float));
         }
 
         auto copy_slots = [&](ggml_tensor * src, ggml_tensor * pw) {
