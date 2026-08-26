@@ -388,10 +388,12 @@ private:
     std::vector<ggml_backend_buffer_type_t> backend_buft;
     std::vector<size_t>                     backend_buf_exp_size; // expected buffer sizes
 
-    // expert pool (stage 2): pooled weight context/buffer
+    // expert pool (stage 2): pooled weight context/buffer + mount-table ctx
     // (kept alive as long as the context; pointers also stored in model.expert_pool_state)
     ggml_context * pool_ctx  = nullptr;
+    ggml_context * pool_tab_ctx = nullptr; // direct-mount routing tables (host)
     ggml_backend_buffer_ptr pool_buf;
+    ggml_backend_buffer_ptr mount_tab_buf; // host buffer holding remap/mask tables
 
     llm_graph_result_ptr gf_res_prev;
     llm_graph_result_ptr gf_res_reserve;
