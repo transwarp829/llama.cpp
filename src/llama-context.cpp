@@ -668,8 +668,8 @@ void llama_context::expert_pool_init() {
     // legacy mini-graph delegate path was removed with the -1-ids refactor
     {
         const char * mount_env0 = getenv("GGML_EXPPOOL_MOUNT");
-        if (mount_env0 == nullptr || mount_env0[0] != '1') {
-            LLAMA_LOG_WARN("%s: expert pool requires GGML_EXPPOOL_MOUNT=1, pool disabled\n", __func__);
+        if (mount_env0 != nullptr && mount_env0[0] == '0') {
+            LLAMA_LOG_INFO("%s: expert pool mount disabled by GGML_EXPPOOL_MOUNT=0\n", __func__);
             return;
         }
     }
@@ -804,7 +804,7 @@ void llama_context::expert_pool_init() {
     // NOTE: the gate only skips REGISTRATION - never the allocation below.
     llama_expert_pool_clear_mount();
     const char * mount_env = getenv("GGML_EXPPOOL_MOUNT");
-    if (mount_env == nullptr || mount_env[0] != '1') {
+    if (mount_env != nullptr && mount_env[0] == '0') {
         st.direct_mount = false;
     } else {
         st.direct_mount = true;
