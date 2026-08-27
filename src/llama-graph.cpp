@@ -1980,8 +1980,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     ggml_tensor * weights = nullptr;
     ggml_tensor * mount_out  = nullptr; // direct-mount GPU chain result (weighted)
     ggml_tensor * mount_ids_cpu = nullptr; // inverse-remap ids for the CPU chain
-    ggml_tensor * mount_scale_gpu = nullptr; // [1, n_used, T] down scale for the GPU chain
-    ggml_tensor * mount_scale_cpu = nullptr; // [1, n_used, T] down scale for the CPU chain
+    ggml_tensor * mount_scale = nullptr; // [1, n_used, T] down scale, gathered on
+                                         // the GPU segment, used by both chains
 
     // let the expert pool know the real chain parameters for this layer
     // (exactly as the model's graph builder passed them); pool mini graphs
@@ -2137,18 +2137,23 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // non-resident experts to -1 (zero), the CPU chain ids route resident
     // experts to -1. the merge is a single add: hit col = 0(cpu) + gpu,
     // miss col = cpu + 0.
-    // direct mount serves the decode path only: prefill/verify batches keep
-    // the pure CPU chain (native ids), while the mount branch keys on the
-    // same n_tokens==1 condition.
-    if (!chain_only && cparams.expert_pool > 0 && il >= 0 && n_tokens == 1) {
+    // direct mount serves every batch size: decode (T=1) and verify/parallel
+    // batches (T>1) share the same graph.
+    if (!chain_only && cparams.expert_pool > 0 && il >= 0) {
         const llama_expert_pool_mount & mnt = llama_expert_pool_get_mount(il);
         if (mnt.active) {
-            // gather remapped ids/hit mask. get_rows wants the lookup table
-            // per token ([1, n_expert, T], same layout as the routing-probs
-            // gather above); our tables are shared across tokens, so tile
-            // them with repeat_4d. mul_mat_id then wants the ids column-major
-            // [n_used, T].
-            ggml_tensor * remap3 = ggml_repeat_4d(ctx0, mnt.remap, 1, n_expert, n_tokens, 1);
+            // all tables live on the pool device, so every gather runs on the
+            // GPU segment from the same topk ids. ids_cpu and the scale values
+            // are handed to the CPU segment as regular split inputs (32B
+            // each), so the CPU segment stays lookup-free. the I32 tables fill
+            // the mul_mat_id ids directly (get_rows keeps the table type on
+            // every backend, no cast). tile with a view when T==1, a true
+            // repeat_4d for T>1 (get_rows requires src0.ne[2] == ids.ne[1]);
+            // an I32 REPEAT runs on the CPU segment (native there) until the
+            // upstream CUDA REPEAT adds I32 support.
+            ggml_tensor * remap3 = n_tokens == 1
+                ? ggml_reshape_3d(ctx0, mnt.remap, 1, n_expert, 1)
+                : ggml_repeat_4d(ctx0, mnt.remap, 1, n_expert, n_tokens, 1);
             ggml_tensor * ids_remap = ggml_get_rows(ctx0, remap3, selected_experts);
             ids_remap = ggml_reshape_2d(ctx0, ids_remap, n_expert_used, n_tokens);
             cb(ids_remap, "ffn_moe_ids_remap", il);
@@ -2156,29 +2161,24 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             // inverse table for the CPU chain: resident -> -1, non-resident ->
             // expert id, so the CPU mul_mat_id zeroes the hit columns natively
             // (PR #26631) and computes exactly the miss columns
-            ggml_tensor * remap_cpu3 = ggml_repeat_4d(ctx0, mnt.remap_cpu, 1, n_expert, n_tokens, 1);
+            ggml_tensor * remap_cpu3 = n_tokens == 1
+                ? ggml_reshape_3d(ctx0, mnt.remap_cpu, 1, n_expert, 1)
+                : ggml_repeat_4d(ctx0, mnt.remap_cpu, 1, n_expert, n_tokens, 1);
             ggml_tensor * ids_cpu = ggml_get_rows(ctx0, remap_cpu3, selected_experts);
             ids_cpu = ggml_reshape_2d(ctx0, ids_cpu, n_expert_used, n_tokens);
             cb(ids_cpu, "ffn_moe_ids_cpu", il);
             mount_ids_cpu = ids_cpu;
 
-            // per-expert down scale lookups: get_rows cannot take -1, so the
-            // scale tables map skipped columns to slot 0 (their value is zero,
-            // 0*any_scale = 0) and real columns to their expert id; then the
-            // real scale values are gathered from w_down_s
-            if (mnt.w_down_s != nullptr) {
-                ggml_tensor * rs3 = ggml_repeat_4d(ctx0, mnt.remap_scale, 1, n_expert, n_tokens, 1);
-                ggml_tensor * ids_sc = ggml_get_rows(ctx0, rs3, selected_experts);   // I32 [1, n_used, T]
-                ids_sc = ggml_reshape_2d(ctx0, ids_sc, n_expert_used, n_tokens);     // I32 [n_used, T]
-                ggml_tensor * ws3 = ggml_repeat_4d(ctx0,
-                        ggml_reshape_3d(ctx0, mnt.w_down_s, 1, n_expert, 1), 1, n_expert, n_tokens, 1);
-                mount_scale_gpu = ggml_get_rows(ctx0, ws3, ids_sc);                  // F32 [1, n_used, T]
-                ggml_tensor * rsc3 = ggml_repeat_4d(ctx0, mnt.remap_scale_cpu, 1, n_expert, n_tokens, 1);
-                ggml_tensor * ids_scc = ggml_get_rows(ctx0, rsc3, selected_experts); // I32 [1, n_used, T]
-                ids_scc = ggml_reshape_2d(ctx0, ids_scc, n_expert_used, n_tokens);   // I32 [n_used, T]
-                ggml_tensor * wsc3 = ggml_repeat_4d(ctx0,
-                        ggml_reshape_3d(ctx0, mnt.w_down_s, 1, n_expert, 1), 1, n_expert, n_tokens, 1);
-                mount_scale_cpu = ggml_get_rows(ctx0, wsc3, ids_scc);                // F32 [1, n_used, T]
+            // per-expert down scale: one flat gather, used by both chains.
+            // stays [1, n_used, T]: the mul broadcasts over n_ff. a 2D reshape
+            // would shift the broadcast and fail can_repeat for T>1 (ne1
+            // 8 % T == 0 only for T in 1,2,4,8).
+            if (mnt.scale != nullptr) {
+                ggml_tensor * sc3 = n_tokens == 1
+                    ? ggml_reshape_3d(ctx0, mnt.scale, 1, n_expert, 1)
+                    : ggml_repeat_4d(ctx0, mnt.scale, 1, n_expert, n_tokens, 1);
+                mount_scale = ggml_get_rows(ctx0, sc3, selected_experts);
+                cb(mount_scale, "ffn_moe_scale", il);
             }
 
             mount_out = build_moe_ffn(cur, gate_inp, gate_inp_b,
@@ -2187,8 +2187,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 cur, mnt.w_gate_up, nullptr, nullptr, nullptr, nullptr, ids_remap);
             cb(mount_out, "ffn_moe_mount", il);
 
-            if (mount_scale_gpu != nullptr) {
-                mount_out = ggml_mul(ctx0, mount_out, mount_scale_gpu);
+            if (mount_scale != nullptr) {
+                mount_out = ggml_mul(ctx0, mount_out, mount_scale);
                 cb(mount_out, "ffn_moe_mount_scaled", il);
             }
 
@@ -2209,9 +2209,9 @@ build_expert_chain:
         // the CPU chain reads the inverse remap: resident columns are -1
         // (zeroed natively), non-resident columns keep their expert ids
         selected_experts = mount_ids_cpu;
-        // the down scale lookup would index this ids tensor (it may contain
-        // -1, which get_rows cannot take); it is re-applied per column after
-        // the chain via mount_scale_cpu instead
+        // the down scale would index this ids tensor (it may contain -1,
+        // which get_rows cannot take); it is re-applied per column after
+        // the chain via mount_scale instead
         down_exps_s = nullptr;
     }
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
@@ -2385,11 +2385,12 @@ build_expert_chain:
         cb(experts, "ffn_moe_weighted", il);
     }
 
-    if (mount_scale_cpu != nullptr) {
-        // down scale was hoisted out of both chains (the -1 ids cannot reach
-        // the original scale lookup); re-apply it per column here. skipped
-        // columns are zero, 0*any_scale = 0 - exact.
-        experts = ggml_mul(ctx0, experts, mount_scale_cpu);
+    if (mount_scale != nullptr) {
+        // down scale gathered on the GPU segment from the same topk ids and
+        // handed to the CPU segment as a split input; the -1 ids keep the
+        // skipped columns zero on the CPU chain too, so 0*any_scale = 0 -
+        // exact.
+        experts = ggml_mul(ctx0, experts, mount_scale);
         cb(experts, "ffn_moe_cpu_scaled", il);
     }
 

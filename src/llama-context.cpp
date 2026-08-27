@@ -542,11 +542,6 @@ llama_context::~llama_context() {
         ggml_free(pool_tab_ctx);
         pool_tab_ctx = nullptr;
     }
-    host_tab_buf.reset();
-    if (host_tab_ctx) {
-        ggml_free(host_tab_ctx);
-        host_tab_ctx = nullptr;
-    }
 }
 
 void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint32_t n_seqs) {
@@ -759,34 +754,37 @@ void llama_context::expert_pool_init() {
     for (int32_t il : pooled_ils) {
         const llama_layer & L = model.layers[il];
         // per-layer slot count = the pool file's line length for this layer;
-        // zero-slot layers get no pool tensors (delegate falls back to CPU).
-        // IDENTITY layout: the pool tensor holds every expert e in slot e
-        // (n_expert slots, non-resident slots left zero). non-resident experts
-        // route to -1 in the remap (PR #26631 skip -> exact zero), so no
-        // separate sentinel slice is needed. the whole pool buffer is cleared
-        // once below; copy_slots only writes the resident slots.
+        // zero-slot layers get no pool tensors (the layer falls back to CPU).
+        // COMPACT layout: slot s holds resident expert res[s] (S slots, no
+        // zero padding). non-resident experts route to -1 in the GPU remap
+        // (PR #26631 skip -> exact zero), so no sentinel slice is needed.
+        // keeping ne2 = S (not n_expert) matters for the MMQ kernel: its
+        // prep work (quantize/grouping) scales with the slot count, and the
+        // 128-slot identity layout cost ~7.5x there (measured 2.65 vs
+        // 0.35 ms/token on the GPU chain).
+        const int32_t s_il = (int32_t) st.resident[il].size();
+        if (s_il <= 0) {
+            continue;
+        }
         if (L.ffn_gate_up_exps) {
             st.orig_gate_up[il] = L.ffn_gate_up_exps;
-            // pool tensor uses n_expert slots so slot e holds expert e
-            // (ids = expert name indexes it directly); remap maps resident
-            // expert e -> e, non-resident -> -1.
             st.w_pool_gate_up[il] = ggml_new_tensor_4d(pool_ctx, L.ffn_gate_up_exps->type,
-                    L.ffn_gate_up_exps->ne[0], L.ffn_gate_up_exps->ne[1], n_expert, 1);
+                    L.ffn_gate_up_exps->ne[0], L.ffn_gate_up_exps->ne[1], s_il, 1);
         }
         if (L.ffn_up_exps) {
             st.orig_up[il] = L.ffn_up_exps;
             st.w_pool_up[il] = ggml_new_tensor_4d(pool_ctx, L.ffn_up_exps->type,
-                    L.ffn_up_exps->ne[0], L.ffn_up_exps->ne[1], n_expert, 1);
+                    L.ffn_up_exps->ne[0], L.ffn_up_exps->ne[1], s_il, 1);
         }
         if (L.ffn_gate_exps) {
             st.orig_gate[il] = L.ffn_gate_exps;
             st.w_pool_gate[il] = ggml_new_tensor_4d(pool_ctx, L.ffn_gate_exps->type,
-                    L.ffn_gate_exps->ne[0], L.ffn_gate_exps->ne[1], n_expert, 1);
+                    L.ffn_gate_exps->ne[0], L.ffn_gate_exps->ne[1], s_il, 1);
         }
         if (L.ffn_down_exps) {
             st.orig_down[il] = L.ffn_down_exps;
             st.w_pool_down[il] = ggml_new_tensor_4d(pool_ctx, L.ffn_down_exps->type,
-                    L.ffn_down_exps->ne[0], L.ffn_down_exps->ne[1], n_expert, 1);
+                    L.ffn_down_exps->ne[0], L.ffn_down_exps->ne[1], s_il, 1);
         }
     }
 
@@ -815,8 +813,8 @@ void llama_context::expert_pool_init() {
                 (L.ffn_down_exps_s && L.ffn_down_exps_b)) {
                 // gate/up-side scale/bias cannot be replicated by the GPU chain
                 // (they are baked into the merged gate_up flow); down-side scale
-                // alone is fine (applied via remap_scale outside the chains) and
-                // down-side bias alone is fine (add_id -1 = no-op), but BOTH
+                // alone is fine (applied via the scale table) and down-side
+                // bias alone is fine (add_id -1 = no-op), but BOTH
                 // together would change the operator order, so disable the mount
                 LLAMA_LOG_WARN("%s: per-expert scale/bias on layer %d, direct mount disabled for it\n",
                         __func__, il);
@@ -837,13 +835,12 @@ void llama_context::expert_pool_init() {
         }
     }
 
-    // --- mount routing tables ---
-    // remap lives on the pool device: the GPU chain reads it in-graph, and a
-    // host-side table would pull its MUL_MAT_ID onto the CPU path. remap_cpu
-    // lives on the host: the CPU chain reads it on its own path.
+    // --- mount routing tables (all on the pool device) ---
+    // every gather runs on the GPU segment from the same topk ids; ids_cpu and
+    // the scale values reach the CPU segment as regular split inputs (32B
+    // each), so the CPU segment stays lookup-free.
     if (st.direct_mount) {
         pool_tab_ctx = ggml_init({ 1u*1024u*1024u, nullptr, true }); // no_alloc
-        host_tab_ctx = ggml_init({ 1u*1024u*1024u, nullptr, true }); // no_alloc
     }
     for (int32_t il : pooled_ils) {
         if (!st.direct_mount) {
@@ -853,13 +850,24 @@ void llama_context::expert_pool_init() {
         if (!m.active) {
             continue;
         }
+        const llama_layer & L = model.layers[il];
         m.remap     = ggml_new_tensor_2d(pool_tab_ctx, GGML_TYPE_I32, 1, n_expert);
-        m.remap_cpu = ggml_new_tensor_2d(host_tab_ctx, GGML_TYPE_I32, 1, n_expert);
-        m.remap_scale     = ggml_new_tensor_2d(pool_tab_ctx, GGML_TYPE_I32, 1, n_expert);
-        m.remap_scale_cpu = ggml_new_tensor_2d(host_tab_ctx, GGML_TYPE_I32, 1, n_expert);
+        m.remap_cpu = ggml_new_tensor_2d(pool_tab_ctx, GGML_TYPE_I32, 1, n_expert);
+        if (L.ffn_down_exps_s != nullptr) {
+            m.scale = ggml_new_tensor_2d(pool_tab_ctx, GGML_TYPE_F32, 1, n_expert);
+        }
+        char nm[64];
+        snprintf(nm, sizeof(nm), "mnt_remap_%d", il);
+        ggml_set_name(m.remap, nm);
+        snprintf(nm, sizeof(nm), "mnt_remap_cpu_%d", il);
+        ggml_set_name(m.remap_cpu, nm);
+        if (m.scale != nullptr) {
+            snprintf(nm, sizeof(nm), "mnt_scale_%d", il);
+            ggml_set_name(m.scale, nm);
+        }
         llama_expert_pool_register_mount(il, m);
     }
-    // --- allocate: remap on the pool device, remap_cpu on the host ---
+    // --- allocate: device tables on the pool device, host tables on the CPU ---
     ggml_backend_buffer_type_t tab_buft = ggml_backend_cpu_buffer_type();
     for (const ggml_backend_buffer_type_t bt : backend_buft) {
         if (!ggml_backend_buft_is_host(bt)) {
@@ -875,16 +883,6 @@ void llama_context::expert_pool_init() {
             st.direct_mount = false;
         } else {
             tab_buf.swap(mount_tab_buf);
-        }
-        if (st.direct_mount) {
-            ggml_backend_buffer_ptr htab_buf(ggml_backend_alloc_ctx_tensors_from_buft(
-                    host_tab_ctx, ggml_backend_cpu_buffer_type()));
-            if (!htab_buf) {
-                LLAMA_LOG_ERROR("%s: host mount table allocation failed, direct mount disabled\n", __func__);
-                st.direct_mount = false;
-            } else {
-                htab_buf.swap(host_tab_buf);
-            }
         }
         if (!st.direct_mount) {
             // de-register the mounts of this run so the graph builder never
@@ -939,33 +937,27 @@ void llama_context::expert_pool_init() {
                 continue;
             }
             const std::vector<int32_t> & res = st.resident[il];
-            // identity layout: the pool tensor holds expert e in slot e
-            // (copy_slots writes expert e into pool slot e), so remap maps
-            // resident expert e -> e and non-resident -> -1 (PR #26631 skip
-            // yields an exact zero, matching the cleared pool slot).
-            // remap_cpu is the inverse: resident -> -1 (zeroed natively by the
-            // CPU kernel), non-resident -> expert id.
-            // the scale tables only feed get_rows(scale, .) so they cannot
-            // carry -1: non-resident columns map to slot 0 (their value is
-            // zero, 0*any_scale = 0), resident columns keep their expert id.
+            // compact layout: pool slot s holds expert res[s]. remap_gpu maps
+            // resident expert e -> its SLOT s (the pool tensor is indexed by
+            // slot) and non-resident -> -1 (PR #26631 skip -> exact zero).
+            // remap_cpu is the inverse for the CPU chain (which reads the
+            // full prototype tensor, indexed by expert id): resident -> -1
+            // (zeroed natively by the CPU kernel), non-resident -> its id.
+            // the scale value table depends on model weight data and is
+            // staged later in expert_pool_fill().
             std::vector<int32_t> rmp(n_expert, -1);
             std::vector<int32_t> rmp_cpu(n_expert, -1);
-            std::vector<int32_t> rmp_sc(n_expert, 0);
-            std::vector<int32_t> rmp_sc_cpu(n_expert, 0);
-            for (int32_t e : res) {
+            for (int32_t s = 0; s < (int32_t) res.size(); ++s) {
+                const int32_t e = res[s];
                 if (e >= 0 && e < n_expert) {
-                    rmp[e] = e;
-                    rmp_sc[e] = e;
+                    rmp[e] = s;
                 }
             }
             for (int32_t e = 0; e < n_expert; ++e) {
                 rmp_cpu[e] = rmp[e] >= 0 ? -1 : e;
-                rmp_sc_cpu[e] = rmp[e] >= 0 ? 0 : e;
             }
             ggml_backend_tensor_set(m.remap, rmp.data(), 0, n_expert * sizeof(int32_t));
             ggml_backend_tensor_set(m.remap_cpu, rmp_cpu.data(), 0, n_expert * sizeof(int32_t));
-            ggml_backend_tensor_set(m.remap_scale, rmp_sc.data(), 0, n_expert * sizeof(int32_t));
-            ggml_backend_tensor_set(m.remap_scale_cpu, rmp_sc_cpu.data(), 0, n_expert * sizeof(int32_t));
         }
     }
 
@@ -1011,27 +1003,36 @@ void llama_context::expert_pool_fill() {
         // second write keeps them correct if fill() ever refreshes the resident set)
         llama_expert_pool_mount & m = llama_expert_pool_get_mount(il);
         const bool has_mount = st.direct_mount && m.active &&
-                               m.remap != nullptr && m.remap_cpu != nullptr &&
-                               m.remap_scale != nullptr && m.remap_scale_cpu != nullptr;
+                               m.remap != nullptr && m.remap_cpu != nullptr;
         if (has_mount) {
+            // I32 ids tables: get_rows outputs the table type natively on
+            // every backend (ggml.c), so no cast is needed anywhere.
             std::vector<int32_t> rmp(n_expert, -1);
-            std::vector<int32_t> rmp_sc(n_expert, 0);
-            for (int32_t e : res) {
+            for (int32_t s = 0; s < (int32_t) res.size(); ++s) {
+                const int32_t e = res[s];
                 if (e >= 0 && e < n_expert) {
-                    rmp[e] = e;
-                    rmp_sc[e] = e;
+                    rmp[e] = s;
                 }
             }
+            // inverse table: resident -> -1 (zeroed natively by the CPU
+            // kernel), non-resident -> its expert id
             std::vector<int32_t> rmp_cpu(n_expert, -1);
-            std::vector<int32_t> rmp_sc_cpu(n_expert, 0);
             for (int32_t e = 0; e < n_expert; ++e) {
                 rmp_cpu[e] = rmp[e] >= 0 ? -1 : e;
-                rmp_sc_cpu[e] = rmp[e] >= 0 ? 0 : e;
             }
             ggml_backend_tensor_set(m.remap, rmp.data(), 0, n_expert * sizeof(int32_t));
             ggml_backend_tensor_set(m.remap_cpu, rmp_cpu.data(), 0, n_expert * sizeof(int32_t));
-            ggml_backend_tensor_set(m.remap_scale, rmp_sc.data(), 0, n_expert * sizeof(int32_t));
-            ggml_backend_tensor_set(m.remap_scale_cpu, rmp_sc_cpu.data(), 0, n_expert * sizeof(int32_t));
+            if (m.scale != nullptr) {
+                // one flat table: expert e -> its down scale value. the -1 ids
+                // already zero the skipped columns on both chains, so no
+                // 0-padding is needed here.
+                std::vector<float> vals(n_expert, 0.0f);
+                const float * src_s = (const float *) L.ffn_down_exps_s->data;
+                for (int32_t e = 0; e < n_expert; ++e) {
+                    vals[e] = src_s[e];
+                }
+                ggml_backend_tensor_set(m.scale, vals.data(), 0, n_expert * sizeof(float));
+            }
         }
 
         auto copy_slots = [&](ggml_tensor * src, ggml_tensor * pw) {
@@ -1045,9 +1046,9 @@ void llama_context::expert_pool_fill() {
                 if (e < 0 || e >= n_expert) {
                     continue;
                 }
-                // identity layout: expert e lives in pool slot e
+                // compact layout: pool slot s holds expert res[s]
                 ggml_backend_tensor_set(pw, (const char *) src->data + e * src->nb[2],
-                        e * pw->nb[2], sz);
+                        s * pw->nb[2], sz);
             }
         };
         copy_slots(L.ffn_gate_up_exps, st.w_pool_gate_up[il]);
