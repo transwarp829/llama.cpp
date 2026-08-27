@@ -1775,6 +1775,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         for (int64_t i1 = 0; i1 < ids_tensor->ne[1]; i1++) {
                             for (int64_t i0 = 0; i0 < ids_tensor->ne[0]; i0++) {
                                 int32_t id = ids[i1 * ids_tensor->nb[1]/sizeof(int32_t) + i0 * ids_tensor->nb[0]/sizeof(int32_t)];
+                                if (id == -1) {
+                                    // skipped column (PR #26631 -1 ids): the
+                                    // kernel zeroes it - no weight range needed
+                                    continue;
+                                }
                                 GGML_ASSERT(id >= 0 && id < n_expert);
                                 ggml_bitset_set(used_ids.data(), id);
                             }
@@ -1801,6 +1806,18 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     int id = 0;
                     while (!ggml_bitset_get(used_ids.data(), id)) {
                         id++;
+                        if (id >= n_expert) {
+                            // all columns skipped (full-resident pool): the
+                            // mmid kernels zero the -1 columns natively without
+                            // reading any weight row, but the copy buffer must
+                            // still hold the full tensor for safety, so fall
+                            // back to a plain whole-tensor copy
+                            ggml_backend_synchronize(input_backend);
+                            ggml_backend_tensor_set_async(split_backend, input_cpy,
+                                    input->data, 0, ggml_nbytes(input));
+                            prev_ids_tensor = ids_tensor;
+                            goto copy_done;
+                        }
                     }
                     int32_t first_id = id;
                     int32_t last_id = first_id;
@@ -1821,6 +1838,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         last_id = id;
                     }
                     copy_experts(first_id, last_id);
+                    copy_done:;
                 } else {
                     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
                     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
