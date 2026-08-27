@@ -745,6 +745,12 @@ void llama_context::expert_pool_init() {
         }
     }
     if (!ok) {
+        if (n_slot > n_expert) {
+            LLAMA_LOG_WARN("%s: expert pool request of %d slots exceeds capacity (%d pooled layers x %d experts), "
+                           "saturating to full coverage per layer\n",
+                    __func__, cparams.expert_pool, n_pooled, n_expert);
+            n_slot = n_expert;
+        }
         llama_expert_pool_random(n_layer, n_expert, n_slot, st.resident);
     }
 

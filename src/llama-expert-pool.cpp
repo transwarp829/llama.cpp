@@ -279,14 +279,23 @@ bool llama_expert_pool_parse_init(const std::string & path, int32_t n_layer,
     return true;
 }
 
-// random resident set per layer (fixed seed for reproducibility)
+// random resident set per layer (fixed seed for reproducibility); samples
+// without replacement so every slot holds a distinct expert
 void llama_expert_pool_random(int32_t n_layer, int32_t n_expert, int32_t n_slot,
                               std::vector<std::vector<int32_t>> & resident) {
+    if (n_slot > n_expert) {
+        n_slot = n_expert;
+    }
     resident.assign(n_layer, std::vector<int32_t>(n_slot, -1));
     std::mt19937 rng(0);
+    std::vector<int32_t> perm(n_expert);
+    for (int32_t e = 0; e < n_expert; ++e) {
+        perm[e] = e;
+    }
     for (int32_t il = 0; il < n_layer; ++il) {
+        std::shuffle(perm.begin(), perm.end(), rng);
         for (int32_t s = 0; s < n_slot; ++s) {
-            resident[il][s] = (int32_t) (rng() % n_expert);
+            resident[il][s] = perm[s];
         }
     }
 }
