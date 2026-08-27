@@ -38,18 +38,15 @@ extern "C" {
     GGML_BACKEND_API bool    ggml_is_numa(void); // true if init detected that system has >1 NUMA node
 
     // Moe delegate: lets the host (llama.cpp) take over row computation inside the CPU
-    // MUL_MAT_ID kernel for cache-hit experts. begin() is called once per node (ith==0),
-    // may submit async work to another backend and returns true when the delegate is active
-    // (-> the kernel skips mask==0 rows, end() writes them later). end() is called once per
-    // node (ith==0) after the local row loop and must complete all async work / writes.
+    // MUL_MAT_ID hook for runtime routing analysis. begin() is called once per
+    // node (ith==0) before row grouping; it must not skip rows (the -1 ids
+    // zero the columns natively) and returns a null skip table.
     typedef void (*ggml_cpu_moe_delegate_begin_fn)(
             struct ggml_tensor * src0, struct ggml_tensor * src1, struct ggml_tensor * ids,
             struct ggml_tensor * dst, const int32_t ** skip_out, void * user_data);
-    typedef void (*ggml_cpu_moe_delegate_end_fn)(
-            struct ggml_tensor * dst, void * user_data);
 
     GGML_BACKEND_API void ggml_cpu_set_moe_delegate(
-            ggml_cpu_moe_delegate_begin_fn begin, ggml_cpu_moe_delegate_end_fn end, void * user_data);
+            ggml_cpu_moe_delegate_begin_fn begin, void * user_data);
 
     GGML_BACKEND_API struct ggml_tensor * ggml_new_i32(struct ggml_context * ctx, int32_t value);
     GGML_BACKEND_API struct ggml_tensor * ggml_new_f32(struct ggml_context * ctx, float value);
