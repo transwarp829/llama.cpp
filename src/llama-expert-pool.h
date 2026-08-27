@@ -76,9 +76,9 @@ struct llama_expert_pool {
 // ---------------------------------------------------------------
 // model-level runtime state of the expert pool (stage 2, milestone 3/4)
 //
-// holds, per pooled layer, GPU-resident pool weight tensors plus the
-// host-side slot table consumed by the moe delegate hook inside the CPU
-// MUL_MAT_ID kernel (slots[il]: expert id -> slot, -1 = miss/full CPU).
+// holds, per pooled layer, GPU-resident pool weight tensors (identity
+// layout: slot e = expert e, non-resident slots stay zero) plus the
+// routing tables that split the two chains of the direct mount.
 // the pool is initialized once (from --expert-pool-init or random) and
 // never refreshed in the static v1; swap logic is not wired in yet.
 struct llama_expert_pool_state {
@@ -91,11 +91,12 @@ struct llama_expert_pool_state {
     std::vector<ggml_tensor *> orig_gate;
     std::vector<ggml_tensor *> orig_down;
 
-    // pool weight tensors, indexed by layer; null = not pooled / not present
-    std::vector<ggml_tensor *> w_pool_gate_up; // fused [n_ff*2, n_embd, S]
-    std::vector<ggml_tensor *> w_pool_up;      // separate [n_ff, n_embd, S]
-    std::vector<ggml_tensor *> w_pool_gate;    // separate [n_ff, n_embd, S]
-    std::vector<ggml_tensor *> w_pool_down;    // [n_embd, n_ff, S]
+    // pool weight tensors, indexed by layer; null = not pooled / not present.
+    // identity layout: slot e holds expert e (non-resident slots stay zero)
+    std::vector<ggml_tensor *> w_pool_gate_up; // fused [n_ff*2, n_embd, n_expert]
+    std::vector<ggml_tensor *> w_pool_up;      // separate [n_ff, n_embd, n_expert]
+    std::vector<ggml_tensor *> w_pool_gate;    // separate [n_ff, n_embd, n_expert]
+    std::vector<ggml_tensor *> w_pool_down;    // [n_embd, n_ff, n_expert]
 
     // resident expert lists, indexed by layer (for diagnostics/serialization)
     std::vector<std::vector<int32_t>> resident;
@@ -106,80 +107,20 @@ struct llama_expert_pool_state {
     // set once the pool weights/tables have been copied (idempotent fill)
     bool fill_done = false;
 
-    // CPU-side expert->slot table per pooled layer (int32, -1 = miss); used by the
-    // moe delegate hook inside the CPU MUL_MAT_ID kernel
-    std::vector<std::vector<int32_t>> slots;
-
-    // moe delegate runtime
-    bool delegate_ok = false;
-    bool direct_mount = false;   // main-graph mount mode (GGML_EXPPOOL_MOUNT=1):
-                                 // the hook only supplies skip tables + stats,
-                                 // end() does no D2H write-back
+    // main-graph mount mode (GGML_EXPPOOL_MOUNT=1): a second GPU-resident
+    // expert chain runs inside the main graph; PR #26631 -1 ids zero the
+    // non-resident columns on the GPU chain (and the resident columns on the
+    // CPU chain via the inverse table), so no delegate hook is needed
+    bool direct_mount = false;
     bool rtlog_only = false;     // GGML_EXPPOOL_ROUTING_LOG with no pool: the
                                  // hook only feeds the routing log (no slots,
                                  // no delegation); set in expert_pool_init()
     ggml_backend_buffer_type_t pool_buft = nullptr;        // pool buft (device)
-    ggml_backend_t gpu_backend = nullptr;                  // target device[[truncated]
-    ggml_context *  mg_ctx    = nullptr;               // mini-graph ctx (no_alloc)
-    ggml_backend_buffer_t dg_buf = nullptr;            // GPU scratch: cur/out/ids
-    ggml_tensor * t_cur = nullptr;                     // [n_embd] F32
-    ggml_tensor * t_out = nullptr;                     // [n_ff, 8] F32
-    ggml_tensor * t_ids = nullptr;                     // [8] I32
-    ggml_tensor * mg_w  = nullptr;                     // pool weight 4D (set per call)
-    int32_t n_used = 0;                                // top-k (hparams.n_expert_used)
-    std::vector<int32_t> hit_slots;                    // hit slots per ids row (size = n_used)
-    std::vector<int32_t> hit_cols;                     // original ids column per hit
-    int32_t n_hit = 0;
-    size_t  sz_out_row = 0;                            // n_ff * sizeof(float)
-    // per-layer delegate statistics (indexed by ilx = position in pooled_layers;
-    // accumulated since last read, see llama_expert_pool_get_stats; the delegate
-    // runs on the ith==0 thread only)
-    struct layer_delegate_stats {
-        uint64_t submits = 0;    // mini-graph submissions for this layer
-        uint64_t hit_rows = 0;   // rows computed by the GPU delegate
-        uint64_t miss_rows = 0;  // rows computed by the CPU kernel
-        uint64_t getset_us = 0;  // cur copy H2D preparation time
-        uint64_t ids_us = 0;     // ids scratch prepare + upload time
-        uint64_t comp_us = 0;    // graph compute submission time
-        uint64_t sync_us = 0;    // end() wait for GPU completion
-        uint64_t get_us = 0;     // end() D2H copy of hit rows
-    };
-    std::vector<layer_delegate_stats> s_layer;
-    ggml_backend_buffer_t host_buf = nullptr;          // pinned host mirrors (fast H2D/D2H)
-    void * host_cur = nullptr;                         // pinned mirror of t_cur
-    void * host_ids = nullptr;                         // pinned mirror of t_ids
-    bool async_d2h = false;                            // stream-ordered D2H in begin (GGML_EXPPOOL_ASYNC_D2H=1)
-
-    // per-layer cached mini graphs (built once at fill time; each call only
-    // refills t_cur/t_ids and recomputes). each entry owns the llm_graph
-    // context/result that built it (the chain is built by calling
-    // build_moe_ffn(chain_only) with pool weights, so the model's own
-    // activation variants are reused verbatim).
-    struct mini_graph_entry {
-        ggml_cgraph * g = nullptr;         // the built whole-chain graph
-        ggml_tensor * out_down = nullptr;  // down output (chain result)
-        void * gres = nullptr;             // llm_graph_result* (owned)
-    };
-    std::vector<std::vector<mini_graph_entry>> mini;
-    std::vector<ggml_backend_buffer_t> layer_bufs; // per-layer chain scratch (freed in reset)
-    std::vector<ggml_tensor *> layer_out_down;     // per-layer chain result tensors
-
-    // fused up+gate submission state: the first begin of a layer submits the
-    // combined graph; the second begin only scans ids and returns the skip table.
-    // end() uses this map to find (il, which) for a given dst tensor.
-    std::unordered_map<const ggml_tensor *, std::pair<int32_t, int32_t>> dst_ilx_which;
-    ggml_tensor * t_out_down = nullptr;    // [n_embd, n_used] F32 down hit output (GPU), the chain result
-    void * host_out_down = nullptr;        // pinned mirror of t_out_down
-    bool mini_submitted = false;           // combined graph already submitted this step
-    int32_t mini_submitted_il = -1;        // which layer submitted it
-                                           // note: begin re-arms on a layer CHANGE,
-                                           // end() re-arms after write-back (either
-                                           // alone misses the single-pool-layer case)
-    ggml_backend_event_t ev = nullptr;     // per-submit completion event (end() waits only its own graph)
 
     // runtime routing log (GGML_EXPPOOL_ROUTING_LOG=<path>; ONLY for analysis,
-    // writes the raw ids seen by the delegate: "step,layer,id0,id1,..."  - the
-    // same format as the CB-on capture, but from the REAL NO_CB execution).
+    // writes the ids seen by the CPU mul_mat_id kernel: "step,layer,id0,id1,..".
+    // with direct mount the ids are the inverse-remap values (resident = -1,
+    // non-resident = expert id), so hit ratio = share of -1 entries.
     FILE * rt_log = nullptr;               // opened lazily on first begin
     bool   rt_log_tried = false;           // env already checked (avoid re-getenv)
     uint64_t log_step = 0;                 // current decode step (incremented at ilx==0)
@@ -218,26 +159,39 @@ void llama_expert_pool_register_chain(int il, int type_op, bool norm_w, float w_
 const llama_chain_params & llama_expert_pool_get_chain(int il);
 void llama_expert_pool_clear_chain();
 
-// moe delegate: called by the CPU MUL_MAT_ID kernel for cache-hit experts (see ggml-cpu.h)
+// moe routing-log hook: called by the CPU MUL_MAT_ID kernel (ith==0), feeds
+// GGML_EXPPOOL_ROUTING_LOG (see llama-expert-pool.h). returns a null skip
+// table: no rows are skipped, column zeroing is done by the -1 ids natively.
 void llama_expert_pool_delegate_begin(
         ggml_tensor * src0, ggml_tensor * src1, ggml_tensor * ids, ggml_tensor * dst,
         const int32_t ** skip_out, void * ud);
-void llama_expert_pool_delegate_end(ggml_tensor * dst, void * ud);
 
 // ---------------------------------------------------------------
 // direct mount (main-graph execution): per-layer tensors that let
 // build_moe_ffn run a second, GPU-resident chain over the pool
-// weights inside the MAIN graph. non-resident expert columns route
-// to a zero sentinel slice (index = per-layer slot count) and yield
-// exact zeros; a column-mask merge with the CPU chain (which the
-// delegate hook reduces to miss rows only) produces the final output.
+// weights inside the MAIN graph. PR #26631 -1 ids zero the matching
+// column, so the two chains split the columns by construction:
+// remap (device, for the GPU chain) sends non-resident experts to -1,
+// remap_cpu (host, for the CPU chain) sends resident experts to -1.
+// a single add merges both chains.
 struct llama_expert_pool_mount {
     bool active = false;
-    ggml_tensor * w_gate_up = nullptr; // [n_ff*2, n_embd, S] or null
-    ggml_tensor * w_up      = nullptr; // [n_ff, n_embd, S] or null
+    ggml_tensor * w_gate_up = nullptr; // [n_ff*2, n_embd, n_expert] or null
+    ggml_tensor * w_up      = nullptr; // [n_ff, n_embd, n_expert] or null
     ggml_tensor * w_gate    = nullptr;
     ggml_tensor * w_down    = nullptr;
-    ggml_tensor * remap     = nullptr; // I32 [1, n_expert] expert -> slot, or -1 (skip, PR#26631)
+    ggml_tensor * w_down_s  = nullptr; // per-expert down scale (applied outside
+                                       // the chains via remap_scale lookups)
+    ggml_tensor * w_down_b  = nullptr; // per-expert down bias (add_id -1 makes
+                                       // it a no-op for skipped columns)
+    ggml_tensor * remap     = nullptr; // I32 [1, n_expert] on the pool device:
+                                       // resident expert e -> e, non-resident -> -1
+    ggml_tensor * remap_cpu = nullptr; // I32 [1, n_expert] on the host:
+                                       // resident expert e -> -1, non-resident -> e
+    ggml_tensor * remap_scale     = nullptr; // I32 [1, n_expert] on the pool device:
+                                             // resident e -> e, non-resident -> 0
+    ggml_tensor * remap_scale_cpu = nullptr; // I32 [1, n_expert] on the host:
+                                             // resident e -> 0, non-resident -> e
 };
 
 void llama_expert_pool_register_mount(int il, const llama_expert_pool_mount & mount);
