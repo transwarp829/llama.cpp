@@ -913,6 +913,8 @@ void llama_context::expert_pool_init() {
     st.pool_buft = pool_buft;
     pool_buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(pool_ctx, pool_buft));
     if (!pool_buf) {
+        LLAMA_LOG_WARN("%s: pool allocation on %s failed, falling back to CPU\n",
+                __func__, ggml_backend_buft_name(pool_buft));
         pool_buft = ggml_backend_cpu_buffer_type();
         pool_buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(pool_ctx, pool_buft));
     }
@@ -921,6 +923,9 @@ void llama_context::expert_pool_init() {
         st.reset();
         return;
     }
+    LLAMA_LOG_INFO("%s: pool allocated on %s (host=%d, %zu bytes)\n",
+            __func__, ggml_backend_buft_name(pool_buft),
+            (int) ggml_backend_buffer_is_host(pool_buf.get()), ggml_backend_buffer_get_size(pool_buf.get()));
     // mark the pool tensors as weights so the scheduler keeps the warm-path
     // mat_mul_id (and its outputs) on the pool device instead of pulling the
     // pool tensors back to the CPU for the hot/cold merge
