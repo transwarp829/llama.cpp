@@ -174,24 +174,26 @@ void llama_expert_pool_delegate_begin(
 // remap (device, for the GPU chain) sends non-resident experts to -1,
 // remap_cpu (host, for the CPU chain) sends resident experts to -1.
 // a single add merges both chains.
+// NOTE: remap/remap_cpu are I32: ggml_get_rows supports I32 tables natively
+// (the output type follows the table, ggml.c) on every backend, so the ids
+// gathering needs no cast. the F32 REPEAT gate on CUDA only matters for the
+// scale tables, which are F32.
 struct llama_expert_pool_mount {
     bool active = false;
     ggml_tensor * w_gate_up = nullptr; // [n_ff*2, n_embd, n_expert] or null
     ggml_tensor * w_up      = nullptr; // [n_ff, n_embd, n_expert] or null
     ggml_tensor * w_gate    = nullptr;
     ggml_tensor * w_down    = nullptr;
-    ggml_tensor * w_down_s  = nullptr; // per-expert down scale (applied outside
-                                       // the chains via remap_scale lookups)
+    ggml_tensor * w_down_s  = nullptr; // per-expert down scale source (values
+                                       // are staged into `scale` at fill time)
     ggml_tensor * w_down_b  = nullptr; // per-expert down bias (add_id -1 makes
                                        // it a no-op for skipped columns)
     ggml_tensor * remap     = nullptr; // I32 [1, n_expert] on the pool device:
-                                       // resident expert e -> e, non-resident -> -1
-    ggml_tensor * remap_cpu = nullptr; // I32 [1, n_expert] on the host:
+                                       // resident expert e -> slot s, non-resident -> -1
+    ggml_tensor * remap_cpu = nullptr; // I32 [1, n_expert] on the pool device:
                                        // resident expert e -> -1, non-resident -> e
-    ggml_tensor * remap_scale     = nullptr; // I32 [1, n_expert] on the pool device:
-                                             // resident e -> e, non-resident -> 0
-    ggml_tensor * remap_scale_cpu = nullptr; // I32 [1, n_expert] on the host:
-                                             // resident e -> 0, non-resident -> e
+    ggml_tensor * scale     = nullptr; // F32 [1, n_expert] on the pool device:
+                                       // per-expert down scale (null = no scale)
 };
 
 void llama_expert_pool_register_mount(int il, const llama_expert_pool_mount & mount);

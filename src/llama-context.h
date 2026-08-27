@@ -392,10 +392,8 @@ private:
     // (kept alive as long as the context; pointers also stored in model.expert_pool_state)
     ggml_context * pool_ctx  = nullptr;
     ggml_context * pool_tab_ctx = nullptr; // direct-mount remap tables (pool device)
-    ggml_context * host_tab_ctx = nullptr; // inverse remap tables (host)
     ggml_backend_buffer_ptr pool_buf;
     ggml_backend_buffer_ptr mount_tab_buf; // device buffer holding the remap tables
-    ggml_backend_buffer_ptr host_tab_buf;  // host buffer holding the remap tables
 
     llm_graph_result_ptr gf_res_prev;
     llm_graph_result_ptr gf_res_reserve;
