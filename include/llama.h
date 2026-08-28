@@ -1571,6 +1571,26 @@ extern "C" {
     LLAMA_API void llama_log_get(ggml_log_callback * log_callback, void ** user_data);
     LLAMA_API void llama_log_set(ggml_log_callback   log_callback, void *  user_data);
 
+    // verbosity-explicit logging: bypasses the ggml-level -> verbosity remap in
+    // the common default callback. `verbosity` uses the same numbering as the
+    // common LOG_LEVEL_* (3 = info, shown at -lv 3). The common layer registers
+    // a verbosity callback that forwards to its own log (LOG_INF-equivalent);
+    // when none is registered, llama_log_verbose falls back to llama_log_internal.
+    typedef enum llama_log_verbosity {
+        LLAMA_LOG_VERBOSITY_ERROR = 1,
+        LLAMA_LOG_VERBOSITY_WARN  = 2,
+        LLAMA_LOG_VERBOSITY_INFO  = 3,
+        LLAMA_LOG_VERBOSITY_TRACE = 4,
+        LLAMA_LOG_VERBOSITY_DEBUG = 5,
+    } llama_log_verbosity;
+
+    // same signature as ggml_log_callback with an explicit verbosity prepended
+    typedef void (*llama_log_verbosity_callback)(int verbosity, enum ggml_log_level level, const char * text, void * user_data);
+
+    // register the verbosity-explicit callback (global, not thread safe, like
+    // llama_log_set)
+    LLAMA_API void llama_log_set_verbosity(llama_log_verbosity_callback callback, void * user_data);
+
     //
     // Performance utils
     //
@@ -1656,6 +1676,11 @@ extern "C" {
 
     LLAMA_API uint32_t llama_expert_pool_get_stats(struct llama_context * ctx,
             struct llama_expert_pool_layer_stats * out, uint32_t max_layers);
+
+    // expert pool: end of a generation segment. prints the accumulated
+    // swap-window hit rate (since the last finalize) at info verbosity and
+    // resets the window counters. call once after the decode loop finishes.
+    LLAMA_API void llama_expert_pool_finalize(struct llama_context * ctx);
 
 #ifdef __cplusplus
 }

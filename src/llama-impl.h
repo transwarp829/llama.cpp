@@ -24,12 +24,19 @@ LLAMA_ATTRIBUTE_FORMAT(2, 3)
 void llama_log_internal        (ggml_log_level level, const char * format, ...);
 void llama_log_callback_default(ggml_log_level level, const char * text, void * user_data);
 
+// verbosity-explicit logging (see llama_log_set_verbosity in llama.h). takes
+// an explicit common LOG_LEVEL verbosity; bypasses the ggml-level remap when a
+// verbosity callback is registered, else falls back to llama_log_internal.
+LLAMA_ATTRIBUTE_FORMAT(3, 4)
+void llama_log_verbose(int verbosity, ggml_log_level level, const char * format, ...);
 #define LLAMA_LOG(...)       llama_log_internal(GGML_LOG_LEVEL_NONE , __VA_ARGS__)
 #define LLAMA_LOG_INFO(...)  llama_log_internal(GGML_LOG_LEVEL_INFO , __VA_ARGS__)
 #define LLAMA_LOG_WARN(...)  llama_log_internal(GGML_LOG_LEVEL_WARN , __VA_ARGS__)
 #define LLAMA_LOG_ERROR(...) llama_log_internal(GGML_LOG_LEVEL_ERROR, __VA_ARGS__)
 #define LLAMA_LOG_DEBUG(...) llama_log_internal(GGML_LOG_LEVEL_DEBUG, __VA_ARGS__)
 #define LLAMA_LOG_CONT(...)  llama_log_internal(GGML_LOG_LEVEL_CONT , __VA_ARGS__)
+// verbosity-explicit info log: shown at -lv 3 (LLAMA_LOG_VERBOSITY_INFO)
+#define LLAMA_LOG_INFV(verbosity, ...) llama_log_verbose((verbosity), GGML_LOG_LEVEL_INFO, __VA_ARGS__)
 
 //
 // helpers
