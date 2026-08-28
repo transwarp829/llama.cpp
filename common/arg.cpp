@@ -1713,13 +1713,6 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ));
     add_opt(common_arg(
-        {"--expert-pool-swap"},
-        "refresh the expert pool resident set from a sliding decode window (stage 3)",
-        [](common_params & params) {
-            params.expert_pool_swap = true;
-        }
-    ));
-    add_opt(common_arg(
         {"--expert-pool-swap-window"}, "N",
         "swap window length in decode steps (stage 3; default 512)",
         [](common_params & params, int value) {

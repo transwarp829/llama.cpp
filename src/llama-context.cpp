@@ -690,6 +690,12 @@ void llama_context::expert_pool_init() {
     }
     st.n_expert = n_expert;
     st.swap_auto = cparams.expert_pool_swap;
+    // experimental: GGML_EXPPOOL_SWAP=0 keeps the resident set static (A/B
+    // comparisons without swap); otherwise swap is on by default with -nep
+    const char * swap_env = getenv("GGML_EXPPOOL_SWAP");
+    if (swap_env != nullptr && swap_env[0] == '0') {
+        st.swap_auto = false;
+    }
     const char * swap_w_env = getenv("GGML_EXPPOOL_SWAP_WINDOW");
     if (cparams.expert_pool_swap_window > 0) {
         st.swap_W = cparams.expert_pool_swap_window;
@@ -4241,7 +4247,7 @@ llama_context_params llama_context_default_params() {
         /*.expert_cache                =*/ false,
         /*.expert_pool                 =*/ 0,
         /*.expert_pool_init            =*/ nullptr,
-        /*.expert_pool_swap            =*/ false,
+        /*.expert_pool_swap            =*/ true,
         /*.expert_pool_swap_window     =*/ 0,
         /*.samplers                    =*/ nullptr,
         /*.n_samplers                  =*/ 0,
