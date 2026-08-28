@@ -13,6 +13,8 @@
 struct llama_logger_state {
     ggml_log_callback log_callback = llama_log_callback_default;
     void * log_callback_user_data = nullptr;
+    llama_log_verbosity_callback log_callback_v = nullptr;
+    void * log_callback_v_user_data = nullptr;
 };
 
 static llama_logger_state g_logger_state;
@@ -33,6 +35,11 @@ void llama_log_set(ggml_log_callback log_callback, void * user_data) {
     ggml_log_set(log_callback, user_data);
     g_logger_state.log_callback = log_callback ? log_callback : llama_log_callback_default;
     g_logger_state.log_callback_user_data = user_data;
+}
+
+void llama_log_set_verbosity(llama_log_verbosity_callback callback, void * user_data) {
+    g_logger_state.log_callback_v = callback;
+    g_logger_state.log_callback_v_user_data = user_data;
 }
 
 static void llama_log_internal_v(ggml_log_level level, const char * format, va_list args) {
@@ -57,6 +64,35 @@ void llama_log_internal(ggml_log_level level, const char * format, ...) {
     va_start(args, format);
     llama_log_internal_v(level, format, args);
     va_end(args);
+}
+
+void llama_log_verbose(int verbosity, ggml_log_level level, const char * format, ...) {
+    if (g_logger_state.log_callback_v == nullptr) {
+        // no verbosity callback registered: fall back to the plain level log
+        va_list args;
+        va_start(args, format);
+        llama_log_internal_v(level, format, args);
+        va_end(args);
+        return;
+    }
+
+    va_list args;
+    va_list args_copy;
+    va_start(args, format);
+    va_copy(args_copy, args);
+    char buffer[128];
+    int len = vsnprintf(buffer, sizeof(buffer), format, args);
+    va_end(args);
+    if (len < (int) sizeof(buffer)) {
+        g_logger_state.log_callback_v(verbosity, level, buffer, g_logger_state.log_callback_v_user_data);
+    } else {
+        char * buffer2 = new char[len + 1];
+        vsnprintf(buffer2, len + 1, format, args_copy);
+        buffer2[len] = 0;
+        g_logger_state.log_callback_v(verbosity, level, buffer2, g_logger_state.log_callback_v_user_data);
+        delete[] buffer2;
+    }
+    va_end(args_copy);
 }
 
 void llama_log_callback_default(ggml_log_level level, const char * text, void * user_data) {

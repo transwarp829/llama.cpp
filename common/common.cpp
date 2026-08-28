@@ -392,6 +392,14 @@ void common_init() {
     common_log_set_timestamps(common_log_main(), true);
 
     llama_log_set(common_log_default_callback, NULL);
+
+    // verbosity-explicit path (expert-pool swap summaries): bypasses the ggml
+    // level -> verbosity remap in common_log_default_callback, mirrors LOG_INF
+    llama_log_set_verbosity([](int verbosity, enum ggml_log_level level, const char * text, void * /*user_data*/) {
+        if (verbosity <= common_log_get_verbosity_thold()) {
+            common_log_add(common_log_main(), level, "%s", text);
+        }
+    }, NULL);
 }
 
 void common_params_print_info(const common_params & params, bool print_devices) {

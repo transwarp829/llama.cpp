@@ -429,6 +429,9 @@ int main(int argc, char ** argv) {
         step++;
     }
 
+    // end of the generation segment: print the accumulated pool hit rate
+    llama_expert_pool_finalize(ctx);
+
     // aggregate view: run totals + per-layer means (decode steps only)
     if (data.steps.size() > 1) {
         const double nd = (double) (data.steps.size() - 1);
