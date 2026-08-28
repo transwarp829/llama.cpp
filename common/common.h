@@ -575,6 +575,7 @@ struct common_params {
 
     int32_t expert_pool        = 0;      // total expert-pool slots (0 = disabled)
     std::string expert_pool_init;         // csv file to seed the pool (empty = random)
+    bool expert_pool_swap      = false;   // auto-swap the pool resident set (sliding window)
 
     bool input_prefix_bos  = false; // prefix BOS to user inputs, preceding input_prefix
     bool verbose_prompt    = false; // print prompt tokens before generation

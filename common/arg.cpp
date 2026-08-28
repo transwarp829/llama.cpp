@@ -1713,6 +1713,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ));
     add_opt(common_arg(
+        {"--expert-pool-swap"},
+        "refresh the expert pool resident set from a sliding decode window (stage 3)",
+        [](common_params & params) {
+            params.expert_pool_swap = true;
+        }
+    ));
+    add_opt(common_arg(
         {"-ctxcp", "--ctx-checkpoints", "--swa-checkpoints"}, "N",
         string_format("max number of context checkpoints to create per slot (default: %d)"
             "[(more info)](https://github.com/ggml-org/llama.cpp/pull/15293)", params.n_ctx_checkpoints),
