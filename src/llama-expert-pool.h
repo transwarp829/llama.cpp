@@ -139,6 +139,18 @@ struct llama_expert_pool_state {
     std::vector<int32_t> win_cnt;          // [pooled layers * n_expert]
     std::vector<std::vector<int32_t>> win_hist; // [W] flat (ilx, e) pairs per step
 
+    // per-pooled-layer hit/miss counters (direct mount: the CPU segment
+    // receives remap_cpu ids, so e < 0 means the GPU pool chain computed the
+    // row and e >= 0 is a CPU miss); read (and cleared) via
+    // llama_expert_pool_get_stats
+    std::vector<uint64_t> stat_hit;        // [pooled layers]
+    std::vector<uint64_t> stat_miss;       // [pooled layers]
+    // swap-window aggregates (cleared by each swap; independent of the
+    // per-layer snapshot counters above, which a frequent stats reader
+    // resets)
+    uint64_t win_hit  = 0;
+    uint64_t win_miss = 0;
+
     void reset();
 };
 

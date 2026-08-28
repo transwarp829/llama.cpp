@@ -229,6 +229,10 @@ void llama_expert_pool_state::reset() {
     win_step = 0;
     win_cnt.clear();
     win_hist.clear();
+    stat_hit.clear();
+    stat_miss.clear();
+    win_hit  = 0;
+    win_miss = 0;
 }
 
 // parse seed csv: one line per layer "il,e1,e2,...". layers missing from the
@@ -369,6 +373,10 @@ void llama_expert_pool_delegate_begin(
         st.win_cnt.assign((size_t) st.pooled_layers.size() * st.n_expert, 0);
         st.win_hist.resize(st.swap_W);
     }
+    if (st.stat_hit.empty() && !st.pooled_layers.empty()) {
+        st.stat_hit.assign(st.pooled_layers.size(), 0);
+        st.stat_miss.assign(st.pooled_layers.size(), 0);
+    }
     // step-advance detection, independent of the routing log: the first
     // pooled layer of a step begins after the last layer of the previous
     // one (rt_step_done is set at the end of this hook)
@@ -421,6 +429,21 @@ void llama_expert_pool_delegate_begin(
             st.win_cnt[ilx * st.n_expert + e] ++;
             hist.push_back(ilx);
             hist.push_back(e);
+        }
+    }
+    // hit/miss counters (direct mount: ids come from remap_cpu, so -1 is a GPU
+    // pool hit and a non-negative id is the expert computed on the CPU). idle
+    // layers (active=false) are skipped by the mount gate above.
+    if (st.direct_mount) {
+        for (int id = 0; id < (int) ids->ne[0]; ++id) {
+            const int32_t e = *((const int32_t *) ((const char *) ids->data + id*ids->nb[0]));
+            if (e < 0) {
+                st.stat_hit[ilx] ++;
+                st.win_hit ++;
+            } else if (e < st.n_expert) {
+                st.stat_miss[ilx] ++;
+                st.win_miss ++;
+            }
         }
     }
     // the last pooled layer completes the step (single-layer-safe detection:
@@ -564,4 +587,13 @@ void llama_expert_pool_run_swap(llama_expert_pool_state & st) {
     }
 
     LLAMA_LOG_INFO("%s: swapped %d expert slots (step %d)\n", __func__, delta, st.win_step);
+    if (st.win_hit + st.win_miss > 0) {
+        LLAMA_LOG_INFO("%s: pool hit rate %.1f%% (%llu/%llu rows, swap window %d)\n", __func__,
+                100.0 * st.win_hit / (double) (st.win_hit + st.win_miss),
+                (unsigned long long) st.win_hit,
+                (unsigned long long) (st.win_hit + st.win_miss), st.swap_W);
+    }
+    // a new window starts at the next swap
+    st.win_hit  = 0;
+    st.win_miss = 0;
 }
