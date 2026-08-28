@@ -3,6 +3,7 @@
 #include "llama-model.h"
 #include "llama-graph.h"
 #include "llama-model-loader.h"
+#include "ggml-backend.h"
 
 // note: almost all graphs require at least sqrtf, so include cmath globally
 #include <cmath>
@@ -1367,6 +1368,15 @@ struct llama_model_dflash : public llama_model_base {
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+
+    // lazy host copy of the target model's lm_head, used when the draft has no
+    // output.weight of its own and its graph cannot reference the target's
+    // pre-allocated tensor directly (e.g. it lives on a GPU backend that is
+    // not in this draft context's scheduler). kept here so graph rebuilds
+    // reuse the copy instead of re-copying every step.
+    mutable ggml_context * out_ctx      = nullptr;
+    mutable ggml_tensor *  out_host     = nullptr;
+    mutable std::unique_ptr<ggml_backend_buffer, decltype(&ggml_backend_buffer_free)> out_buf{nullptr, &ggml_backend_buffer_free};
 };
 
 
