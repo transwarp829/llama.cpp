@@ -2139,7 +2139,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // miss col = cpu + 0.
     // direct mount serves every batch size: decode (T=1) and verify/parallel
     // batches (T>1) share the same graph.
-    if (!chain_only && cparams.expert_pool > 0 && il >= 0) {
+    // NOTE: draft contexts (ctx_other set) must never build the mount chain:
+    // the mount registry is global and keyed by layer index only, so a drafter
+    // graph would pick up the MAIN model's mounts (wrong tensors, wrong pool).
+    if (!chain_only && cparams.expert_pool > 0 && il >= 0 && cparams.ctx_other == nullptr) {
         const llama_expert_pool_mount & mnt = llama_expert_pool_get_mount(il);
         if (mnt.active) {
             // all tables live on the pool device, so every gather runs on the

@@ -629,6 +629,14 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
 // - seed the resident sets from --expert-pool-init csv, or at random
 // - copy the resident weights into the pool and fill the slot tables
 void llama_context::expert_pool_init() {
+    // speculative draft contexts (separate drafter model / MTP) must not touch
+    // the expert pool: its buffers, mount registry, and CPU MoE delegate belong
+    // to the MAIN context only. a draft ctx re-running this would re-allocate
+    // the pool (clobbering VRAM), overwrite the globally-registered delegate,
+    // and - with MTP sharing the main model's state - reset() a live pool.
+    if (cparams.ctx_other != nullptr) {
+        return;
+    }
     llama_expert_pool_state & st = model.expert_pool_state;
     st.reset();
     // routing-log-only mode: capture the native routing stream of a pool-free
@@ -4945,4 +4953,26 @@ uint32_t llama_context::expert_pool_stats_snapshot(llama_expert_pool_layer_stats
     std::fill(st.stat_hit.begin(),  st.stat_hit.begin()  + n, 0);
     std::fill(st.stat_miss.begin(), st.stat_miss.begin() + n, 0);
     return n;
+}
+
+void llama_context::expert_pool_finalize() {
+    llama_expert_pool_state & st = model.expert_pool_state;
+    if (st.win_hit + st.win_miss == 0) {
+        return;
+    }
+    // generation-segment hit rate, printed once at segment end (see
+    // llama_expert_pool_run_swap: win_hit/win_miss accumulate across swaps)
+    LLAMA_LOG_INFV(LLAMA_LOG_VERBOSITY_INFO, "%s: pool hit rate %.1f%% (%llu/%llu rows, generation segment)\n", __func__,
+            100.0 * st.win_hit / (double) (st.win_hit + st.win_miss),
+            (unsigned long long) st.win_hit,
+            (unsigned long long) (st.win_hit + st.win_miss));
+    st.win_hit  = 0;
+    st.win_miss = 0;
+}
+
+extern "C" void llama_expert_pool_finalize(struct llama_context * ctx) {
+    if (ctx == nullptr) {
+        return;
+    }
+    ctx->expert_pool_finalize();
 }
