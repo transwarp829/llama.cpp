@@ -2525,6 +2525,15 @@ common_speculative_init_result::common_speculative_init_result(
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 
+    // the expert pool is a MAIN-context feature; draft contexts must never
+    // inherit it, mirroring how -cmoed/-ngld live in params.speculative.draft.*
+    // instead of the main params. (if a drafter ever needs its own pool, add a
+    // -nepd-style channel in that same draft-mparams space instead of lifting
+    // this isolation.)
+    cparams.expert_pool           = 0;
+    cparams.expert_pool_swap      = false;
+    cparams.expert_pool_swap_window = 0;
+
     if (spec_mtp) {
         cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
     }

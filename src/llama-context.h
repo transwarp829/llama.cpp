@@ -247,6 +247,9 @@ public:
     // snapshot-and-reset expert-pool delegate statistics (public API support)
     uint32_t expert_pool_stats_snapshot(llama_expert_pool_layer_stats * out, uint32_t max_layers);
 
+    // print-and-reset the generation-segment swap-window hit rate (public API support)
+    void expert_pool_finalize();
+
     // can reuse the llm_graph_result instance of the context (for example to update a memory module)
     llm_graph_result * get_gf_res_reserve() const;
 

@@ -350,10 +350,13 @@ void llama_expert_pool_delegate_begin(
             return;
         }
     }
-    // single decode rows only (the log line is one token's ids)
-    if (ids->ne[1] != 1) {
-        return;
-    }
+    // NOTE: no single-token gate here. the swap window and the hit/miss
+    // counters must see EVERY token column of the batch: multi-sequence runs
+    // (-np N) and speculative verify batches (T = 1 + n_draft) both arrive
+    // with ids->ne[1] > 1, and dropping them silently disables the swap under
+    // -np N or speculative decoding (the window is a global mix of all
+    // sequences routed in this decode). only the routing log below keeps the
+    // one-token-per-line format.
     // --- runtime routing log (env-gated, B=1 decode rows only): write the
     // expert ids that reached this kernel, one line per (step, pooled layer).
     // step counting: the first begin of each step is the first pooled layer
@@ -397,7 +400,8 @@ void llama_expert_pool_delegate_begin(
             st.win_step += 1;
         }
     }
-    if (st.rt_log != nullptr) {
+    // routing log: keep the one-token-per-line format (B=1 decode rows only)
+    if (ids->ne[1] == 1 && st.rt_log != nullptr) {
         // new decode step when the FIRST pooled layer logs again after the
         // LAST one did (a layer-id-change test breaks with one pooled layer)
         if (ilx == 0 && st.rt_step_done) {
@@ -418,31 +422,37 @@ void llama_expert_pool_delegate_begin(
         }
     }
 
-    // --- stage 3 swap window: count this row's expert ids ---
+    // --- stage 3 swap window: count this row's expert ids for EVERY token
+    // column of the batch (multi-seq / spec verify arrive with ne[1] > 1).
+    // one decode call = one window step regardless of the token count.
     if (st.swap_auto && !st.win_cnt.empty()) {
         std::vector<int32_t> & hist = st.win_hist[st.win_step % st.swap_W];
-        for (int id = 0; id < (int) ids->ne[0]; ++id) {
-            const int32_t e = *((const int32_t *) ((const char *) ids->data + id*ids->nb[0]));
-            if (e < 0 || e >= st.n_expert) {
-                continue;
+        for (int64_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
+            for (int id = 0; id < (int) ids->ne[0]; ++id) {
+                const int32_t e = *((const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]));
+                if (e < 0 || e >= st.n_expert) {
+                    continue;
+                }
+                st.win_cnt[ilx * st.n_expert + e] ++;
+                hist.push_back(ilx);
+                hist.push_back(e);
             }
-            st.win_cnt[ilx * st.n_expert + e] ++;
-            hist.push_back(ilx);
-            hist.push_back(e);
         }
     }
     // hit/miss counters (direct mount: ids come from remap_cpu, so -1 is a GPU
     // pool hit and a non-negative id is the expert computed on the CPU). idle
     // layers (active=false) are skipped by the mount gate above.
     if (st.direct_mount) {
-        for (int id = 0; id < (int) ids->ne[0]; ++id) {
-            const int32_t e = *((const int32_t *) ((const char *) ids->data + id*ids->nb[0]));
-            if (e < 0) {
-                st.stat_hit[ilx] ++;
-                st.win_hit ++;
-            } else if (e < st.n_expert) {
-                st.stat_miss[ilx] ++;
-                st.win_miss ++;
+        for (int64_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
+            for (int id = 0; id < (int) ids->ne[0]; ++id) {
+                const int32_t e = *((const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]));
+                if (e < 0) {
+                    st.stat_hit[ilx] ++;
+                    st.win_hit ++;
+                } else if (e < st.n_expert) {
+                    st.stat_miss[ilx] ++;
+                    st.win_miss ++;
+                }
             }
         }
     }
@@ -586,14 +596,8 @@ void llama_expert_pool_run_swap(llama_expert_pool_state & st) {
         delta += (int32_t) fill.size();
     }
 
-    LLAMA_LOG_INFO("%s: swapped %d expert slots (step %d)\n", __func__, delta, st.win_step);
-    if (st.win_hit + st.win_miss > 0) {
-        LLAMA_LOG_INFO("%s: pool hit rate %.1f%% (%llu/%llu rows, swap window %d)\n", __func__,
-                100.0 * st.win_hit / (double) (st.win_hit + st.win_miss),
-                (unsigned long long) st.win_hit,
-                (unsigned long long) (st.win_hit + st.win_miss), st.swap_W);
-    }
-    // a new window starts at the next swap
-    st.win_hit  = 0;
-    st.win_miss = 0;
+    LLAMA_LOG_INFV(LLAMA_LOG_VERBOSITY_INFO, "%s: swapped %d expert slots (step %d)\n", __func__, delta, st.win_step);
+    // the pool hit rate is printed once at the end of the generation segment
+    // by llama_expert_pool_finalize; win_hit/win_miss accumulate across the
+    // segment (no per-swap reset here)
 }
