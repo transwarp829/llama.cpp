@@ -681,6 +681,10 @@ struct server_slot {
         }
 
         common_speculative_print_stats(spec);
+
+        // expert pool: print-and-reset the generation-segment hit rate
+        // (swap-window stats accumulate since the previous segment end)
+        llama_expert_pool_finalize(ctx_tgt);
     }
 
     json to_json(bool only_metrics = false) const {
