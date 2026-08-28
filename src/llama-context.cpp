@@ -149,6 +149,7 @@ llama_context::llama_context(
 
     cparams.expert_pool      = params.expert_pool;
     cparams.expert_pool_init = params.expert_pool_init;
+    cparams.expert_pool_swap = params.expert_pool_swap;
     if (cparams.expert_cache) {
         expert_cache.enabled = true;
         expert_cache.init(cparams.n_seq_max, hparams.n_layer());
@@ -677,6 +678,12 @@ void llama_context::expert_pool_init() {
     const int32_t n_expert = model.hparams.n_expert;
     if (n_expert <= 0) {
         return;
+    }
+    st.n_expert = n_expert;
+    st.swap_auto = cparams.expert_pool_swap;
+    const char * swap_w_env = getenv("GGML_EXPPOOL_SWAP_WINDOW");
+    if (swap_w_env != nullptr && std::atoi(swap_w_env) > 0) {
+        st.swap_W = std::atoi(swap_w_env);
     }
 
     // --- find the pooled layers (MoE weights that live on the CPU) ---
@@ -4223,6 +4230,7 @@ llama_context_params llama_context_default_params() {
         /*.expert_cache                =*/ false,
         /*.expert_pool                 =*/ 0,
         /*.expert_pool_init            =*/ nullptr,
+        /*.expert_pool_swap            =*/ false,
         /*.samplers                    =*/ nullptr,
         /*.n_samplers                  =*/ 0,
         /*.ctx_other                   =*/ nullptr,

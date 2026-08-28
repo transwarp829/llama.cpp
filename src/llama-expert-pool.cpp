@@ -1,4 +1,5 @@
 #include "llama-expert-pool.h"
+#include "llama-impl.h"
 
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -223,6 +224,11 @@ void llama_expert_pool_state::reset() {
     log_step = 0;
     logged_il = -1;
     rt_step_done = false;
+
+    swap_auto = false;
+    win_step = 0;
+    win_cnt.clear();
+    win_hist.clear();
 }
 
 // parse seed csv: one line per layer "il,e1,e2,...". layers missing from the
@@ -358,13 +364,37 @@ void llama_expert_pool_delegate_begin(
             }
         }
     }
+    // lazy window allocation: pooled_layers must be known (first decode row)
+    if (st.swap_auto && st.win_cnt.empty() && !st.pooled_layers.empty()) {
+        st.win_cnt.assign((size_t) st.pooled_layers.size() * st.n_expert, 0);
+        st.win_hist.resize(st.swap_W);
+    }
+    // step-advance detection, independent of the routing log: the first
+    // pooled layer of a step begins after the last layer of the previous
+    // one (rt_step_done is set at the end of this hook)
+    if (ilx == 0 && st.rt_step_done) {
+        st.rt_step_done = false;
+        if (st.swap_auto && !st.win_cnt.empty()) {
+            if (st.win_step >= st.swap_W && st.win_step % st.swap_W == 0) {
+                llama_expert_pool_run_swap(st);
+            }
+            if (st.win_step >= st.swap_W) {
+                // evict the oldest step before its slot is reused
+                std::vector<int32_t> & old = st.win_hist[st.win_step % st.swap_W];
+                for (size_t i = 0; i + 1 < old.size(); i += 2) {
+                    st.win_cnt[old[i] * st.n_expert + old[i+1]] --;
+                }
+                old.clear();
+            }
+            st.win_step += 1;
+        }
+    }
     if (st.rt_log != nullptr) {
         // new decode step when the FIRST pooled layer logs again after the
         // LAST one did (a layer-id-change test breaks with one pooled layer)
         if (ilx == 0 && st.rt_step_done) {
             st.log_step += 1;
             st.logged_il = -1;
-            st.rt_step_done = false;
             // step boundary: flush the PREVIOUS step's lines (1 syscall/step,
             // vs per-line fflush which cost measurable time on the hot path)
             fflush(st.rt_log);
@@ -377,9 +407,161 @@ void llama_expert_pool_delegate_begin(
                 fprintf(st.rt_log, ",%d", e);
             }
             fputc('\n', st.rt_log);
-            if (ilx == (int32_t) st.pooled_layers.size() - 1) {
-                st.rt_step_done = true;
-            }
         }
     }
+
+    // --- stage 3 swap window: count this row's expert ids ---
+    if (st.swap_auto && !st.win_cnt.empty()) {
+        std::vector<int32_t> & hist = st.win_hist[st.win_step % st.swap_W];
+        for (int id = 0; id < (int) ids->ne[0]; ++id) {
+            const int32_t e = *((const int32_t *) ((const char *) ids->data + id*ids->nb[0]));
+            if (e < 0 || e >= st.n_expert) {
+                continue;
+            }
+            st.win_cnt[ilx * st.n_expert + e] ++;
+            hist.push_back(ilx);
+            hist.push_back(e);
+        }
+    }
+    // the last pooled layer completes the step (single-layer-safe detection:
+    // a step with only one pooled layer sets the flag on its own hook)
+    if (ilx == (int32_t) st.pooled_layers.size() - 1) {
+        st.rt_step_done = true;
+    }
+}
+
+// ---------------------------------------------------------------
+// stage 3: sliding-window resident-set refresh (--expert-pool-swap)
+
+namespace {
+
+void swap_write_tables(llama_expert_pool_state & st, int32_t il,
+                       const std::vector<int32_t> & res,
+                       const std::vector<int32_t> & pending_fill) {
+    llama_expert_pool_mount & m = llama_expert_pool_get_mount(il);
+    if (!m.active || m.remap == nullptr || m.remap_cpu == nullptr) {
+        return;
+    }
+    const int32_t n_expert = st.n_expert;
+    // resident -> slot; pending_fill entries stay unmapped (-1) so the hot
+    // path falls back to the CPU chain until their weight copies land
+    std::vector<int32_t> rmp(n_expert, -1);
+    for (int32_t s = 0; s < (int32_t) res.size(); ++s) {
+        const int32_t e = res[s];
+        if (e >= 0 && e < n_expert) {
+            rmp[e] = s;
+        }
+    }
+    for (int32_t e : pending_fill) {
+        rmp[e] = -1;
+    }
+    std::vector<int32_t> rmp_cpu(n_expert, -1);
+    for (int32_t e = 0; e < n_expert; ++e) {
+        rmp_cpu[e] = rmp[e] >= 0 ? -1 : e;
+    }
+    ggml_backend_tensor_set(m.remap,     rmp.data(),     0, n_expert * sizeof(int32_t));
+    ggml_backend_tensor_set(m.remap_cpu, rmp_cpu.data(), 0, n_expert * sizeof(int32_t));
+}
+
+void swap_copy_one(ggml_tensor * src, ggml_tensor * pw, int32_t e, int32_t slot) {
+    if (src == nullptr || pw == nullptr) {
+        return;
+    }
+    const size_t sz = src->nb[2];
+    ggml_backend_tensor_set(pw, (const char *) src->data + e * src->nb[2],
+            slot * pw->nb[2], sz);
+}
+
+} // namespace
+
+void llama_expert_pool_run_swap(llama_expert_pool_state & st) {
+    const int32_t P = (int32_t) st.pooled_layers.size();
+    const int32_t n_expert = st.n_expert;
+    if (P <= 0 || st.win_cnt.empty()) {
+        return;
+    }
+
+    std::vector<int32_t> idx(n_expert);
+    std::vector<int32_t> topk;
+    int32_t delta = 0;
+
+    for (int32_t ilx = 0; ilx < P; ++ilx) {
+        const int32_t il = st.pooled_layers[ilx];
+        std::vector<int32_t> & res = st.resident[il];
+        const int32_t K = (int32_t) res.size();
+        if (K <= 0) {
+            continue;
+        }
+        // top-K of the sliding-window activation count on this layer
+        std::iota(idx.begin(), idx.end(), 0);
+        std::partial_sort(idx.begin(), idx.begin() + K, idx.end(),
+                [&](int32_t a, int32_t b) {
+                    return st.win_cnt[ilx * n_expert + a] > st.win_cnt[ilx * n_expert + b];
+                });
+        topk.assign(idx.begin(), idx.begin() + K);
+
+        // diff against the resident set; keep slots stable for surviving experts
+        const auto in_topk = [&](int32_t e) {
+            return std::find(topk.begin(), topk.end(), e) != topk.end();
+        };
+        std::vector<int32_t> evict;
+        for (int32_t e : res) {
+            if (!in_topk(e)) {
+                evict.push_back(e);
+            }
+        }
+        std::vector<int32_t> fill;
+        for (int32_t e : topk) {
+            if (std::find(res.begin(), res.end(), e) == res.end()) {
+                fill.push_back(e);
+            }
+        }
+        if (fill.empty()) {
+            continue;
+        }
+
+        // new layout: survivors keep their slots, fills take the evicted ones
+        std::vector<int32_t> new_res(K, -1);
+        for (int32_t e : res) {
+            if (in_topk(e)) {
+                for (int32_t s = 0; s < K; ++s) {
+                    if (res[s] == e) {
+                        new_res[s] = e;
+                        break;
+                    }
+                }
+            }
+        }
+        size_t fi = 0;
+        for (int32_t s = 0; s < K && fi < fill.size(); ++s) {
+            if (new_res[s] < 0) {
+                new_res[s] = fill[fi++];
+            }
+        }
+
+        // safe swap sequence: unmap fills -> copy weights -> commit
+        swap_write_tables(st, il, new_res, fill);
+        for (int32_t e : fill) {
+            int32_t slot = -1;
+            for (int32_t s = 0; s < K; ++s) {
+                if (new_res[s] == e) {
+                    slot = s;
+                    break;
+                }
+            }
+            if (slot < 0) {
+                continue;
+            }
+            swap_copy_one(st.orig_gate_up[il], st.w_pool_gate_up[il], e, slot);
+            swap_copy_one(st.orig_up[il],      st.w_pool_up[il],      e, slot);
+            swap_copy_one(st.orig_gate[il],    st.w_pool_gate[il],    e, slot);
+            swap_copy_one(st.orig_down[il],    st.w_pool_down[il],    e, slot);
+        }
+        swap_write_tables(st, il, new_res, {});
+
+        res.swap(new_res);
+        delta += (int32_t) fill.size();
+    }
+
+    LLAMA_LOG_INFO("%s: swapped %d expert slots (step %d)\n", __func__, delta, st.win_step);
 }

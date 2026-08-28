@@ -6,6 +6,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <numeric>
 #include <string>
 #include <vector>
 #include <unordered_map>
@@ -128,6 +129,16 @@ struct llama_expert_pool_state {
     bool   rt_step_done = false;           // last pooled layer logged since the last
                                            // step advance (single-layer-safe step detect)
 
+    // stage 3 auto-swap (--expert-pool-swap): sliding decode window count of
+    // expert activations, one entry per (pooled layer, expert); the resident
+    // set is refreshed from the window every swap_W decode steps
+    bool swap_auto = false;
+    int32_t swap_W = 512;                  // window length in decode steps
+    int32_t n_expert = 0;                  // experts per layer (set at init)
+    int32_t win_step = 0;                  // decode steps accounted in the window
+    std::vector<int32_t> win_cnt;          // [pooled layers * n_expert]
+    std::vector<std::vector<int32_t>> win_hist; // [W] flat (ilx, e) pairs per step
+
     void reset();
 };
 
@@ -165,6 +176,10 @@ void llama_expert_pool_clear_chain();
 void llama_expert_pool_delegate_begin(
         ggml_tensor * src0, ggml_tensor * src1, ggml_tensor * ids, ggml_tensor * dst,
         const int32_t ** skip_out, void * ud);
+
+// stage 3: refresh the resident set from the sliding decode window. called at
+// a decode step boundary from the delegate hook (--expert-pool-swap).
+void llama_expert_pool_run_swap(llama_expert_pool_state & st);
 
 // ---------------------------------------------------------------
 // direct mount (main-graph execution): per-layer tensors that let

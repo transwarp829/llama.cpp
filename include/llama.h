@@ -410,6 +410,7 @@ extern "C" {
 
         int32_t expert_pool;        // [EXPERIMENTAL] total expert-pool slots (0 = disabled)
         const char * expert_pool_init; // [EXPERIMENTAL] csv file to seed the pool ("il,e1,e2,..."), null = random
+        bool expert_pool_swap;      // [EXPERIMENTAL] auto-swap the pool resident set (sliding window)
 
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)
