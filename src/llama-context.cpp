@@ -150,6 +150,7 @@ llama_context::llama_context(
     cparams.expert_pool      = params.expert_pool;
     cparams.expert_pool_init = params.expert_pool_init;
     cparams.expert_pool_swap = params.expert_pool_swap;
+    cparams.expert_pool_swap_window = params.expert_pool_swap_window;
     if (cparams.expert_cache) {
         expert_cache.enabled = true;
         expert_cache.init(cparams.n_seq_max, hparams.n_layer());
@@ -682,7 +683,9 @@ void llama_context::expert_pool_init() {
     st.n_expert = n_expert;
     st.swap_auto = cparams.expert_pool_swap;
     const char * swap_w_env = getenv("GGML_EXPPOOL_SWAP_WINDOW");
-    if (swap_w_env != nullptr && std::atoi(swap_w_env) > 0) {
+    if (cparams.expert_pool_swap_window > 0) {
+        st.swap_W = cparams.expert_pool_swap_window;
+    } else if (swap_w_env != nullptr && std::atoi(swap_w_env) > 0) {
         st.swap_W = std::atoi(swap_w_env);
     }
 
@@ -4231,6 +4234,7 @@ llama_context_params llama_context_default_params() {
         /*.expert_pool                 =*/ 0,
         /*.expert_pool_init            =*/ nullptr,
         /*.expert_pool_swap            =*/ false,
+        /*.expert_pool_swap_window     =*/ 0,
         /*.samplers                    =*/ nullptr,
         /*.n_samplers                  =*/ 0,
         /*.ctx_other                   =*/ nullptr,
@@ -4920,10 +4924,25 @@ extern "C" uint32_t llama_expert_pool_get_stats(struct llama_context * ctx,
 }
 
 uint32_t llama_context::expert_pool_stats_snapshot(llama_expert_pool_layer_stats * out, uint32_t max_layers) {
-    (void) out;
-    (void) max_layers;
-    // the delegate counters were removed together with the moe delegate
-    // (direct mount + PR #26631 -1 ids replaced it); hit/miss statistics now
-    // come from GGML_EXPPOOL_ROUTING_LOG
-    return 0;
+    llama_expert_pool_state & st = model.expert_pool_state;
+    if (st.stat_hit.empty()) {
+        return 0;
+    }
+    const uint32_t n = (uint32_t) std::min((size_t) max_layers, st.pooled_layers.size());
+    for (uint32_t i = 0; i < n; ++i) {
+        out[i].layer      = st.pooled_layers[i];
+        out[i].submits    = 0;
+        out[i].hit_rows   = st.stat_hit[i];
+        out[i].miss_rows  = st.stat_miss[i];
+        out[i].prep_getset_us = 0;
+        out[i].prep_ids_us    = 0;
+        out[i].prep_comp_us   = 0;
+        out[i].end_sync_us    = 0;
+        out[i].end_get_us     = 0;
+    }
+    // snapshot semantics: returns the totals since the previous call (per
+    // decode-step usage resets after each read)
+    std::fill(st.stat_hit.begin(),  st.stat_hit.begin()  + n, 0);
+    std::fill(st.stat_miss.begin(), st.stat_miss.begin() + n, 0);
+    return n;
 }
