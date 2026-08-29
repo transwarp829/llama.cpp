@@ -139,6 +139,22 @@ struct llama_expert_pool_state {
     std::vector<int32_t> win_cnt;          // [pooled layers * n_expert]
     std::vector<std::vector<int32_t>> win_hist; // [W] flat (ilx, e) pairs per step
 
+    // prefill-measure mode: the pool is built lazily from the prefill routing
+    // counts (global top-N pairs -> per-layer slot widths). while measuring,
+    // the hook counts the routing and the pool is absent (the prefill runs
+    // the plain CPU chain; no mount, no transfer tax).
+    bool pool_ready = false;               // pool allocation finished
+    int32_t budget_slots = 0;              // -nep total slot budget
+    int32_t last_active_ilx = -1;          // pooled index of the last layer with an active
+                                           // mount (the step-boundary anchor - not always
+                                           // the last pooled layer: a 0-slot layer has no
+                                           // mount and its hook early-returns)
+    int32_t first_active_ilx = -1;         // pooled index of the first layer with an active
+                                           // mount (start boundary anchor; symmetric)
+    // cumulative routing counter (infinite window): the segment-end width
+    // reallocation reads the global top-N pairs from this table; never
+    // decayed, so the prefill's small under-count is negligible noise.
+    std::vector<int32_t> seg_cnt;          // [pooled layers * n_expert]
     // per-pooled-layer hit/miss counters (direct mount: the CPU segment
     // receives remap_cpu ids, so e < 0 means the GPU pool chain computed the
     // row and e >= 0 is a CPU miss); read (and cleared) via
@@ -150,6 +166,20 @@ struct llama_expert_pool_state {
     // resets)
     uint64_t win_hit  = 0;
     uint64_t win_miss = 0;
+
+    // marginal-swap exchange pipeline. the weight copies are issued async on
+    // the pool backend's main stream at the step boundary (they overlap the
+    // step's CPU chain); the table commit happens at the NEXT step boundary,
+    // stream-ordered after the copies, so no event/sync is needed.
+    ggml_backend_t pool_backend = nullptr;   // backend owning the pool buft
+    struct pending_exchange {
+        int32_t il;      // pooled layer index
+        int32_t e;       // incoming expert id
+        int32_t slot;    // pool slot it occupies
+    };
+    std::vector<pending_exchange> pend;      // fills issued at the last boundary
+    // swap summary aggregation (periodic INFO line, like print_timings)
+    int32_t swap_sum = 0;                    // exchanges accumulated this period
 
     void reset();
 };
@@ -192,6 +222,15 @@ void llama_expert_pool_delegate_begin(
 // stage 3: refresh the resident set from the sliding decode window. called at
 // a decode step boundary from the delegate hook (--expert-pool-swap).
 void llama_expert_pool_run_swap(llama_expert_pool_state & st);
+
+// prefill-measure allocation: the global top-N (layer, expert) pairs of the
+// prefill activation counts (N = budget slots) decide the per-layer slot
+// widths (1-2-slot layers fall back to 0: the desert rule). returns false
+// when the counts are too sparse to rank (the caller falls back to uniform
+// widths with the observed experts as the in-sample seed).
+bool llama_expert_pool_alloc_from_counts(
+        const std::vector<int32_t> & win_cnt, int32_t P, int32_t n_expert,
+        int32_t budget, std::vector<std::vector<int32_t>> & resident);
 
 // ---------------------------------------------------------------
 // direct mount (main-graph execution): per-layer tensors that let

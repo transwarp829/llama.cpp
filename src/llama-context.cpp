@@ -505,6 +505,11 @@ llama_context::llama_context(
 llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
+    // release the scheduler FIRST: its CUDA graph cache holds nodes that
+    // reference the pool weight/tensor objects, which the pool_buf/pool_ctx
+    // frees below would invalidate (the member dtor would otherwise run
+    // after this body, touching freed pool tensors -> use-after-free at exit)
+    sched.reset();
 
     expert_cache.dump_close();
 
@@ -637,6 +642,12 @@ void llama_context::expert_pool_init() {
     if (cparams.ctx_other != nullptr) {
         return;
     }
+    // the pool is already built (prefill-measure late init or the csv seed
+    // path): the sched_reserve() that follows the late init re-enters here,
+    // and a reset() would wipe the freshly built pool
+    if (model.expert_pool_state.pool_ready) {
+        return;
+    }
     llama_expert_pool_state & st = model.expert_pool_state;
     st.reset();
     // routing-log-only mode: capture the native routing stream of a pool-free
@@ -759,24 +770,52 @@ void llama_context::expert_pool_init() {
     st.resident.resize(n_layer);
     st.pooled_layers = pooled_ils;
 
-    // --- resident sets: csv seed or random ---
-    bool ok = false;
+    // DEBUG override: seed the pool from a csv file via env (debug only; the
+    // default flow builds a uniform-width random-content pool and refines
+    // the widths at the generation-segment end from the cumulative counts)
+    const char * csv_env = getenv("GGML_EXPPOOL_INIT_CSV");
+    if (csv_env != nullptr && csv_env[0] != '\0') {
+        cparams.expert_pool_init = csv_env;
+    }
     if (cparams.expert_pool_init && cparams.expert_pool_init[0]) {
+        // --- resident sets: csv seed or random ---
+        bool ok = false;
         ok = llama_expert_pool_parse_init(cparams.expert_pool_init, n_layer, n_expert, st.resident);
         if (!ok) {
-            LLAMA_LOG_WARN("%s: failed to read --expert-pool-init '%s', falling back to random\n",
+            LLAMA_LOG_WARN("%s: failed to read GGML_EXPPOOL_INIT_CSV '%s', falling back to random\n",
                     __func__, cparams.expert_pool_init);
+            if (n_slot > n_expert) {
+                LLAMA_LOG_WARN("%s: expert pool request of %d slots exceeds capacity (%d pooled layers x %d experts), "
+                               "saturating to full coverage per layer\n",
+                        __func__, cparams.expert_pool, n_pooled, n_expert);
+                n_slot = n_expert;
+            }
+            llama_expert_pool_random(n_layer, n_expert, n_slot, st.resident);
         }
+        st.pool_ready = true;
+        st.budget_slots = cparams.expert_pool;
+        expert_pool_build();
+        return;
     }
-    if (!ok) {
-        if (n_slot > n_expert) {
-            LLAMA_LOG_WARN("%s: expert pool request of %d slots exceeds capacity (%d pooled layers x %d experts), "
-                           "saturating to full coverage per layer\n",
-                    __func__, cparams.expert_pool, n_pooled, n_expert);
-            n_slot = n_expert;
-        }
-        llama_expert_pool_random(n_layer, n_expert, n_slot, st.resident);
+
+    // default: uniform widths + random content (measured: the allocation
+    // shape costs less than 7% vs the global top-N at the same budget, while
+    // a random+swap pool beats a stale csv seed; the segment-end realloc
+    // refines the widths once the cumulative counts accumulate)
+    st.budget_slots = cparams.expert_pool;
+    if (n_slot > n_expert) {
+        n_slot = n_expert;
     }
+    llama_expert_pool_random(n_layer, n_expert, n_slot, st.resident);
+    st.pool_ready = true;
+    expert_pool_build();
+}
+
+void llama_context::expert_pool_build() {
+    llama_expert_pool_state & st = model.expert_pool_state;
+    const int32_t n_expert = model.hparams.n_expert;
+    const std::vector<int32_t> & pooled_ils = st.pooled_layers;
+    const int32_t n_pooled = (int32_t) pooled_ils.size();
 
     // --- create pool weight tensors ---
     pool_ctx = ggml_init({ 4u*1024u*1024u, nullptr, true }); // no_alloc = true (allocated via buft)
@@ -864,6 +903,20 @@ void llama_context::expert_pool_init() {
             llama_expert_pool_register_mount(il, m);
         }
     }
+    // step-boundary anchors: the first/last shared layer that actually has a
+    // mount (a 0-slot layer is not registered and its hook early-returns, so
+    // detecting the boundary against the pooled_layers edges would freeze the
+    // swap when the desert rule zeros an edge layer)
+    st.first_active_ilx = -1;
+    st.last_active_ilx  = -1;
+    for (int32_t ilx = 0; ilx < (int32_t) pooled_ils.size(); ++ilx) {
+        if (llama_expert_pool_get_mount(pooled_ils[ilx]).active) {
+            if (st.first_active_ilx < 0) {
+                st.first_active_ilx = ilx;
+            }
+            st.last_active_ilx = ilx;
+        }
+    }
 
     // --- mount routing tables (all on the pool device) ---
     // every gather runs on the GPU segment from the same topk ids; ids_cpu and
@@ -947,6 +1000,17 @@ void llama_context::expert_pool_init() {
         st.reset();
         return;
     }
+    // the backend owning the pool buft: the marginal swap issues its weight
+    // copies async on this backend's main stream (the table commit at the
+    // next step boundary is stream-ordered after them); sync fallback if
+    // no matching backend is found (CPU pool etc.)
+    st.pool_backend = nullptr;
+    for (size_t i = 0; i < backend_buft.size() && i < backend_ptrs.size(); ++i) {
+        if (backend_buft[i] == pool_buft) {
+            st.pool_backend = backend_ptrs[i];
+            break;
+        }
+    }
     LLAMA_LOG_INFO("%s: pool allocated on %s (host=%d, %zu bytes)\n",
             __func__, ggml_backend_buft_name(pool_buft),
             (int) ggml_backend_buffer_is_host(pool_buf.get()), ggml_backend_buffer_get_size(pool_buf.get()));
@@ -1000,8 +1064,8 @@ void llama_context::expert_pool_init() {
     for (int32_t il : pooled_ils) {
         tot_slots += (int32_t) st.resident[il].size();
     }
-    LLAMA_LOG_INFO("%s: expert pool enabled: %d pooled layers, %d slots total (? %d/layer if uniform)\n",
-            __func__, n_pooled, tot_slots, n_slot);
+    LLAMA_LOG_INFO("%s: expert pool enabled: %d pooled layers, %d slots total (%d/layer if uniform)\n",
+            __func__, n_pooled, tot_slots, n_pooled > 0 ? tot_slots / n_pooled : 0);
     {
         size_t pool_bytes = 0;
         for (int32_t il : pooled_ils) {
@@ -4974,6 +5038,70 @@ void llama_context::expert_pool_finalize() {
             (unsigned long long) (st.win_hit + st.win_miss));
     st.win_hit  = 0;
     st.win_miss = 0;
+
+    // segment-end flush: if the segment ended between two 64-step report
+    // boundaries, print the partial-window average (a short second round
+    // would otherwise never reach the next boundary and stay silent)
+    if (st.swap_sum > 0) {
+        const int32_t steps_in = st.win_step % 64;
+        if (steps_in > 0) {
+            LLAMA_LOG_INFV(LLAMA_LOG_VERBOSITY_INFO,
+                    "%s: marginal swap avg %.1f expert slots/step (partial %d steps, segment end)\n",
+                    __func__, (float) st.swap_sum / (float) steps_in, steps_in);
+        }
+        st.swap_sum = 0;
+    }
+
+    // segment-end width reallocation: the global top-N (layer, expert) pairs
+    // of the CUMULATIVE counts (infinite window) decide the new per-layer
+    // slot widths. sparse data keeps the current layout; changed widths
+    // rebuild the pool tensors/tables once (the next decode re-reserves).
+    if (st.enabled && !st.seg_cnt.empty() && st.budget_slots > 0) {
+        const int32_t n_pooled = (int32_t) st.pooled_layers.size();
+        std::vector<std::vector<int32_t>> resident;
+        if (!llama_expert_pool_alloc_from_counts(
+                    st.seg_cnt, n_pooled, st.n_expert, st.budget_slots, resident)) {
+            return;
+        }
+        bool changed = false;
+        for (int32_t ilx = 0; ilx < n_pooled; ++ilx) {
+            if (resident[ilx].size() != st.resident[st.pooled_layers[ilx]].size()) {
+                changed = true;
+                break;
+            }
+        }
+        if (!changed) {
+            return;
+        }
+        // rebuild: the old pool tensors/tables go away with their contexts.
+        // the sched may still run in-flight async copies (the marginal-swap
+        // pipeline issues them per step): synchronize before freeing.
+        synchronize();
+        llama_expert_pool_clear_mount();
+        pool_buf.reset();
+        mount_tab_buf.reset();
+        if (pool_ctx != nullptr) {
+            ggml_free(pool_ctx);
+            pool_ctx = nullptr;
+        }
+        if (pool_tab_ctx != nullptr) {
+            ggml_free(pool_tab_ctx);
+            pool_tab_ctx = nullptr;
+        }
+        st.resident.assign(model.hparams.n_layer(), {});
+        for (int32_t ilx = 0; ilx < n_pooled; ++ilx) {
+            st.resident[st.pooled_layers[ilx]] = resident[ilx];
+        }
+        // the rebuild creates NEW pool tensors: the deferred fill must run
+        // again (the old fill_done refers to the previous pool, whose weights
+        // would otherwise stay zero)
+        st.fill_done = false;
+        st.pend.clear();
+        LLAMA_LOG_INFV(LLAMA_LOG_VERBOSITY_INFO, "%s: reallocated pool widths at segment end\n", __func__);
+        expert_pool_build();
+        expert_pool_fill();
+        sched_need_reserve = true;
+    }
 }
 
 extern "C" void llama_expert_pool_finalize(struct llama_context * ctx) {
