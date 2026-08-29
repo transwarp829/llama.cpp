@@ -2144,37 +2144,41 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             // are handed to the CPU segment as regular split inputs (32B
             // each), so the CPU segment stays lookup-free. the I32 tables fill
             // the mul_mat_id ids directly (get_rows keeps the table type on
-            // every backend, no cast). tile with a view when T==1, a true
-            // repeat_4d for T>1 (get_rows requires src0.ne[2] == ids.ne[1]);
-            // an I32 REPEAT runs on the CPU segment (native there) until the
-            // upstream CUDA REPEAT adds I32 support.
-            ggml_tensor * remap3 = n_tokens == 1
-                ? ggml_reshape_3d(ctx0, mnt.remap, 1, n_expert, 1)
-                : ggml_repeat_4d(ctx0, mnt.remap, 1, n_expert, n_tokens, 1);
-            ggml_tensor * ids_remap = ggml_get_rows(ctx0, remap3, selected_experts);
+            // every backend, no cast).
+            // the tables are constant (one row per expert, identical for every
+            // token), but get_rows requires src0.ne[2] == ids.ne[1]. instead
+            // of repeating the table over T (an I32 REPEAT has no CUDA kernel
+            // and falls to the CPU segment), flatten the ids to [n_used*T, 1]
+            // so the check holds on the ids side - a single get_rows on the
+            // GPU segment serves every batch size. the topk ids come from
+            // argsort_top_k as a strided view; get_rows tolerates that, a
+            // reshape does not, so copy them into a contiguous tensor first
+            // (I32->I32 cpy is supported on every backend).
+            ggml_tensor * ids_c = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_expert_used, n_tokens);
+            ggml_tensor * ids_cpy = ggml_cpy(ctx0, selected_experts, ids_c);
+            ggml_tensor * ids_flat = ggml_reshape_2d(ctx0, ids_cpy, n_expert_used * n_tokens, 1);
+            ggml_tensor * remap3 = ggml_reshape_3d(ctx0, mnt.remap, 1, n_expert, 1);
+            ggml_tensor * ids_remap = ggml_get_rows(ctx0, remap3, ids_flat);
             ids_remap = ggml_reshape_2d(ctx0, ids_remap, n_expert_used, n_tokens);
             cb(ids_remap, "ffn_moe_ids_remap", il);
 
             // inverse table for the CPU chain: resident -> -1, non-resident ->
             // expert id, so the CPU mul_mat_id zeroes the hit columns natively
             // (PR #26631) and computes exactly the miss columns
-            ggml_tensor * remap_cpu3 = n_tokens == 1
-                ? ggml_reshape_3d(ctx0, mnt.remap_cpu, 1, n_expert, 1)
-                : ggml_repeat_4d(ctx0, mnt.remap_cpu, 1, n_expert, n_tokens, 1);
-            ggml_tensor * ids_cpu = ggml_get_rows(ctx0, remap_cpu3, selected_experts);
+            ggml_tensor * remap_cpu3 = ggml_reshape_3d(ctx0, mnt.remap_cpu, 1, n_expert, 1);
+            ggml_tensor * ids_cpu = ggml_get_rows(ctx0, remap_cpu3, ids_flat);
             ids_cpu = ggml_reshape_2d(ctx0, ids_cpu, n_expert_used, n_tokens);
             cb(ids_cpu, "ffn_moe_ids_cpu", il);
             mount_ids_cpu = ids_cpu;
 
-            // per-expert down scale: one flat gather, used by both chains.
-            // stays [1, n_used, T]: the mul broadcasts over n_ff. a 2D reshape
-            // would shift the broadcast and fail can_repeat for T>1 (ne1
-            // 8 % T == 0 only for T in 1,2,4,8).
+            // per-expert down scale: same flat lookup. stays [1, n_used, T]:
+            // the mul broadcasts over n_ff. a 2D reshape would shift the
+            // broadcast and fail can_repeat for T>1 (ne1 8 % T == 0 only for
+            // T in 1,2,4,8).
             if (mnt.scale != nullptr) {
-                ggml_tensor * sc3 = n_tokens == 1
-                    ? ggml_reshape_3d(ctx0, mnt.scale, 1, n_expert, 1)
-                    : ggml_repeat_4d(ctx0, mnt.scale, 1, n_expert, n_tokens, 1);
-                mount_scale = ggml_get_rows(ctx0, sc3, selected_experts);
+                ggml_tensor * sc3 = ggml_reshape_3d(ctx0, mnt.scale, 1, n_expert, 1);
+                mount_scale = ggml_get_rows(ctx0, sc3, ids_flat);
+                mount_scale = ggml_reshape_3d(ctx0, mount_scale, 1, n_expert_used, n_tokens);
                 cb(mount_scale, "ffn_moe_scale", il);
             }
 
