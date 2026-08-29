@@ -2123,8 +2123,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     ggml_build_forward_expand(gf, weights);
 
     // expert-pool direct mount: a second, GPU-resident copy of the expert
-    // chain runs inside THIS graph (chain_only over the pool weights, same
-    // activation variants). PR #26631 -1 ids zero a column natively on both
+    // chain runs inside THIS graph (chain_only over the pool weights; the
+    // real layer index is passed through, so the activation variants -
+    // including the swiglu_clamp limits - are identical to the main chain).
+    // PR #26631 -1 ids zero a column natively on both
     // backends, so the split is by construction: the GPU chain ids route
     // non-resident experts to -1 (zero), the CPU chain ids route resident
     // experts to -1. the merge is a single add: hit col = 0(cpu) + gpu,
@@ -2178,7 +2180,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
             mount_out = build_moe_ffn(cur, gate_inp, gate_inp_b,
                 mnt.w_up, nullptr, mnt.w_gate, nullptr, mnt.w_down, mnt.w_down_b, exp_probs_b,
-                n_expert, n_expert_used, type_op, norm_w, w_scale, gating_op, -1,
+                n_expert, n_expert_used, type_op, norm_w, w_scale, gating_op, il,
                 cur, mnt.w_gate_up, nullptr, nullptr, nullptr, nullptr, ids_remap);
             cb(mount_out, "ffn_moe_mount", il);
 
