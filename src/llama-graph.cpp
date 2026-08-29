@@ -1965,7 +1965,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     const int64_t n_tokens = cur->ne[1];
     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
 
-    // expert-chain reuse mode (expert-pool mini graphs): both the routing
+    // expert-chain reuse mode (expert-pool mount chain): both the routing
     // probs and the selected experts are supplied by the caller, so the whole
     // routing section is skipped and `weights` is fixed to 1. the chain below
     // (gate/up -> activation -> down) is then built EXACTLY as the main graph
@@ -1982,14 +1982,6 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     ggml_tensor * mount_ids_cpu = nullptr; // inverse-remap ids for the CPU chain
     ggml_tensor * mount_scale = nullptr; // [1, n_used, T] down scale, gathered on
                                          // the GPU segment, used by both chains
-
-    // let the expert pool know the real chain parameters for this layer
-    // (exactly as the model's graph builder passed them); pool mini graphs
-    // reuse build_moe_ffn itself with these values, so every arch/variant is
-    // inherited automatically instead of being replicated
-    if (cparams.expert_pool > 0 && il >= 0) {
-        llama_expert_pool_register_chain(il, (int) type_op, norm_w, w_scale, (uint32_t) gating_op);
-    }
 
     if (chain_only) {
         // weights are never read: the chain returns the raw down output

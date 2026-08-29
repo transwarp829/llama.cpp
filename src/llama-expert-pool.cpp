@@ -4,39 +4,10 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 
-#include "llama-graph.h"   // llm_graph_result (mini chain owner, deleted in reset)
-
 #include <algorithm>
 #include <fstream>
 #include <random>
 #include <sstream>
-
-// ---- per-layer chain param registry (see llama-expert-pool.h) ----
-namespace {
-    std::vector<llama_chain_params> g_chain; // indexed by layer id
-}
-
-void llama_expert_pool_register_chain(int il, int type_op, bool norm_w, float w_scale, uint32_t gating_op) {
-    if (il < 0) {
-        return;
-    }
-    if ((size_t) il >= g_chain.size()) {
-        g_chain.resize(il + 1);
-    }
-    g_chain[il] = { type_op, norm_w, w_scale, gating_op };
-}
-
-const llama_chain_params & llama_expert_pool_get_chain(int il) {
-    static const llama_chain_params none {};
-    if (il < 0 || (size_t) il >= g_chain.size() || g_chain[il].type_op < 0) {
-        return none;
-    }
-    return g_chain[il];
-}
-
-void llama_expert_pool_clear_chain() {
-    g_chain.clear();
-}
 
 // ---- direct-mount registry (see llama-expert-pool.h) ----
 namespace {
@@ -54,9 +25,9 @@ void llama_expert_pool_register_mount(int il, const llama_expert_pool_mount & mo
 }
 
 llama_expert_pool_mount & llama_expert_pool_get_mount(int il) {
-    // auto-grow (like register_chain): a returned reference must be the real
-    // per-layer cell, not a shared static - callers write fields into it
-    // (expert_pool_init registration loop fills the mount in place)
+    // auto-grow: a returned reference must be the real per-layer cell, not a
+    // shared static - callers write fields into it (expert_pool_init
+    // registration loop fills the mount in place)
     static llama_expert_pool_mount none {};
     if (il < 0) {
         return none;
@@ -69,139 +40,6 @@ llama_expert_pool_mount & llama_expert_pool_get_mount(int il) {
 
 void llama_expert_pool_clear_mount() {
     g_mount.clear();
-}
-
-void llama_expert_pool::init(int32_t n_layer, int32_t n_expert, int32_t n_slot, int64_t expert_size) {
-    enabled   = true;
-    this->n_layer   = n_layer;
-    this->n_expert  = n_expert;
-    this->n_slot    = n_slot;
-    this->expert_size = expert_size;
-
-    expert_to_slot.assign(n_layer, std::vector<int32_t>(n_expert, -1));
-    slot_expert.assign(n_layer, std::vector<int32_t>(n_slot, -1));
-    n_resident.assign(n_layer, 0);
-}
-
-int32_t llama_expert_pool::slot_of(int32_t il, int32_t expert) const {
-    if (!enabled || il < 0 || il >= n_layer || expert < 0 || expert >= n_expert) {
-        return -1;
-    }
-    return expert_to_slot[il][expert];
-}
-
-int32_t llama_expert_pool::expert_in_slot(int32_t il, int32_t slot) const {
-    if (!enabled || il < 0 || il >= n_layer || slot < 0 || slot >= n_slot) {
-        return -1;
-    }
-    return slot_expert[il][slot];
-}
-
-bool llama_expert_pool::is_resident(int32_t il, int32_t expert) const {
-    return slot_of(il, expert) >= 0;
-}
-
-llama_expert_pool::swap_plan llama_expert_pool::plan_swap(const std::vector<std::vector<int32_t>> & topk) const {
-    swap_plan plan;
-
-    for (int32_t il = 0; il < n_layer; ++il) {
-        if (il >= (int32_t) topk.size()) {
-            continue;
-        }
-        const std::vector<int32_t> & want = topk[il];
-
-        // evict residents that are no longer wanted
-        for (int32_t s = 0; s < n_slot; ++s) {
-            const int32_t e = slot_expert[il][s];
-            if (e < 0) {
-                continue;
-            }
-            const bool still_wanted = std::find(want.begin(), want.end(), e) != want.end();
-            if (!still_wanted) {
-                plan.evict_il.push_back(il);
-                plan.evict_ex.push_back(e);
-            }
-        }
-
-        // fill missing experts, reusing slots freed by eviction first.
-        // a slot is free when empty or when its resident is being evicted
-        // (stable reuse keeps the same slots across successive repins).
-        std::vector<int32_t> free_slots;
-        for (int32_t s = 0; s < n_slot; ++s) {
-            const int32_t e = slot_expert[il][s];
-            const bool to_evict = e >= 0 && std::find(want.begin(), want.end(), e) == want.end();
-            if (e < 0 || to_evict) {
-                free_slots.push_back(s);
-            }
-        }
-        for (int32_t e : want) {
-            if (expert_to_slot[il][e] >= 0) {
-                continue; // already resident (check the entry, not the slot values)
-            }
-            if (free_slots.empty()) {
-                break; // no room (should not happen: |want| <= n_slot)
-            }
-            const int32_t s = free_slots.back();
-            free_slots.pop_back();
-            plan.fill_il.push_back(il);
-            plan.fill_ex.push_back(e);
-        }
-    }
-
-    // swap cost = H2D copies only (evictions are LUT updates, the CPU keeps
-    // the original weights), so the delta is the fill set size.
-    plan.delta = (int32_t) plan.fill_il.size();
-    return plan;
-}
-
-bool llama_expert_pool::gate_should_swap(float h_inc, float c_cand, int32_t delta,
-                                         float cpu_ms, float swap_ms, float L) {
-    if (delta <= 0) {
-        return false;
-    }
-    const float benefit = (c_cand - h_inc) * cpu_ms;
-    const float cost    = delta * swap_ms / L;
-    return benefit > cost;
-}
-
-void llama_expert_pool::begin_swap(const swap_plan & plan) {
-    // evict: unmap every expert scheduled for eviction
-    for (size_t i = 0; i < plan.evict_il.size(); ++i) {
-        const int32_t il = plan.evict_il[i];
-        const int32_t e  = plan.evict_ex[i];
-        const int32_t s  = expert_to_slot[il][e];
-        if (s >= 0) {
-            expert_to_slot[il][e] = -1;
-            slot_expert[il][s]    = -1;
-            if (n_resident[il] > 0) {
-                --n_resident[il];
-            }
-        }
-    }
-}
-
-void llama_expert_pool::commit_slot(int32_t il, int32_t slot, int32_t expert) {
-    if (!enabled || il < 0 || il >= n_layer || slot < 0 || slot >= n_slot ||
-        expert < 0 || expert >= n_expert) {
-        return;
-    }
-    // slot must be empty; if it still holds another expert, unmap that one first
-    const int32_t old = slot_expert[il][slot];
-    if (old >= 0) {
-        expert_to_slot[il][old] = -1;
-    } else {
-        ++n_resident[il];
-    }
-    slot_expert[il][slot] = expert;
-    expert_to_slot[il][expert] = slot;
-}
-
-int32_t llama_expert_pool::total_resident() const {
-    int32_t total = 0;
-    for (int32_t r : n_resident) {
-        total += r;
-    }
-    return total;
 }
 
 void llama_expert_pool_state::reset() {
@@ -440,9 +278,6 @@ void llama_expert_pool_delegate_begin(
     // one decode call = one window step regardless of the token count.
     if (st.swap_auto && !st.win_cnt.empty()) {
         std::vector<int32_t> & hist = st.win_hist[st.win_step % st.swap_W];
-        if (st.seg_cnt.empty()) {
-            st.seg_cnt.assign((size_t) st.pooled_layers.size() * st.n_expert, 0);
-        }
         for (int64_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
             for (int id = 0; id < (int) ids->ne[0]; ++id) {
                 const int32_t e = *((const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]));
@@ -534,28 +369,27 @@ void swap_copy_one(ggml_backend_t be, ggml_tensor * src, ggml_tensor * pw, int32
 
 } // namespace
 
-// allocate the per-layer slot widths from the prefill-measure counts: the
-// global top-N (layer, expert) pairs by activation count (N = -nep budget)
-// determine both the widths and the seed content. two structural rules:
+// allocate the per-layer slot widths from the cumulative activation counts
+// (the infinite-window seg_cnt): the global top-N (layer, expert) pairs by
+// count (N = -nep budget) determine both the widths and the seed content.
+// two structural rules:
 // - desert: layers that would get 1-2 slots drop to 0 (a mounted layer with
 //   one or two slots pays the per-layer roundtrip tax for near-zero hits;
 //   s = 0 is the pure-CPU baseline, free); the freed slots go to the next
 //   ranked pairs.
 // - sparse guard: when the counts are too sparse to rank (fewer than two
 //   expected events per expert, or fewer observed pairs than half the
-//   budget), fall back to uniform widths (stable across runs) with the
-//   observed experts as the in-sample seed. the seed's shortfalls are
-//   filled by the marginal swap as the window accumulates.
-// returns false when the counts are unusable (fallback requested).
+//   budget), the caller keeps the current layout.
+// returns false when the counts are unusable.
 bool llama_expert_pool_alloc_from_counts(
-        const std::vector<int32_t> & win_cnt, int32_t P, int32_t n_expert,
+        const std::vector<int32_t> & counts, int32_t P, int32_t n_expert,
         int32_t budget, std::vector<std::vector<int32_t>> & resident) {
     resident.assign(P, {});
     int64_t total = 0;
     int32_t observed = 0;
     for (int32_t i = 0; i < P * n_expert; ++i) {
-        if (win_cnt[i] > 0) {
-            total += win_cnt[i];
+        if (counts[i] > 0) {
+            total += counts[i];
             observed += 1;
         }
     }
@@ -572,8 +406,8 @@ bool llama_expert_pool_alloc_from_counts(
     std::vector<std::pair<int32_t, int32_t>> pairs;
     pairs.reserve((size_t) P * n_expert);
     for (int32_t i = 0; i < P * n_expert; ++i) {
-        if (win_cnt[i] > 0) {
-            pairs.emplace_back(win_cnt[i], i);
+        if (counts[i] > 0) {
+            pairs.emplace_back(counts[i], i);
         }
     }
     std::sort(pairs.begin(), pairs.end(), [](const auto & a, const auto & b) {
@@ -637,10 +471,9 @@ void llama_expert_pool_run_swap(llama_expert_pool_state & st) {
 
     // --- marginal exchange: swap the worst resident expert with the best
     // non-resident one, at most one pair per pooled layer per step, gated by
-    // the measured payback (the frequency difference must cover the copy
-    // within one window). the gate's threshold is the noise margin: window
-    // count noise is smaller than the payback distance, so the boundary
-    // churn seen with the full reorder (delta ~= K every window) is gone.
+    // the z-sigma confidence test below (the cost-gate/payback terms were
+    // retired 8/30; the gate is a property of the estimator, not of the
+    // model or hardware).
     int32_t delta = 0;
     for (int32_t ilx = 0; ilx < P; ++ilx) {
         const int32_t il = st.pooled_layers[ilx];
@@ -707,13 +540,6 @@ void llama_expert_pool_run_swap(llama_expert_pool_state & st) {
         if (best_e < 0) {
             continue;
         }
-        // gate: the observed count gap must be statistically significant
-        // (z standard deviations above the gap's Poisson noise: two
-        // independent bins of the window, Var(gap) = cnt_out + cnt_in) so
-        // the exchange reacts to real drift, not boundary noise. z is a
-        // property of the estimator (confidence), not of the model or the
-        // hardware. the payback term then requires the real gap to cover the
-        // copy within one window.
         // gate: the count gap must exceed z sigma of its Poisson noise (two
         // independent window bins, Var(gap) = cnt_out + cnt_in). z = 2: the
         // user-validated level - 2-sigma keeps the boundary "alive": the

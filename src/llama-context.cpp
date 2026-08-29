@@ -505,11 +505,6 @@ llama_context::llama_context(
 llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
-    // release the scheduler FIRST: its CUDA graph cache holds nodes that
-    // reference the pool weight/tensor objects, which the pool_buf/pool_ctx
-    // frees below would invalidate (the member dtor would otherwise run
-    // after this body, touching freed pool tensors -> use-after-free at exit)
-    sched.reset();
 
     expert_cache.dump_close();
 
@@ -538,6 +533,12 @@ llama_context::~llama_context() {
         model.expert_pool_state.direct_mount = false;
         model.expert_pool_state.rtlog_only = false;
     }
+
+    // release the scheduler BEFORE the pool buffers: its CUDA graph cache
+    // holds nodes that reference the pool weight/tensor objects, which the
+    // frees below would invalidate (the member dtor would otherwise run
+    // after this body, touching freed pool tensors -> use-after-free at exit)
+    sched.reset();
 
     pool_buf.reset(); // release the pool buffer before freeing the ctx metadata
     if (pool_ctx) {
@@ -642,9 +643,9 @@ void llama_context::expert_pool_init() {
     if (cparams.ctx_other != nullptr) {
         return;
     }
-    // the pool is already built (prefill-measure late init or the csv seed
-    // path): the sched_reserve() that follows the late init re-enters here,
-    // and a reset() would wipe the freshly built pool
+    // the pool is already built (csv seed or a segment-end rebuild): the
+    // sched_reserve() that follows expert_pool_build() re-enters here, and
+    // a reset() would wipe the freshly built pool
     if (model.expert_pool_state.pool_ready) {
         return;
     }
@@ -777,23 +778,23 @@ void llama_context::expert_pool_init() {
     if (csv_env != nullptr && csv_env[0] != '\0') {
         cparams.expert_pool_init = csv_env;
     }
+    st.budget_slots = cparams.expert_pool;
+    if (n_slot > n_expert) {
+        LLAMA_LOG_WARN("%s: expert pool request of %d slots exceeds capacity (%d pooled layers x %d experts), "
+                       "saturating to full coverage per layer\n",
+                __func__, cparams.expert_pool, n_pooled, n_expert);
+        n_slot = n_expert;
+    }
+    st.seg_cnt.assign((size_t) n_pooled * n_expert, 0);
     if (cparams.expert_pool_init && cparams.expert_pool_init[0]) {
         // --- resident sets: csv seed or random ---
-        bool ok = false;
-        ok = llama_expert_pool_parse_init(cparams.expert_pool_init, n_layer, n_expert, st.resident);
+        bool ok = llama_expert_pool_parse_init(cparams.expert_pool_init, n_layer, n_expert, st.resident);
         if (!ok) {
             LLAMA_LOG_WARN("%s: failed to read GGML_EXPPOOL_INIT_CSV '%s', falling back to random\n",
                     __func__, cparams.expert_pool_init);
-            if (n_slot > n_expert) {
-                LLAMA_LOG_WARN("%s: expert pool request of %d slots exceeds capacity (%d pooled layers x %d experts), "
-                               "saturating to full coverage per layer\n",
-                        __func__, cparams.expert_pool, n_pooled, n_expert);
-                n_slot = n_expert;
-            }
             llama_expert_pool_random(n_layer, n_expert, n_slot, st.resident);
         }
         st.pool_ready = true;
-        st.budget_slots = cparams.expert_pool;
         expert_pool_build();
         return;
     }
@@ -802,10 +803,6 @@ void llama_context::expert_pool_init() {
     // shape costs less than 7% vs the global top-N at the same budget, while
     // a random+swap pool beats a stale csv seed; the segment-end realloc
     // refines the widths once the cumulative counts accumulate)
-    st.budget_slots = cparams.expert_pool;
-    if (n_slot > n_expert) {
-        n_slot = n_expert;
-    }
     llama_expert_pool_random(n_layer, n_expert, n_slot, st.resident);
     st.pool_ready = true;
     expert_pool_build();
