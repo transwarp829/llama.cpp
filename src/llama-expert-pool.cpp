@@ -233,6 +233,14 @@ void llama_expert_pool_state::reset() {
     stat_miss.clear();
     win_hit  = 0;
     win_miss = 0;
+
+    pool_ready = false;
+    budget_slots = 0;
+    seg_cnt.clear();
+
+    pend.clear();
+    pool_backend  = nullptr;
+    swap_sum      = 0;
 }
 
 // parse seed csv: one line per layer "il,e1,e2,...". layers missing from the
@@ -381,30 +389,35 @@ void llama_expert_pool_delegate_begin(
         st.stat_miss.assign(st.pooled_layers.size(), 0);
     }
     // step-advance detection, independent of the routing log: the first
-    // pooled layer of a step begins after the last layer of the previous
-    // one (rt_step_done is set at the end of this hook)
-    if (ilx == 0 && st.rt_step_done) {
+    // layer with an active mount of a step begins after the last one of the
+    // previous step (rt_step_done is set at the end of this hook)
+    if (ilx == st.first_active_ilx && st.rt_step_done) {
         st.rt_step_done = false;
         if (st.swap_auto && !st.win_cnt.empty()) {
-            if (st.win_step >= st.swap_W && st.win_step % st.swap_W == 0) {
-                llama_expert_pool_run_swap(st);
-            }
-            if (st.win_step >= st.swap_W) {
-                // evict the oldest step before its slot is reused
-                std::vector<int32_t> & old = st.win_hist[st.win_step % st.swap_W];
+            llama_expert_pool_run_swap(st);
+            st.win_step += 1;
+            // WRITE-TIME eviction, once per step: after the increment, the
+            // slot win_step % W still holds the step from one full window
+            // ago (win_step - W); decrement those pairs and clear it before
+            // the counting block pushes this step's rows. the previous
+            // implementation evicted at the OLD win_step (one step late):
+            // it removed the newest step's data while a full window leaked
+            // in the counters, and the gate's sigma collapsed once the
+            // window slid (the DSV4 rebound to ~40/step).
+            std::vector<int32_t> & old = st.win_hist[st.win_step % st.swap_W];
+            if (!old.empty()) {
                 for (size_t i = 0; i + 1 < old.size(); i += 2) {
                     st.win_cnt[old[i] * st.n_expert + old[i+1]] --;
                 }
                 old.clear();
             }
-            st.win_step += 1;
         }
     }
     // routing log: keep the one-token-per-line format (B=1 decode rows only)
     if (ids->ne[1] == 1 && st.rt_log != nullptr) {
-        // new decode step when the FIRST pooled layer logs again after the
-        // LAST one did (a layer-id-change test breaks with one pooled layer)
-        if (ilx == 0 && st.rt_step_done) {
+        // new decode step when the FIRST mounted layer logs again after the
+        // LAST one did (a layer-id-change test breaks with one active layer)
+        if (ilx == st.first_active_ilx && st.rt_step_done) {
             st.log_step += 1;
             st.logged_il = -1;
             // step boundary: flush the PREVIOUS step's lines (1 syscall/step,
@@ -427,6 +440,9 @@ void llama_expert_pool_delegate_begin(
     // one decode call = one window step regardless of the token count.
     if (st.swap_auto && !st.win_cnt.empty()) {
         std::vector<int32_t> & hist = st.win_hist[st.win_step % st.swap_W];
+        if (st.seg_cnt.empty()) {
+            st.seg_cnt.assign((size_t) st.pooled_layers.size() * st.n_expert, 0);
+        }
         for (int64_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
             for (int id = 0; id < (int) ids->ne[0]; ++id) {
                 const int32_t e = *((const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]));
@@ -434,6 +450,7 @@ void llama_expert_pool_delegate_begin(
                     continue;
                 }
                 st.win_cnt[ilx * st.n_expert + e] ++;
+                st.seg_cnt[ilx * st.n_expert + e] ++;
                 hist.push_back(ilx);
                 hist.push_back(e);
             }
@@ -456,9 +473,11 @@ void llama_expert_pool_delegate_begin(
             }
         }
     }
-    // the last pooled layer completes the step (single-layer-safe detection:
-    // a step with only one pooled layer sets the flag on its own hook)
-    if (ilx == (int32_t) st.pooled_layers.size() - 1) {
+    // the LAST layer with an active mount completes the step (single-layer-
+    // safe detection: a 0-slot layer has no mount and its hook early-returns,
+    // so the anchor is not always the last pooled index - using the last
+    // ACTIVE index keeps the step-boundary alive under the desert rule)
+    if (ilx == st.last_active_ilx) {
         st.rt_step_done = true;
     }
 }
@@ -496,16 +515,103 @@ void swap_write_tables(llama_expert_pool_state & st, int32_t il,
     ggml_backend_tensor_set(m.remap_cpu, rmp_cpu.data(), 0, n_expert * sizeof(int32_t));
 }
 
-void swap_copy_one(ggml_tensor * src, ggml_tensor * pw, int32_t e, int32_t slot) {
+void swap_copy_one(ggml_backend_t be, ggml_tensor * src, ggml_tensor * pw, int32_t e, int32_t slot) {
     if (src == nullptr || pw == nullptr) {
         return;
     }
     const size_t sz = src->nb[2];
-    ggml_backend_tensor_set(pw, (const char *) src->data + e * src->nb[2],
-            slot * pw->nb[2], sz);
+    const char * data = (const char *) src->data + e * src->nb[2];
+    const size_t off  = slot * pw->nb[2];
+    // async on the backend's main stream: the copy runs while the step's
+    // CPU chain computes. fall back to the blocking copy if no backend is
+    // known (CPU pool etc.).
+    if (be != nullptr) {
+        ggml_backend_tensor_set_async(be, pw, data, off, sz);
+    } else {
+        ggml_backend_tensor_set(pw, data, off, sz);
+    }
 }
 
 } // namespace
+
+// allocate the per-layer slot widths from the prefill-measure counts: the
+// global top-N (layer, expert) pairs by activation count (N = -nep budget)
+// determine both the widths and the seed content. two structural rules:
+// - desert: layers that would get 1-2 slots drop to 0 (a mounted layer with
+//   one or two slots pays the per-layer roundtrip tax for near-zero hits;
+//   s = 0 is the pure-CPU baseline, free); the freed slots go to the next
+//   ranked pairs.
+// - sparse guard: when the counts are too sparse to rank (fewer than two
+//   expected events per expert, or fewer observed pairs than half the
+//   budget), fall back to uniform widths (stable across runs) with the
+//   observed experts as the in-sample seed. the seed's shortfalls are
+//   filled by the marginal swap as the window accumulates.
+// returns false when the counts are unusable (fallback requested).
+bool llama_expert_pool_alloc_from_counts(
+        const std::vector<int32_t> & win_cnt, int32_t P, int32_t n_expert,
+        int32_t budget, std::vector<std::vector<int32_t>> & resident) {
+    resident.assign(P, {});
+    int64_t total = 0;
+    int32_t observed = 0;
+    for (int32_t i = 0; i < P * n_expert; ++i) {
+        if (win_cnt[i] > 0) {
+            total += win_cnt[i];
+            observed += 1;
+        }
+    }
+    // resolution floor: the mean events per expert must allow the ranking to
+    // separate (Poisson sigma ~ sqrt(mu) below mu ~= 2 -> the top pairs are
+    // distinguishable); and the observed pairs should cover half the budget
+    const double mu = (double) total / (double) (P > 0 && n_expert > 0 ? P * n_expert : 1);
+    if (mu < 2.0 || observed < budget / 2) {
+        return false;
+    }
+    // rank all (ilx, e) pairs by count, descending; keep the counting until
+    // the budget or until the counts run out (zero-count pairs carry no
+    // information; the residual budget stays unused)
+    std::vector<std::pair<int32_t, int32_t>> pairs;
+    pairs.reserve((size_t) P * n_expert);
+    for (int32_t i = 0; i < P * n_expert; ++i) {
+        if (win_cnt[i] > 0) {
+            pairs.emplace_back(win_cnt[i], i);
+        }
+    }
+    std::sort(pairs.begin(), pairs.end(), [](const auto & a, const auto & b) {
+        return a.first > b.first || (a.first == b.first && a.second < b.second);
+    });
+    size_t take0 = std::min<size_t>(pairs.size(), (size_t) budget);
+    std::vector<int32_t> width(P, 0);
+    for (size_t i = 0; i < take0; ++i) {
+        const int32_t ilx = pairs[i].second / n_expert;
+        width[ilx] += 1;
+    }
+    // desert pass: 1-2-slot layers drop to 0; the freed slots go to the next
+    // ranked pairs (the list is already sorted; the top-N just widens)
+    int32_t freed = 0;
+    for (int32_t ilx = 0; ilx < P; ++ilx) {
+        if (width[ilx] == 1 || width[ilx] == 2) {
+            freed += width[ilx];
+            width[ilx] = 0;
+        }
+    }
+    size_t take = take0 + (size_t) std::min<int32_t>(freed, (int32_t) pairs.size() - (int32_t) take0);
+    for (size_t i = take0; i < take; ++i) {
+        const int32_t ilx = pairs[i].second / n_expert;
+        width[ilx] += 1;
+    }
+    // build the resident vectors: slot s holds the s-th pair of the layer
+    // (pairs are globally sorted, so the resident order = the layer's counts
+    // descending; desert layers keep zero slots)
+    for (size_t i = 0; i < take; ++i) {
+        const int32_t idx  = pairs[i].second;
+        const int32_t ilx  = idx / n_expert;
+        const int32_t e    = idx % n_expert;
+        if (width[ilx] > 0 && (int32_t) resident[ilx].size() < width[ilx]) {
+            resident[ilx].push_back(e);
+        }
+    }
+    return true;
+}
 
 void llama_expert_pool_run_swap(llama_expert_pool_state & st) {
     const int32_t P = (int32_t) st.pooled_layers.size();
@@ -514,89 +620,144 @@ void llama_expert_pool_run_swap(llama_expert_pool_state & st) {
         return;
     }
 
-    std::vector<int32_t> idx(n_expert);
-    std::vector<int32_t> topk;
-    int32_t delta = 0;
+    // --- commit the exchanges issued at the previous step boundary ---
+    // the weight copies were queued on the pool backend's main stream, and
+    // the sched's per-split synchronization guarantees the step's GPU work
+    // (and with it the copies) completed before the first CPU MMID of this
+    // step; the table writes below rebuild the mapping from the resident
+    // vectors, so the incoming experts become visible from this step on.
+    for (const auto & pe : st.pend) {
+        std::vector<int32_t> & res = st.resident[pe.il];
+        if (pe.slot >= 0 && pe.slot < (int32_t) res.size() && res[pe.slot] < 0) {
+            res[pe.slot] = pe.e;
+            swap_write_tables(st, pe.il, res, {});
+        }
+    }
+    st.pend.clear();
 
+    // --- marginal exchange: swap the worst resident expert with the best
+    // non-resident one, at most one pair per pooled layer per step, gated by
+    // the measured payback (the frequency difference must cover the copy
+    // within one window). the gate's threshold is the noise margin: window
+    // count noise is smaller than the payback distance, so the boundary
+    // churn seen with the full reorder (delta ~= K every window) is gone.
+    int32_t delta = 0;
     for (int32_t ilx = 0; ilx < P; ++ilx) {
         const int32_t il = st.pooled_layers[ilx];
         std::vector<int32_t> & res = st.resident[il];
-        const int32_t K = (int32_t) res.size();
-        if (K <= 0) {
+        if (res.empty()) {
             continue;
         }
-        // top-K of the sliding-window activation count on this layer
-        std::iota(idx.begin(), idx.end(), 0);
-        std::partial_sort(idx.begin(), idx.begin() + K, idx.end(),
-                [&](int32_t a, int32_t b) {
-                    return st.win_cnt[ilx * n_expert + a] > st.win_cnt[ilx * n_expert + b];
-                });
-        topk.assign(idx.begin(), idx.begin() + K);
-
-        // diff against the resident set; keep slots stable for surviving experts
-        const auto in_topk = [&](int32_t e) {
-            return std::find(topk.begin(), topk.end(), e) != topk.end();
-        };
-        std::vector<int32_t> evict;
-        for (int32_t e : res) {
-            if (!in_topk(e)) {
-                evict.push_back(e);
-            }
-        }
-        std::vector<int32_t> fill;
-        for (int32_t e : topk) {
-            if (std::find(res.begin(), res.end(), e) == res.end()) {
-                fill.push_back(e);
-            }
-        }
-        if (fill.empty()) {
+        // the exchange only affects layers with an active mount; others run
+        // the plain CPU chain, so swapping their resident set is a no-op
+        const llama_expert_pool_mount & mnt = llama_expert_pool_get_mount(il);
+        if (!mnt.active) {
             continue;
         }
-
-        // new layout: survivors keep their slots, fills take the evicted ones
-        std::vector<int32_t> new_res(K, -1);
-        for (int32_t e : res) {
-            if (in_topk(e)) {
-                for (int32_t s = 0; s < K; ++s) {
-                    if (res[s] == e) {
-                        new_res[s] = e;
-                        break;
-                    }
+        // worst resident: prefer an EMPTY slot (the sparse-prefill fallback
+        // seeds free slots that the swap fills as the window accumulates;
+        // an empty slot has no incumbent to lose); otherwise the mapped
+        // expert with the lowest window count
+        int32_t worst_s = -1;
+        int32_t worst_cnt = 0;
+        for (int32_t s = 0; s < (int32_t) res.size(); ++s) {
+            if (res[s] < 0) {
+                worst_s = s;
+                worst_cnt = 0;
+                break;
+            }
+            const int32_t c = st.win_cnt[ilx * n_expert + res[s]];
+            if (worst_s < 0 || c < worst_cnt) {
+                worst_s = s;
+                worst_cnt = c;
+            }
+        }
+        if (worst_s < 0) {
+            continue;
+        }
+        // best non-resident (not mapped, not already pending for this layer)
+        const auto pending_e = [&](int32_t e) {
+            for (const auto & pe : st.pend) {
+                if (pe.il == il && pe.e == e) {
+                    return true;
                 }
             }
-        }
-        size_t fi = 0;
-        for (int32_t s = 0; s < K && fi < fill.size(); ++s) {
-            if (new_res[s] < 0) {
-                new_res[s] = fill[fi++];
+            return false;
+        };
+        int32_t best_e = -1;
+        int32_t best_cnt = 0;
+        for (int32_t e = 0; e < n_expert; ++e) {
+            const int32_t c = st.win_cnt[ilx * n_expert + e];
+            if (c <= best_cnt) {
+                continue;
             }
-        }
-
-        // safe swap sequence: unmap fills -> copy weights -> commit
-        swap_write_tables(st, il, new_res, fill);
-        for (int32_t e : fill) {
-            int32_t slot = -1;
-            for (int32_t s = 0; s < K; ++s) {
-                if (new_res[s] == e) {
-                    slot = s;
+            bool resident = false;
+            for (int32_t s = 0; s < (int32_t) res.size(); ++s) {
+                if (res[s] == e) {
+                    resident = true;
                     break;
                 }
             }
-            if (slot < 0) {
+            if (resident || pending_e(e)) {
                 continue;
             }
-            swap_copy_one(st.orig_gate_up[il], st.w_pool_gate_up[il], e, slot);
-            swap_copy_one(st.orig_up[il],      st.w_pool_up[il],      e, slot);
-            swap_copy_one(st.orig_gate[il],    st.w_pool_gate[il],    e, slot);
-            swap_copy_one(st.orig_down[il],    st.w_pool_down[il],    e, slot);
+            best_e = e;
+            best_cnt = c;
         }
-        swap_write_tables(st, il, new_res, {});
-
-        res.swap(new_res);
-        delta += (int32_t) fill.size();
+        if (best_e < 0) {
+            continue;
+        }
+        // gate: the observed count gap must be statistically significant
+        // (z standard deviations above the gap's Poisson noise: two
+        // independent bins of the window, Var(gap) = cnt_out + cnt_in) so
+        // the exchange reacts to real drift, not boundary noise. z is a
+        // property of the estimator (confidence), not of the model or the
+        // hardware. the payback term then requires the real gap to cover the
+        // copy within one window.
+        // gate: the count gap must exceed z sigma of its Poisson noise (two
+        // independent window bins, Var(gap) = cnt_out + cnt_in). z = 2: the
+        // user-validated level - 2-sigma keeps the boundary "alive": the
+        // pool keeps jittering among near-equivalent boundary experts (a few
+        // exchanges/step, cheap), so the mechanism never looks frozen, while
+        // the vast majority of noise-driven ties stay rejected. drift
+        // adaptation in the long run belongs to the segment-end reallocation
+        // (cumulative seg_cnt), not to this per-step test.
+        const double gap = (double) (best_cnt - worst_cnt);
+        if (gap <= 2.0 * sqrt((double) best_cnt + (double) worst_cnt)) {
+            continue;
+        }
+        // unmap the victim, copy the fill into the freed slot, publish both
+        // at the next step boundary (the slot stays -1 in the tables until
+        // the commit, so the step's graphs never read the in-flight slot)
+        const int32_t victim_e = res[worst_s];
+        res[worst_s] = -1;
+        swap_write_tables(st, il, res, {});
+        swap_copy_one(st.pool_backend, st.orig_gate_up[il], st.w_pool_gate_up[il], best_e, worst_s);
+        swap_copy_one(st.pool_backend, st.orig_up[il],      st.w_pool_up[il],      best_e, worst_s);
+        swap_copy_one(st.pool_backend, st.orig_gate[il],    st.w_pool_gate[il],    best_e, worst_s);
+        swap_copy_one(st.pool_backend, st.orig_down[il],    st.w_pool_down[il],    best_e, worst_s);
+        st.pend.push_back({ il, best_e, worst_s });
+        LLAMA_LOG_INFV(LLAMA_LOG_VERBOSITY_TRACE,
+                "%s: exchange layer %d (step %d): evict e=%d (cnt %d), fill e=%d (cnt %d)",
+                __func__, il, st.win_step, victim_e, worst_cnt, best_e, best_cnt);
+        delta += 1;
     }
 
-    LLAMA_LOG_INFV(LLAMA_LOG_VERBOSITY_INFO, "%s: swapped %d expert slots (step %d)\n", __func__, delta, st.win_step);
+    // per-exchange lines: the pair detail (TRACE) and the per-step count
+    // (DEBUG). the INFO level gets a PERIODIC average instead of per-step
+    // noise: the swap runs every step, but by far most steps exchange 0 or 1
+    // pair, so a per-step INFO line is either spam (churn) or silence
+    // (converged). print_timings-style: every 64 steps, one average line.
+    st.swap_sum += delta;
+    if (st.win_step > 0 && st.win_step % 64 == 0) {
+        LLAMA_LOG_INFV(LLAMA_LOG_VERBOSITY_INFO,
+                "%s: marginal swap avg %.1f expert slots/step (past 64 steps, step %d)\n",
+                __func__, (float) st.swap_sum / 64.0f, st.win_step);
+        st.swap_sum = 0;
+    }
+    LLAMA_LOG_INFV(LLAMA_LOG_VERBOSITY_DEBUG,
+            "%s: marginal step %d: swapped %d\n",
+            __func__, st.win_step, delta);
     // the pool hit rate is printed once at the end of the generation segment
     // by llama_expert_pool_finalize; win_hit/win_miss accumulate across the
     // segment (no per-swap reset here)

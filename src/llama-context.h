@@ -56,6 +56,7 @@ struct llama_context {
     //   - etc.
     void sched_reserve();
     void expert_pool_init();
+    void expert_pool_build();
     void expert_pool_fill();
 
     void synchronize();
