@@ -541,15 +541,14 @@ void llama_expert_pool_run_swap(llama_expert_pool_state & st) {
             continue;
         }
         // gate: the count gap must exceed z sigma of its Poisson noise (two
-        // independent window bins, Var(gap) = cnt_out + cnt_in). z = 2: the
-        // user-validated level - 2-sigma keeps the boundary "alive": the
-        // pool keeps jittering among near-equivalent boundary experts (a few
-        // exchanges/step, cheap), so the mechanism never looks frozen, while
-        // the vast majority of noise-driven ties stay rejected. drift
-        // adaptation in the long run belongs to the segment-end reallocation
-        // (cumulative seg_cnt), not to this per-step test.
+        // independent window bins, Var(gap) = cnt_out + cnt_in). z = 3: the
+        // statistical confidence level, independent of model and backend -
+        // boundaries only move when the drift is real and > 3 sigma, so the
+        // exchange frequency is governed by the actual drift rate, not by
+        // noise. drift adaptation in the long run belongs to the segment-end
+        // reallocation (cumulative seg_cnt), not to this per-step test.
         const double gap = (double) (best_cnt - worst_cnt);
-        if (gap <= 2.0 * sqrt((double) best_cnt + (double) worst_cnt)) {
+        if (gap <= 3.0 * sqrt((double) best_cnt + (double) worst_cnt)) {
             continue;
         }
         // unmap the victim, copy the fill into the freed slot, publish both
