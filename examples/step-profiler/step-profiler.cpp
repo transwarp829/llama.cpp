@@ -315,6 +315,7 @@ int main(int argc, char ** argv) {
         LOG_INF("%s: chat template applied (%d chars), prompt %zu chars\n", __func__, (int) content.size(), prompt.size());
     }
     std::vector<llama_token> tokens = common_tokenize(ctx, prompt, false, true);
+    LOG_INF("%s: prompt tokenized: %zu tokens\n", __func__, tokens.size());
 
     if (tokens.empty()) {
         LOG_ERR("%s: there are not input tokens to process - (try to provide a prompt with '-p')\n", __func__);
