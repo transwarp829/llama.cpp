@@ -6,82 +6,19 @@
 
 #include <cstdint>
 #include <cstdio>
-#include <numeric>
 #include <string>
 #include <vector>
-#include <unordered_map>
 #include <utility>
 
-// GPU-resident expert pool (stage 2 of the expert cache, milestone 1).
-//
-// holds a fixed number of expert slots per MoE layer. the slot table maps
-// expert id -> slot (or -1 when not resident). the swap engine computes the
-// delta between the current resident set and a requested top-K, then applies
-// it as evict -> copy -> commit. between evict and commit the slot is empty,
-// so the hot path (which consults the slot table) never reads a half-written
-// entry; a miss simply falls back to the cold CPU path.
-//
-// milestone 1: data structures + swap-set algebra + cost gate only.
-// GPU buffer allocation and H2D copies are milestone 3 (the copy is
-// abstracted here as a commit callback).
-
-struct llama_expert_pool {
-    bool enabled = false;
-    int32_t n_layer = 0;     // pooled layers (CPU-resident MoE layers)
-    int32_t n_expert = 0;    // experts per layer
-    int32_t n_slot = 0;      // slots per layer (S = budget / n_layer)
-    int64_t expert_size = 0; // bytes per expert (9.45 MB for DSV IQ3_S)
-
-    // expert id -> slot, -1 = not resident; [n_layer][n_expert]
-    std::vector<std::vector<int32_t>> expert_to_slot;
-    // slot -> expert id, -1 = empty; [n_layer][n_slot]
-    std::vector<std::vector<int32_t>> slot_expert;
-    // number of resident experts per layer (diagnostics)
-    std::vector<int32_t> n_resident;
-
-    void init(int32_t n_layer, int32_t n_expert, int32_t n_slot, int64_t expert_size);
-
-    int32_t slot_of(int32_t il, int32_t expert) const;
-    int32_t expert_in_slot(int32_t il, int32_t slot) const;
-    bool is_resident(int32_t il, int32_t expert) const;
-
-    // delta set algebra between the current resident set and a target top-K.
-    // returns per-layer evict/fill list; filling into the slots of evicted
-    // entries first (stable reuse) to minimize H2D churn for the same slot.
-    struct swap_plan {
-        std::vector<int32_t> evict_il;  // parallel arrays of (il, expert) to evict
-        std::vector<int32_t> evict_ex;
-        std::vector<int32_t> fill_il;   // parallel arrays of (il, expert) to fill
-        std::vector<int32_t> fill_ex;
-        int32_t delta = 0;              // total experts changed
-    };
-
-    swap_plan plan_swap(const std::vector<std::vector<int32_t>> & topk) const;
-
-    // cost gate (synchronous-swap conservative accounting):
-    //   (c_cand - h_inc) * CPU_MS > delta * SWAP_MS / L
-    // all inputs are per-token averages; returns true when the repin pays off.
-    static bool gate_should_swap(float h_inc, float c_cand, int32_t delta,
-                                 float cpu_ms, float swap_ms, float L);
-
-    // phase 1 of a swap: evict all entries (slot table entries become empty).
-    void begin_swap(const swap_plan & plan);
-
-    // phase 3 of a swap: commit one filled slot (call after the copy landed).
-    void commit_slot(int32_t il, int32_t slot, int32_t expert);
-
-    // diagnostics
-    int32_t total_resident() const;
-};
-
 // ---------------------------------------------------------------
-// model-level runtime state of the expert pool (stage 2, milestone 3/4)
+// model-level runtime state of the expert pool (direct-mount mode)
 //
-// holds, per pooled layer, GPU-resident pool weight tensors (identity
-// layout: slot e = expert e, non-resident slots stay zero) plus the
-// routing tables that split the two chains of the direct mount.
-// the pool is initialized once (from --expert-pool-init or random) and
-// never refreshed in the static v1; swap logic is not wired in yet.
+// holds, per pooled layer, GPU-resident pool weight tensors (compact
+// layout: slot s holds the s-th resident expert, no zero padding) plus
+// the routing tables that split the two chains of the direct mount.
+// the pool starts from a csv seed (GGML_EXPPOOL_INIT_CSV, debug) or
+// random; the marginal exchange refreshes the content per step and the
+// segment-end reallocation refits the slot widths (see 阶段3-设计.md).
 struct llama_expert_pool_state {
     bool enabled = false;
 
@@ -93,11 +30,12 @@ struct llama_expert_pool_state {
     std::vector<ggml_tensor *> orig_down;
 
     // pool weight tensors, indexed by layer; null = not pooled / not present.
-    // identity layout: slot e holds expert e (non-resident slots stay zero)
-    std::vector<ggml_tensor *> w_pool_gate_up; // fused [n_ff*2, n_embd, n_expert]
-    std::vector<ggml_tensor *> w_pool_up;      // separate [n_ff, n_embd, n_expert]
-    std::vector<ggml_tensor *> w_pool_gate;    // separate [n_ff, n_embd, n_expert]
-    std::vector<ggml_tensor *> w_pool_down;    // [n_embd, n_ff, n_expert]
+    // compact layout: slot s holds the s-th resident expert (S slots per
+    // layer, ne2 = S, no zero padding)
+    std::vector<ggml_tensor *> w_pool_gate_up; // fused [n_ff*2, n_embd, S]
+    std::vector<ggml_tensor *> w_pool_up;      // separate [n_ff, n_embd, S]
+    std::vector<ggml_tensor *> w_pool_gate;    // separate [n_ff, n_embd, S]
+    std::vector<ggml_tensor *> w_pool_down;    // [n_embd, n_ff, S]
 
     // resident expert lists, indexed by layer (for diagnostics/serialization)
     std::vector<std::vector<int32_t>> resident;
@@ -108,7 +46,7 @@ struct llama_expert_pool_state {
     // set once the pool weights/tables have been copied (idempotent fill)
     bool fill_done = false;
 
-    // main-graph mount mode (GGML_EXPPOOL_MOUNT=1): a second GPU-resident
+    // direct mount (GGML_EXPPOOL_MOUNT=0 disables it): a second GPU-resident
     // expert chain runs inside the main graph; PR #26631 -1 ids zero the
     // non-resident columns on the GPU chain (and the resident columns on the
     // CPU chain via the inverse table), so no delegate hook is needed
@@ -129,9 +67,9 @@ struct llama_expert_pool_state {
     bool   rt_step_done = false;           // last pooled layer logged since the last
                                            // step advance (single-layer-safe step detect)
 
-    // stage 3 auto-swap (--expert-pool-swap): sliding decode window count of
-    // expert activations, one entry per (pooled layer, expert); the resident
-    // set is refreshed from the window every swap_W decode steps
+    // stage 3 swap (on by default with -nep): sliding decode window count of
+    // expert activations, one entry per (pooled layer, expert); the marginal
+    // exchange refreshes the resident set one pair per layer per step
     bool swap_auto = false;
     int32_t swap_W = 512;                  // window length in decode steps
     int32_t n_expert = 0;                  // experts per layer (set at init)
@@ -139,10 +77,9 @@ struct llama_expert_pool_state {
     std::vector<int32_t> win_cnt;          // [pooled layers * n_expert]
     std::vector<std::vector<int32_t>> win_hist; // [W] flat (ilx, e) pairs per step
 
-    // prefill-measure mode: the pool is built lazily from the prefill routing
-    // counts (global top-N pairs -> per-layer slot widths). while measuring,
-    // the hook counts the routing and the pool is absent (the prefill runs
-    // the plain CPU chain; no mount, no transfer tax).
+    // built flag: expert_pool_build() has run (sched_reserve() re-enters
+    // expert_pool_init after a rebuild, and a reset() would wipe the fresh
+    // pool)
     bool pool_ready = false;               // pool allocation finished
     int32_t budget_slots = 0;              // -nep total slot budget
     int32_t last_active_ilx = -1;          // pooled index of the last layer with an active
@@ -197,21 +134,6 @@ bool llama_expert_pool_parse_init(const std::string & path, int32_t n_layer,
 void llama_expert_pool_random(int32_t n_layer, int32_t n_expert, int32_t n_slot,
                               std::vector<std::vector<int32_t>> & resident);
 
-struct llama_chain_params {
-    int      type_op  = -1;      // llm_ffn_op_type as int (-1 = not registered)
-    bool     norm_w   = false;
-    float    w_scale  = 1.0f;
-    uint32_t gating_op = 0;
-};
-
-// registered by build_moe_ffn at the real call site (il >= 0, pool active):
-// exact per-layer chain parameters of THIS model. pool mini graphs look them
-// up and call build_moe_ffn(chain_only) with the same values, so every
-// arch/variant is handled by the same code without per-model replication.
-void llama_expert_pool_register_chain(int il, int type_op, bool norm_w, float w_scale, uint32_t gating_op);
-const llama_chain_params & llama_expert_pool_get_chain(int il);
-void llama_expert_pool_clear_chain();
-
 // moe routing-log hook: called by the CPU MUL_MAT_ID kernel (ith==0), feeds
 // GGML_EXPPOOL_ROUTING_LOG (see llama-expert-pool.h). returns a null skip
 // table: no rows are skipped, column zeroing is done by the -1 ids natively.
@@ -219,17 +141,17 @@ void llama_expert_pool_delegate_begin(
         ggml_tensor * src0, ggml_tensor * src1, ggml_tensor * ids, ggml_tensor * dst,
         const int32_t ** skip_out, void * ud);
 
-// stage 3: refresh the resident set from the sliding decode window. called at
-// a decode step boundary from the delegate hook (--expert-pool-swap).
+// stage 3: one marginal exchange per pooled layer per step. called at a
+// decode step boundary from the delegate hook (swap is on by default with -nep).
 void llama_expert_pool_run_swap(llama_expert_pool_state & st);
 
-// prefill-measure allocation: the global top-N (layer, expert) pairs of the
-// prefill activation counts (N = budget slots) decide the per-layer slot
-// widths (1-2-slot layers fall back to 0: the desert rule). returns false
-// when the counts are too sparse to rank (the caller falls back to uniform
-// widths with the observed experts as the in-sample seed).
+// segment-end width allocation: the global top-N (layer, expert) pairs of
+// the cumulative activation counts (N = budget slots) decide the per-layer
+// slot widths (1-2-slot layers fall back to 0: the desert rule). returns
+// false when the counts are too sparse to rank (the caller keeps the
+// current layout).
 bool llama_expert_pool_alloc_from_counts(
-        const std::vector<int32_t> & win_cnt, int32_t P, int32_t n_expert,
+        const std::vector<int32_t> & counts, int32_t P, int32_t n_expert,
         int32_t budget, std::vector<std::vector<int32_t>> & resident);
 
 // ---------------------------------------------------------------
@@ -246,8 +168,8 @@ bool llama_expert_pool_alloc_from_counts(
 // scale tables, which are F32.
 struct llama_expert_pool_mount {
     bool active = false;
-    ggml_tensor * w_gate_up = nullptr; // [n_ff*2, n_embd, n_expert] or null
-    ggml_tensor * w_up      = nullptr; // [n_ff, n_embd, n_expert] or null
+    ggml_tensor * w_gate_up = nullptr; // [n_ff*2, n_embd, S] or null (pool copy)
+    ggml_tensor * w_up      = nullptr; // [n_ff, n_embd, S] or null (pool copy)
     ggml_tensor * w_gate    = nullptr;
     ggml_tensor * w_down    = nullptr;
     ggml_tensor * w_down_s  = nullptr; // per-expert down scale source (values
