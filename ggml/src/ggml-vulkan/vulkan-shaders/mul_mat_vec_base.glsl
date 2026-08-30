@@ -42,7 +42,6 @@ layout (push_constant) uniform parameter
 
 #ifdef MUL_MAT_ID
 uint expert_id;
-bool expert_skip; // an id of -1 skips the slot, the result row is zeroed
 #endif
 
 void get_offsets(out uint a_offset, out uint b_offset, out uint d_offset) {
@@ -64,9 +63,7 @@ void get_offsets(out uint a_offset, out uint b_offset, out uint d_offset) {
         batch_idx_a = i03 * p.ne02 + i02;
     }
 #else
-    const int expert = data_ids[expert_i0 + p.expert_i1 * p.nbi1];
-    expert_skip = expert == -1;
-    expert_id   = expert_skip ? 0 : uint(expert); // clamp, so that the offsets below stay in range
+    expert_id = data_ids[expert_i0 + p.expert_i1 * p.nbi1];
 #endif
 
     a_offset =
@@ -115,9 +112,6 @@ void reduce_result(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t 
                 if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SCALE1) != 0) {
                     const uint expert_i0 = gl_GlobalInvocationID.y;
                     temp[j][n] *= FLOAT_TYPE(data_fuse1[expert_i0]);
-                }
-                if (expert_skip) {
-                    temp[j][n] = FLOAT_TYPE(0);
                 }
 #else
                 if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_BIAS0) != 0) {
@@ -174,9 +168,6 @@ void reduce_result(FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t d_offs
                     const uint expert_i0 = gl_GlobalInvocationID.y;
                     temp[j][n] *= FLOAT_TYPE(data_fuse1[expert_i0]);
                 }
-                if (expert_skip) {
-                    temp[j][n] = FLOAT_TYPE(0);
-                }
 #else
                 if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_BIAS0) != 0) {
                     temp[j][n] += FLOAT_TYPE(data_fuse0[j*p.batch_stride_d + d_offset + first_row + n]);
@@ -221,9 +212,6 @@ void reduce_result(FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t d_offs
                 if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_SCALE1) != 0) {
                     const uint expert_i0 = gl_GlobalInvocationID.y;
                     tmpsh[j][n][0] *= FLOAT_TYPE(data_fuse1[expert_i0]);
-                }
-                if (expert_skip) {
-                    tmpsh[j][n][0] = FLOAT_TYPE(0);
                 }
 #else
                 if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_BIAS0) != 0) {
