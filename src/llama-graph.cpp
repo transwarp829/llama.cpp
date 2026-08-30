@@ -1980,6 +1980,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     ggml_tensor * weights = nullptr;
     ggml_tensor * mount_out  = nullptr; // direct-mount GPU chain result (weighted)
     ggml_tensor * mount_ids_cpu = nullptr; // inverse-remap ids for the CPU chain
+    ggml_tensor * mount_agg  = nullptr; // aggregated GPU chain output ([n_embd, T])
     ggml_tensor * mount_scale = nullptr; // [1, n_used, T] down scale, gathered on
                                          // the GPU segment, used by both chains
 
@@ -2202,6 +2203,23 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 cb(mount_out, "ffn_moe_mount_weighted", il);
             }
 
+            // CPU-side merge (mirrors the native -cmoe path): aggregate the
+            // GPU chain output HERE (in-graph, GPU segment) so that the merge
+            // with the CPU chain below runs on the CPU segment - only the
+            // aggregated 8KB crosses back to the CPU, exactly like native
+            // -cmoe (whose CPU segment produces the aggregated result that is
+            // sent back to the GPU for the layer tail).
+            ggml_tensor * cur_experts_g[LLAMA_MAX_EXPERTS] = { nullptr };
+            for (uint32_t i = 0; i < hparams.n_expert_used; ++i) {
+                cur_experts_g[i] = ggml_view_2d(ctx0, mount_out, n_embd, n_tokens, mount_out->nb[2], i*mount_out->nb[1]);
+            }
+            ggml_tensor * pool_sum = cur_experts_g[0];
+            for (uint32_t i = 1; i < hparams.n_expert_used; ++i) {
+                pool_sum = ggml_add(ctx0, pool_sum, cur_experts_g[i]);
+            }
+            cb(pool_sum, "ffn_moe_mount_agg", il);
+            mount_agg = pool_sum;
+
         }
     }
 
@@ -2396,10 +2414,13 @@ build_expert_chain:
     }
 
     if (mount_out != nullptr) {
-        // direct-mount merge (single add): hit col = 0(cpu, hook) + gpu,
-        // miss col = cpu + 0(-1 skip slot). mount_out is already weighted.
-        experts = ggml_add(ctx0, experts, mount_out);
-        cb(experts, "ffn_moe_mount_merged", il);
+        // direct-mount merge moves AFTER the aggregation below: the CPU chain
+        // output (miss columns) is aggregated first, then the aggregated GPU
+        // chain contribution (ffn_moe_mount_agg) is added - the layer tail
+        // then follows the native -cmoe path exactly (aggregated result is
+        // sent back to the GPU for the residual + cvec).
+        // (the merge add is tagged CPU below; the aggregation views/adds of
+        // the miss columns stay on the CPU segment via the experts input)
     }
 
     ggml_build_forward_expand(gf, experts);
@@ -2425,6 +2446,13 @@ build_expert_chain:
         moe_out = ggml_add(ctx0, moe_out, cur_experts[i]);
 
         ggml_build_forward_expand(gf, moe_out);
+    }
+
+    if (mount_out != nullptr) {
+        // merge with the aggregated GPU chain output on the CPU segment
+        moe_out = ggml_add(ctx0, moe_out, mount_agg);
+        cb(moe_out, "ffn_moe_mount_merged", il);
+        ggml_backend_sched_set_tensor_backend(sched, moe_out, backend_cpu);
     }
 
     if (hparams.n_expert_used == 1) {
