@@ -76,9 +76,64 @@ void llama_expert_pool_state::reset() {
     budget_slots = 0;
     seg_cnt.clear();
 
-    pend.clear();
     pool_backend  = nullptr;
     swap_sum      = 0;
+
+    // stop the copy worker (if running): signal, join, drain
+    {
+        std::lock_guard<std::mutex> lk(cp_mtx);
+        cp_stop = true;
+        cp_todo.clear();
+        cp_done.clear();
+    }
+    cp_cv.notify_all();
+    if (cp_worker.joinable()) {
+        cp_worker.join();
+    }
+    cp_stop = false;
+    cp_inflight.clear();
+}
+
+// start the dedicated swap-copy worker thread (one per pool). the worker
+// performs the H2D weight copies off the inference thread and off the main
+// graph stream; runaway workers are drained on reset().
+namespace { void swap_copy_one_sync(ggml_backend_t, ggml_tensor *, ggml_tensor *, int32_t, int32_t); }
+
+void llama_expert_pool_start_worker(llama_expert_pool_state & st) {
+    if (st.cp_worker.joinable()) {
+        return;
+    }
+    st.cp_inflight.assign(st.pooled_layers.size(), -1);
+    st.cp_stop = false;
+    st.cp_worker = std::thread([&st]() {
+        for (;;) {
+            llama_expert_pool_state::pending_exchange req;
+            {
+                std::unique_lock<std::mutex> lk(st.cp_mtx);
+                st.cp_cv.wait(lk, [&st]() { return st.cp_stop || !st.cp_todo.empty(); });
+                if (st.cp_stop) {
+                    return;
+                }
+                req = st.cp_todo.front();
+                st.cp_todo.pop_front();
+            }
+            // SYNC copy on the worker's own context: ggml_backend_tensor_set
+            // blocks the worker thread only; the inference thread and the
+            // main graph stream never wait for it. the fill is reported done
+            // only after the copy returned.
+            const llama_expert_pool_mount & mnt = llama_expert_pool_get_mount(req.il);
+            if (mnt.active) {
+                swap_copy_one_sync(st.pool_backend, st.orig_gate_up[req.il], st.w_pool_gate_up[req.il], req.e, req.slot);
+                swap_copy_one_sync(st.pool_backend, st.orig_up[req.il],      st.w_pool_up[req.il],      req.e, req.slot);
+                swap_copy_one_sync(st.pool_backend, st.orig_gate[req.il],    st.w_pool_gate[req.il],    req.e, req.slot);
+                swap_copy_one_sync(st.pool_backend, st.orig_down[req.il],    st.w_pool_down[req.il],    req.e, req.slot);
+            }
+            {
+                std::lock_guard<std::mutex> lk(st.cp_mtx);
+                st.cp_done.push_back(req);
+            }
+        }
+    });
 }
 
 // parse seed csv: one line per layer "il,e1,e2,...". layers missing from the
@@ -322,52 +377,62 @@ void llama_expert_pool_delegate_begin(
 
 namespace {
 
-void swap_write_tables(llama_expert_pool_state & st, int32_t il,
-                       const std::vector<int32_t> & res,
-                       const std::vector<int32_t> & pending_fill) {
-    llama_expert_pool_mount & m = llama_expert_pool_get_mount(il);
-    if (!m.active || m.remap == nullptr || m.remap_cpu == nullptr) {
+// rebuild the merged host mirror from resident[] and flush it to the device
+// with ONE tensor_set (step-granular swap update: one API per step, no
+// per-layer table writes). mirror layout: [2*n_expert, n_layers]; layer il =
+// [il*2*n_expert + e] remap, [+n_expert] remap_cpu (ordered like tab_all).
+void llama_expert_pool_tab_sync_impl(llama_expert_pool_state & st) {
+    if (st.tab_all == nullptr) {
         return;
     }
     const int32_t n_expert = st.n_expert;
-    // resident -> slot; pending_fill entries stay unmapped (-1) so the hot
-    // path falls back to the CPU chain until their weight copies land
-    std::vector<int32_t> rmp(n_expert, -1);
-    for (int32_t s = 0; s < (int32_t) res.size(); ++s) {
-        const int32_t e = res[s];
-        if (e >= 0 && e < n_expert) {
-            rmp[e] = s;
+    const size_t n_total = (size_t) st.tab_all->ne[0] * (size_t) st.tab_all->ne[1];
+    if (st.tab_mirror.size() != n_total) {
+        st.tab_mirror.assign(n_total, -1);
+    }
+    for (int32_t il : st.pooled_layers) {
+        const llama_expert_pool_mount & m = llama_expert_pool_get_mount(il);
+        if (!m.active) {
+            continue;
+        }
+        const std::vector<int32_t> & res = st.resident[il];
+        int32_t * rmp    = st.tab_mirror.data() + il * 2 * n_expert;
+        int32_t * rmp_cu = rmp + n_expert;
+        // default: nothing resident (remap -1, inverse = its own id)
+        for (int32_t e = 0; e < n_expert; ++e) {
+            rmp[e] = -1;
+            rmp_cu[e] = e;
+        }
+        for (int32_t s = 0; s < (int32_t) res.size(); ++s) {
+            const int32_t e = res[s];
+            if (e >= 0 && e < n_expert) {
+                rmp[e] = s;
+                rmp_cu[e] = -1;
+            }
         }
     }
-    for (int32_t e : pending_fill) {
-        rmp[e] = -1;
-    }
-    std::vector<int32_t> rmp_cpu(n_expert, -1);
-    for (int32_t e = 0; e < n_expert; ++e) {
-        rmp_cpu[e] = rmp[e] >= 0 ? -1 : e;
-    }
-    ggml_backend_tensor_set(m.remap,     rmp.data(),     0, n_expert * sizeof(int32_t));
-    ggml_backend_tensor_set(m.remap_cpu, rmp_cpu.data(), 0, n_expert * sizeof(int32_t));
+    ggml_backend_tensor_set(st.tab_all, st.tab_mirror.data(), 0, n_total * sizeof(int32_t));
 }
 
-void swap_copy_one(ggml_backend_t be, ggml_tensor * src, ggml_tensor * pw, int32_t e, int32_t slot) {
+void swap_copy_one_sync(ggml_backend_t be, ggml_tensor * src, ggml_tensor * pw, int32_t e, int32_t slot) {
     if (src == nullptr || pw == nullptr) {
         return;
     }
     const size_t sz = src->nb[2];
     const char * data = (const char *) src->data + e * src->nb[2];
     const size_t off  = slot * pw->nb[2];
-    // async on the backend's main stream: the copy runs while the step's
-    // CPU chain computes. fall back to the blocking copy if no backend is
-    // known (CPU pool etc.).
-    if (be != nullptr) {
-        ggml_backend_tensor_set_async(be, pw, data, off, sz);
-    } else {
-        ggml_backend_tensor_set(pw, data, off, sz);
-    }
+    // SYNC copy: only for the dedicated swap worker. the worker reports the
+    // fill "done" only after this returns, so the tables are published after
+    // the copy actually completed (no torn slots; the async variant above is
+    // for the legacy inline path where the sched's split sync covers it).
+    ggml_backend_tensor_set(pw, data, off, sz);
 }
 
 } // namespace
+
+void llama_expert_pool_tab_sync(llama_expert_pool_state & st) {
+    llama_expert_pool_tab_sync_impl(st);
+}
 
 // allocate the per-layer slot widths from the cumulative activation counts
 // (the infinite-window seg_cnt): the global top-N (layer, expert) pairs by
@@ -454,21 +519,23 @@ void llama_expert_pool_run_swap(llama_expert_pool_state & st) {
         return;
     }
 
-    // --- commit the exchanges issued at the previous step boundary ---
-    // the weight copies were queued on the pool backend's main stream, and
-    // the sched's per-split synchronization guarantees the step's GPU work
-    // (and with it the copies) completed before the first CPU MMID of this
-    // step; the table writes below rebuild the mapping from the resident
-    // vectors, so the incoming experts become visible from this step on.
-    for (const auto & pe : st.pend) {
-        std::vector<int32_t> & res = st.resident[pe.il];
-        if (pe.slot >= 0 && pe.slot < (int32_t) res.size() && res[pe.slot] < 0) {
-            res[pe.slot] = pe.e;
-            swap_write_tables(st, pe.il, res, {});
-        }
-    }
-    st.pend.clear();
 
+    // --- publish the exchanges whose copies the worker completed ---
+    // (double sync point: the slot was unmaped in the tables when its fill
+    // was queued; it is only remapped here, after the copy finished, so a
+    // running graph never sees a torn slot. the merged tables are flushed
+    // once per step at the end of this function.)
+    {
+        std::lock_guard<std::mutex> lk(st.cp_mtx);
+        for (const auto & pe : st.cp_done) {
+            std::vector<int32_t> & res = st.resident[pe.il];
+            if (pe.slot >= 0 && pe.slot < (int32_t) res.size() && res[pe.slot] < 0) {
+                res[pe.slot] = pe.e;
+            }
+            st.cp_inflight[pe.il] = -1;
+        }
+        st.cp_done.clear();
+    }
     // --- marginal exchange: swap the worst resident expert with the best
     // non-resident one, at most one pair per pooled layer per step, gated by
     // the z-sigma confidence test below (the cost-gate/payback terms were
@@ -508,15 +575,7 @@ void llama_expert_pool_run_swap(llama_expert_pool_state & st) {
         if (worst_s < 0) {
             continue;
         }
-        // best non-resident (not mapped, not already pending for this layer)
-        const auto pending_e = [&](int32_t e) {
-            for (const auto & pe : st.pend) {
-                if (pe.il == il && pe.e == e) {
-                    return true;
-                }
-            }
-            return false;
-        };
+        // best non-resident expert (not mapped in this layer)
         int32_t best_e = -1;
         int32_t best_cnt = 0;
         for (int32_t e = 0; e < n_expert; ++e) {
@@ -531,7 +590,7 @@ void llama_expert_pool_run_swap(llama_expert_pool_state & st) {
                     break;
                 }
             }
-            if (resident || pending_e(e)) {
+            if (resident) {
                 continue;
             }
             best_e = e;
@@ -548,20 +607,31 @@ void llama_expert_pool_run_swap(llama_expert_pool_state & st) {
         // noise. drift adaptation in the long run belongs to the segment-end
         // reallocation (cumulative seg_cnt), not to this per-step test.
         const double gap = (double) (best_cnt - worst_cnt);
-        if (gap <= 3.0 * sqrt((double) best_cnt + (double) worst_cnt)) {
+        if (gap <= (double) st.swap_sigma * sqrt((double) best_cnt + (double) worst_cnt)) {
             continue;
         }
-        // unmap the victim, copy the fill into the freed slot, publish both
-        // at the next step boundary (the slot stays -1 in the tables until
-        // the commit, so the step's graphs never read the in-flight slot)
+        // unmap the victim, queue the fill for the copy worker, publish the
+        // victim at the next step boundary (the slot stays -1 in the tables
+        // until the worker completes, so the step's graphs never read the
+        // in-flight slot: no torn data, one copy per slot)
         const int32_t victim_e = res[worst_s];
         res[worst_s] = -1;
-        swap_write_tables(st, il, res, {});
-        swap_copy_one(st.pool_backend, st.orig_gate_up[il], st.w_pool_gate_up[il], best_e, worst_s);
-        swap_copy_one(st.pool_backend, st.orig_up[il],      st.w_pool_up[il],      best_e, worst_s);
-        swap_copy_one(st.pool_backend, st.orig_gate[il],    st.w_pool_gate[il],    best_e, worst_s);
-        swap_copy_one(st.pool_backend, st.orig_down[il],    st.w_pool_down[il],    best_e, worst_s);
-        st.pend.push_back({ il, best_e, worst_s });
+        // (the merged tables are flushed once at the end of this function;
+        // the flush runs before the step's next GPU segments submit, so the
+        // unmap is visible in time - no per-exchange table write here)
+        // if this layer already has an in-flight fill, its slot is pending -
+        // do not queue a second copy onto the same layer until the first
+        // completed (double-fill protection; skipped exchanges are dropped)
+        if (st.cp_inflight[il] < 0) {
+            st.cp_inflight[il] = worst_s;
+            std::lock_guard<std::mutex> lk(st.cp_mtx);
+            st.cp_todo.push_back({ il, best_e, worst_s });
+            st.cp_cv.notify_one();
+        } else {
+            // layer busy: revert the unmap (the exchange is not issued)
+            res[worst_s] = victim_e;
+            continue;
+        }
         LLAMA_LOG_INFV(LLAMA_LOG_VERBOSITY_TRACE,
                 "%s: exchange layer %d (step %d): evict e=%d (cnt %d), fill e=%d (cnt %d)",
                 __func__, il, st.win_step, victim_e, worst_cnt, best_e, best_cnt);
@@ -583,6 +653,13 @@ void llama_expert_pool_run_swap(llama_expert_pool_state & st) {
     LLAMA_LOG_INFV(LLAMA_LOG_VERBOSITY_DEBUG,
             "%s: marginal step %d: swapped %d\n",
             __func__, st.win_step, delta);
+    // ONE merged table flush per step: rebuild the host mirror from the
+    // updated resident sets and write it with a single tensor_set. this
+    // runs before the step's remaining GPU segments submit (they are
+    // submitted by the scheduler after run_swap returns), so both the
+    // unmap (-1 for in-flight slots) and the publish (completed fills) of
+    // this step become visible for the rest of the step.
+    llama_expert_pool_tab_sync(st);
     // the pool hit rate is printed once at the end of the generation segment
     // by llama_expert_pool_finalize; win_hit/win_miss accumulate across the
     // segment (no per-swap reset here)
