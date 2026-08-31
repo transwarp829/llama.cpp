@@ -151,6 +151,7 @@ llama_context::llama_context(
     cparams.expert_pool_init = params.expert_pool_init;
     cparams.expert_pool_swap = params.expert_pool_swap;
     cparams.expert_pool_swap_window = params.expert_pool_swap_window;
+    cparams.expert_pool_swap_sigma = params.expert_pool_swap_sigma;
     if (cparams.expert_cache) {
         expert_cache.enabled = true;
         expert_cache.init(cparams.n_seq_max, hparams.n_layer());
@@ -540,6 +541,21 @@ llama_context::~llama_context() {
     // after this body, touching freed pool tensors -> use-after-free at exit)
     sched.reset();
 
+    // stop the swap-copy worker BEFORE the pool buffers are freed: its sync
+    // tensor_set calls reference the pool tensors; a live worker touching
+    // them after the frees below is a use-after-free at exit
+    llama_expert_pool_state & st = model.expert_pool_state;
+    {
+        std::lock_guard<std::mutex> lk(st.cp_mtx);
+        st.cp_stop = true;
+        st.cp_todo.clear();
+        st.cp_done.clear();
+    }
+    st.cp_cv.notify_all();
+    if (st.cp_worker.joinable()) {
+        st.cp_worker.join();
+    }
+
     pool_buf.reset(); // release the pool buffer before freeing the ctx metadata
     if (pool_ctx) {
         ggml_free(pool_ctx);
@@ -709,10 +725,16 @@ void llama_context::expert_pool_init() {
         st.swap_auto = false;
     }
     const char * swap_w_env = getenv("GGML_EXPPOOL_SWAP_WINDOW");
+    const char * swap_sigma_env = getenv("GGML_EXPPOOL_SWAP_SIGMA");
     if (cparams.expert_pool_swap_window > 0) {
         st.swap_W = cparams.expert_pool_swap_window;
     } else if (swap_w_env != nullptr && std::atoi(swap_w_env) > 0) {
         st.swap_W = std::atoi(swap_w_env);
+    }
+    if (cparams.expert_pool_swap_sigma > 0) {
+        st.swap_sigma = cparams.expert_pool_swap_sigma;
+    } else if (swap_sigma_env != nullptr && std::atoi(swap_sigma_env) > 0) {
+        st.swap_sigma = std::atoi(swap_sigma_env);
     }
 
     // --- find the pooled layers (MoE weights that live on the CPU) ---
@@ -931,8 +953,18 @@ void llama_context::expert_pool_build() {
             continue;
         }
         const llama_layer & L = model.layers[il];
-        m.remap     = ggml_new_tensor_2d(pool_tab_ctx, GGML_TYPE_I32, 1, n_expert);
-        m.remap_cpu = ggml_new_tensor_2d(pool_tab_ctx, GGML_TYPE_I32, 1, n_expert);
+        // merged table: ONE contiguous [2*n_expert, n_layers] I32 tensor;
+        // each layer gets a 1KB view for remap and a 1KB view for remap_cpu
+        if (st.tab_all == nullptr) {
+            st.tab_all = ggml_new_tensor_2d(pool_tab_ctx, GGML_TYPE_I32, 2 * n_expert,
+                                            llama_model_n_layer(&model));
+            ggml_set_name(st.tab_all, "mnt_tab_all");
+        }
+        const size_t i32sz = ggml_type_size(GGML_TYPE_I32);
+        m.remap     = ggml_view_2d(pool_tab_ctx, st.tab_all, 1, n_expert, i32sz,
+                                   il * 2 * n_expert * i32sz);
+        m.remap_cpu = ggml_view_2d(pool_tab_ctx, st.tab_all, 1, n_expert, i32sz,
+                                   (il * 2 + 1) * n_expert * i32sz);
         if (L.ffn_down_exps_s != nullptr) {
             m.scale = ggml_new_tensor_2d(pool_tab_ctx, GGML_TYPE_F32, 1, n_expert);
         }
@@ -1033,27 +1065,9 @@ void llama_context::expert_pool_build() {
                 continue;
             }
             const std::vector<int32_t> & res = st.resident[il];
-            // compact layout: pool slot s holds expert res[s]. remap_gpu maps
-            // resident expert e -> its SLOT s (the pool tensor is indexed by
-            // slot) and non-resident -> -1 (PR #26631 skip -> exact zero).
-            // remap_cpu is the inverse for the CPU chain (which reads the
-            // full prototype tensor, indexed by expert id): resident -> -1
-            // (zeroed natively by the CPU kernel), non-resident -> its id.
-            // the scale value table depends on model weight data and is
-            // staged later in expert_pool_fill().
-            std::vector<int32_t> rmp(n_expert, -1);
-            std::vector<int32_t> rmp_cpu(n_expert, -1);
-            for (int32_t s = 0; s < (int32_t) res.size(); ++s) {
-                const int32_t e = res[s];
-                if (e >= 0 && e < n_expert) {
-                    rmp[e] = s;
-                }
-            }
-            for (int32_t e = 0; e < n_expert; ++e) {
-                rmp_cpu[e] = rmp[e] >= 0 ? -1 : e;
-            }
-            ggml_backend_tensor_set(m.remap, rmp.data(), 0, n_expert * sizeof(int32_t));
-            ggml_backend_tensor_set(m.remap_cpu, rmp_cpu.data(), 0, n_expert * sizeof(int32_t));
+            // (table contents are written once by expert_pool_fill() via the
+            // merged tab_sync: every layer's remap/remap_cpu in one set)
+            (void) res;
         }
     }
 
@@ -1102,22 +1116,9 @@ void llama_context::expert_pool_fill() {
                                m.remap != nullptr && m.remap_cpu != nullptr;
         if (has_mount) {
             // I32 ids tables: get_rows outputs the table type natively on
-            // every backend (ggml.c), so no cast is needed anywhere.
-            std::vector<int32_t> rmp(n_expert, -1);
-            for (int32_t s = 0; s < (int32_t) res.size(); ++s) {
-                const int32_t e = res[s];
-                if (e >= 0 && e < n_expert) {
-                    rmp[e] = s;
-                }
-            }
-            // inverse table: resident -> -1 (zeroed natively by the CPU
-            // kernel), non-resident -> its expert id
-            std::vector<int32_t> rmp_cpu(n_expert, -1);
-            for (int32_t e = 0; e < n_expert; ++e) {
-                rmp_cpu[e] = rmp[e] >= 0 ? -1 : e;
-            }
-            ggml_backend_tensor_set(m.remap, rmp.data(), 0, n_expert * sizeof(int32_t));
-            ggml_backend_tensor_set(m.remap_cpu, rmp_cpu.data(), 0, n_expert * sizeof(int32_t));
+            // every backend (ggml.c), so no cast is needed anywhere. the
+            // merged remap/remap_cpu tables are flushed once below, after
+            // the loop (tab_sync), so no per-layer set here.
             if (m.scale != nullptr) {
                 // one flat table: expert e -> its down scale value. the -1 ids
                 // already zero the skipped columns on both chains, so no
@@ -1153,6 +1154,18 @@ void llama_context::expert_pool_fill() {
         copy_slots(L.ffn_down_exps,    st.w_pool_down[il]);
     }
     st.fill_done = true;
+
+    // start the dedicated swap-copy worker: all later H2D weight copies run
+    // on this thread (off the inference thread and off the main graph
+    // stream); swap decisions queue requests, the step boundary publishes
+    // completed fills only.
+    if (st.swap_auto && !st.pooled_layers.empty()) {
+        llama_expert_pool_start_worker(st);
+    }
+
+    // initial merged table flush: the resident sets from expert_pool_init()
+    // land on the device in ONE tensor_set (before the first decode)
+    llama_expert_pool_tab_sync(st);
 
     // --- moe routing-log hook (feeds GGML_EXPPOOL_ROUTING_LOG) ---
     if (st.direct_mount) {
@@ -4310,6 +4323,7 @@ llama_context_params llama_context_default_params() {
         /*.expert_pool_init            =*/ nullptr,
         /*.expert_pool_swap            =*/ true,
         /*.expert_pool_swap_window     =*/ 0,
+        /*.expert_pool_swap_sigma      =*/ 0,
         /*.samplers                    =*/ nullptr,
         /*.n_samplers                  =*/ 0,
         /*.ctx_other                   =*/ nullptr,
@@ -5085,6 +5099,9 @@ void llama_context::expert_pool_finalize() {
             ggml_free(pool_tab_ctx);
             pool_tab_ctx = nullptr;
         }
+        // the merged table tensor died with the context: force its rebuild
+        st.tab_all = nullptr;
+        st.tab_mirror.clear();
         st.resident.assign(model.hparams.n_layer(), {});
         for (int32_t ilx = 0; ilx < n_pooled; ++ilx) {
             st.resident[st.pooled_layers[ilx]] = resident[ilx];
@@ -5093,7 +5110,6 @@ void llama_context::expert_pool_finalize() {
         // again (the old fill_done refers to the previous pool, whose weights
         // would otherwise stay zero)
         st.fill_done = false;
-        st.pend.clear();
         LLAMA_LOG_INFV(LLAMA_LOG_VERBOSITY_INFO, "%s: reallocated pool widths at segment end\n", __func__);
         expert_pool_build();
         expert_pool_fill();

@@ -2449,10 +2449,21 @@ build_expert_chain:
     }
 
     if (mount_out != nullptr) {
-        // merge with the aggregated GPU chain output on the CPU segment
+        // direct-mount merge on the GPU segment: the miss-chain aggregation
+        // crosses back via the existing H2D input of the layer tail (same
+        // path as native -cmoe), and the aggregated GPU chain contribution
+        // (mount_agg) is added where it lives. this removes one D2H per
+        // layer - the mount_agg no longer crosses to the CPU segment.
+        // the per-expert down scale (mount_scale) is still applied on the
+        // CPU segment BEFORE the aggregation (it is a per-column scale).
+        // NOTE: moving the add across backends changes the float path
+        // (CUDA FTZ vs x86) - 1-ulp class, semantic equivalence only.
         moe_out = ggml_add(ctx0, moe_out, mount_agg);
         cb(moe_out, "ffn_moe_mount_merged", il);
-        ggml_backend_sched_set_tensor_backend(sched, moe_out, backend_cpu);
+        // sched backends are ordered [gpu..., cpu] (sched_new asserts the
+        // last backend is CPU), so index 0 is the pool device
+        ggml_backend_sched_set_tensor_backend(sched, moe_out,
+                                              ggml_backend_sched_get_backend(sched, 0));
     }
 
     if (hparams.n_expert_used == 1) {

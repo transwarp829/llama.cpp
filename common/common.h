@@ -577,6 +577,7 @@ struct common_params {
     std::string expert_pool_init;         // csv file to seed the pool (empty = random)
     bool expert_pool_swap      = true;    // auto-swap the pool resident set (sliding window; on whenever -nep is set)
     int32_t expert_pool_swap_window = 0;  // swap window in decode steps (0 = default 512)
+    int32_t expert_pool_swap_sigma = 0;   // swap confidence sigma (0 = default 3)
 
     bool input_prefix_bos  = false; // prefix BOS to user inputs, preceding input_prefix
     bool verbose_prompt    = false; // print prompt tokens before generation

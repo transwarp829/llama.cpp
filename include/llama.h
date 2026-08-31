@@ -412,6 +412,7 @@ extern "C" {
         const char * expert_pool_init; // [EXPERIMENTAL] csv file to seed the pool ("il,e1,e2,..."), null = random
         bool expert_pool_swap;      // [EXPERIMENTAL] auto-swap the pool resident set (sliding window)
         int32_t expert_pool_swap_window; // [EXPERIMENTAL] swap window in decode steps (0 = default 512)
+        int32_t expert_pool_swap_sigma; // [EXPERIMENTAL] swap confidence in sigma (0 = default 3)
 
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)
