@@ -148,7 +148,16 @@ struct llama_expert_pool_state {
     // sliced from it. the host mirror is rebuilt from resident[] once per
     // step and flushed with a single tensor_set (step-granular swap update).
     ggml_tensor * tab_all = nullptr;             // [2*n_expert, n_layers]
-    std::vector<int32_t> tab_mirror;             // [2*n_expert * n_layers]
+    // 9/1: CPU-hosted mirror of the remap_cpu half of tab_all (same layout),
+    // read by the CPU-segment get_rows of the miss chain. updated in the same
+    // tab_sync_impl flush. keeps the CPU chain independent of the pool
+    // segment's 32B output slot race.
+    ggml_tensor * tab_cpu = nullptr;             // [2*n_expert, n_layers] (CPU buft)
+    // ping-pong host mirrors of the merged table: the sync-less flush reads
+    // the mirror written this step, the next tab_sync writes the other one
+    // (two-step distance guarantees the previous set_async finished).
+    std::vector<int32_t> tab_mirror[2];
+    int tab_mirror_flip = 0;
 
     void reset();
 };
@@ -213,9 +222,12 @@ struct llama_expert_pool_mount {
     ggml_tensor * w_down_b  = nullptr; // per-expert down bias (add_id -1 makes
                                        // it a no-op for skipped columns)
     ggml_tensor * remap     = nullptr; // I32 [1, n_expert] on the pool device:
-                                       // resident expert e -> slot s, non-resident -> -1
+                                       // resident -> pool slot, non-resident -> -1
     ggml_tensor * remap_cpu = nullptr; // I32 [1, n_expert] on the pool device:
-                                       // resident expert e -> -1, non-resident -> e
+                                       // resident -> -1, non-resident -> expert id
+    ggml_tensor * remap_cpu_cpu = nullptr; // I32 [1, n_expert] on the CPU device:
+                                           // same content as remap_cpu, for the
+                                           // CPU-segment get_rows (host mirror)
     ggml_tensor * scale     = nullptr; // F32 [1, n_expert] on the pool device:
                                        // per-expert down scale (null = no scale)
 };
