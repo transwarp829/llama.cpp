@@ -387,8 +387,9 @@ void llama_expert_pool_tab_sync_impl(llama_expert_pool_state & st) {
     }
     const int32_t n_expert = st.n_expert;
     const size_t n_total = (size_t) st.tab_all->ne[0] * (size_t) st.tab_all->ne[1];
-    if (st.tab_mirror.size() != n_total) {
-        st.tab_mirror.assign(n_total, -1);
+    std::vector<int32_t> & mir = st.tab_mirror[st.tab_mirror_flip];
+    if (mir.size() != n_total) {
+        mir.assign(n_total, -1);
     }
     for (int32_t il : st.pooled_layers) {
         const llama_expert_pool_mount & m = llama_expert_pool_get_mount(il);
@@ -396,7 +397,7 @@ void llama_expert_pool_tab_sync_impl(llama_expert_pool_state & st) {
             continue;
         }
         const std::vector<int32_t> & res = st.resident[il];
-        int32_t * rmp    = st.tab_mirror.data() + il * 2 * n_expert;
+        int32_t * rmp    = mir.data() + il * 2 * n_expert;
         int32_t * rmp_cu = rmp + n_expert;
         // default: nothing resident (remap -1, inverse = its own id)
         for (int32_t e = 0; e < n_expert; ++e) {
@@ -411,7 +412,23 @@ void llama_expert_pool_tab_sync_impl(llama_expert_pool_state & st) {
             }
         }
     }
-    ggml_backend_tensor_set(st.tab_all, st.tab_mirror.data(), 0, n_total * sizeof(int32_t));
+    // the GPU table write uses the BACKEND iface (main graph stream): the
+    // buffer-iface tensor_set runs on the legacy per-thread stream which has
+    // no ordering with the compute stream -, the mount chain reads the table
+    // via the compute stream and can see a torn/stale table (the 8/31 D'
+    // second root cause class; the scheduler sanitizer caught it as
+    // "write-after-read on tab_all, no happens-before edge").
+    ggml_backend_tensor_set_async(st.pool_backend, st.tab_all, mir.data(), 0, n_total * sizeof(int32_t));
+    // the flush is queued after all in-flight compute on the main stream
+    // (this step's remaining layers still read the OLD table). no host sync:
+    // the next tab_sync writes the other mirror, so the source of this flush
+    // is not touched until two steps later (a ping-pong, not a wait).
+    // same flush to the CPU-hosted copy (the miss chain's get_rows reads it;
+    // 80KB host-to-host copy, executed on the sync buffer path)
+    if (st.tab_cpu != nullptr) {
+        ggml_backend_tensor_set(st.tab_cpu, mir.data(), 0, n_total * sizeof(int32_t));
+    }
+    st.tab_mirror_flip ^= 1;
 }
 
 void swap_copy_one_sync(ggml_backend_t be, ggml_tensor * src, ggml_tensor * pw, int32_t e, int32_t slot) {
