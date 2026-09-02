@@ -566,6 +566,11 @@ llama_context::~llama_context() {
         ggml_free(pool_tab_ctx);
         pool_tab_ctx = nullptr;
     }
+    mount_tab_cpu_buf.reset();
+    if (pool_tab_cpu_ctx) {
+        ggml_free(pool_tab_cpu_ctx);
+        pool_tab_cpu_ctx = nullptr;
+    }
 }
 
 void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint32_t n_seqs) {
@@ -943,6 +948,14 @@ void llama_context::expert_pool_build() {
     // each), so the CPU segment stays lookup-free.
     if (st.direct_mount) {
         pool_tab_ctx = ggml_init({ 1u*1024u*1024u, nullptr, true }); // no_alloc
+        // CPU-hosted copy of the merged table: the miss chain's get_rows reads
+        // remap_cpu from HERE (host memory), so its ids are not tied to the
+        // pool segment's 32B output slot. same [2*n_expert, n_layers] layout,
+        // filled in the same tab_sync_impl flush as tab_all.
+        pool_tab_cpu_ctx = ggml_init({ 64u*1024u, nullptr, true });
+        st.tab_cpu = ggml_new_tensor_2d(pool_tab_cpu_ctx, GGML_TYPE_I32, 2 * n_expert,
+                                        llama_model_n_layer(&model));
+        ggml_set_name(st.tab_cpu, "mnt_tab_cpu");
     }
     for (int32_t il : pooled_ils) {
         if (!st.direct_mount) {
@@ -965,6 +978,9 @@ void llama_context::expert_pool_build() {
                                    il * 2 * n_expert * i32sz);
         m.remap_cpu = ggml_view_2d(pool_tab_ctx, st.tab_all, 1, n_expert, i32sz,
                                    (il * 2 + 1) * n_expert * i32sz);
+        // CPU-side view of the host table (same offset as remap_cpu)
+        m.remap_cpu_cpu = ggml_view_2d(pool_tab_cpu_ctx, st.tab_cpu, 1, n_expert, i32sz,
+                                       (il * 2 + 1) * n_expert * i32sz);
         if (L.ffn_down_exps_s != nullptr) {
             m.scale = ggml_new_tensor_2d(pool_tab_ctx, GGML_TYPE_F32, 1, n_expert);
         }
@@ -973,6 +989,8 @@ void llama_context::expert_pool_build() {
         ggml_set_name(m.remap, nm);
         snprintf(nm, sizeof(nm), "mnt_remap_cpu_%d", il);
         ggml_set_name(m.remap_cpu, nm);
+        snprintf(nm, sizeof(nm), "mnt_remap_cpu_cpu_%d", il);
+        ggml_set_name(m.remap_cpu_cpu, nm);
         if (m.scale != nullptr) {
             snprintf(nm, sizeof(nm), "mnt_scale_%d", il);
             ggml_set_name(m.scale, nm);
@@ -995,6 +1013,15 @@ void llama_context::expert_pool_build() {
             st.direct_mount = false;
         } else {
             tab_buf.swap(mount_tab_buf);
+        }
+        // CPU-side table: allocate with the CPU buft (host memory)
+        ggml_backend_buffer_ptr tab_cpu_buf(ggml_backend_alloc_ctx_tensors_from_buft(
+                pool_tab_cpu_ctx, ggml_backend_cpu_buffer_type()));
+        if (!tab_cpu_buf) {
+            LLAMA_LOG_ERROR("%s: CPU mount table allocation failed, direct mount disabled\n", __func__);
+            st.direct_mount = false;
+        } else {
+            tab_cpu_buf.swap(mount_tab_cpu_buf);
         }
         if (!st.direct_mount) {
             // de-register the mounts of this run so the graph builder never
@@ -1984,6 +2011,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         // first graph allocation places the model weight tensors: fill the pool now
         expert_pool_fill();
+
     }
 
     // set the input data for the input tensors
@@ -5091,6 +5119,7 @@ void llama_context::expert_pool_finalize() {
         llama_expert_pool_clear_mount();
         pool_buf.reset();
         mount_tab_buf.reset();
+        mount_tab_cpu_buf.reset();
         if (pool_ctx != nullptr) {
             ggml_free(pool_ctx);
             pool_ctx = nullptr;
@@ -5099,9 +5128,16 @@ void llama_context::expert_pool_finalize() {
             ggml_free(pool_tab_ctx);
             pool_tab_ctx = nullptr;
         }
+        if (pool_tab_cpu_ctx != nullptr) {
+            ggml_free(pool_tab_cpu_ctx);
+            pool_tab_cpu_ctx = nullptr;
+        }
         // the merged table tensor died with the context: force its rebuild
         st.tab_all = nullptr;
-        st.tab_mirror.clear();
+        st.tab_cpu = nullptr;
+        for (auto & m : st.tab_mirror) {
+            m.clear();
+        }
         st.resident.assign(model.hparams.n_layer(), {});
         for (int32_t ilx = 0; ilx < n_pooled; ++ilx) {
             st.resident[st.pooled_layers[ilx]] = resident[ilx];
