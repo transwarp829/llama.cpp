@@ -33,6 +33,11 @@
 //
 // usage: llama-step-profiler -m model.gguf -p "prompt" -n 100 [-t N] [-ngl N] [--cpu-moe]
 //
+// note: by default the profiler SYNCHRONIZES after each llama_decode, so
+// wall_ms is the real per-step decode time (llama_decode is async - without
+// the sync the timestamp measures only the API submission cost). the old
+// async-only timing is kept behind STEP_PROFILE_NO_SYNC=1 (diagnostics:
+// compare submission vs execution).
 // note: the callback forces the per-node compute path, so timings are contaminated
 // (CUDA graphs disabled). routing data is timing-independent and still valid.
 
@@ -359,6 +364,13 @@ int main(int argc, char ** argv) {
 
     auto * smpl = common_sampler_init(model, params.sampling);
 
+    // sync-after-decode (default on): llama_decode is async; the wall clock is
+    // read after a device sync so it measures real execution, not submission.
+    const bool no_sync = getenv("STEP_PROFILE_NO_SYNC") != nullptr;
+    if (no_sync) {
+        LOG_WRN("%s: STEP_PROFILE_NO_SYNC=1 - wall_ms is submission time, not execution\n", __func__);
+    }
+
     // prompt step
     {
         data.steps.emplace_back();
@@ -369,6 +381,9 @@ int main(int argc, char ** argv) {
         if (llama_decode(ctx, llama_batch_get_one(tokens.data(), tokens.size()))) {
             LOG_ERR("%s: failed to eval prompt\n", __func__);
             return 1;
+        }
+        if (!no_sync) {
+            llama_synchronize(ctx);
         }
         data.steps.back().wall_ms = (ggml_time_us() - t0) / 1000.0;
         data.step_delegate.emplace_back();
@@ -399,6 +414,9 @@ int main(int argc, char ** argv) {
         if (llama_decode(ctx, llama_batch_get_one(&cur, 1))) {
             LOG_ERR("%s: failed to eval\n", __func__);
             break;
+        }
+        if (!no_sync) {
+            llama_synchronize(ctx);
         }
         data.steps.back().wall_ms = (ggml_time_us() - t0) / 1000.0;
 
