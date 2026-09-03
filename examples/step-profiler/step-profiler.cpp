@@ -53,9 +53,8 @@ enum step_cat {
 
 // column order matches one decode step's execution order (timing.csv + summary.csv)
 static const char * const csv_header =
-    "step,layer,wall_ms,attn_ms,router_ms,prep_getset_us,prep_ids_us,prep_comp_us,"
-    "end_sync_us,end_get_us,moe_ms,shared_ms,norm_ms,other_ms,submits,hit_rows,"
-    "miss_rows,gap_ms,cb_ms\n";
+    "step,layer,wall_ms,attn_ms,router_ms,moe_ms,shared_ms,norm_ms,other_ms,"
+    "hit_rows,miss_rows,gap_ms,cb_ms\n";
 
 struct step_record {
     double wall_ms = 0.0;       // total time of the llama_decode call
@@ -181,14 +180,8 @@ static void write_timing_row(std::ofstream & fout, int step, int layer, const st
     if (layer < 0) {
         fout << s.wall_ms << ","
              << s.cat_ms[CAT_ATTN] << "," << s.cat_ms[CAT_ROUTER] << ","
-             << (dl ? std::to_string(dl->prep_getset_us) : "") << ","
-             << (dl ? std::to_string(dl->prep_ids_us) : "") << ","
-             << (dl ? std::to_string(dl->prep_comp_us) : "") << ","
-             << (dl ? std::to_string(dl->end_sync_us) : "") << ","
-             << (dl ? std::to_string(dl->end_get_us) : "") << ","
              << s.cat_ms[CAT_EXPERT] << "," << s.cat_ms[CAT_SHARED] << ","
              << s.cat_ms[CAT_NORM] << "," << s.cat_ms[CAT_OTHER] << ","
-             << (dl ? std::to_string(dl->submits) : "0") << ","
              << (dl ? std::to_string(dl->hit_rows) : "0") << ","
              << (dl ? std::to_string(dl->miss_rows) : "0") << ","
              << gap_ms << "," << s.cb_ms << "\n";
@@ -351,7 +344,7 @@ int main(int argc, char ** argv) {
         LOG_ERR("failed to open %s\n", (std::string(prefix) + ".delegate.csv").c_str());
         return 1;
     }
-    f_deleg << "step,submits,hit_rows,miss_rows\n";
+    f_deleg << "step,hit_rows,miss_rows\n";
 
     std::ofstream f_rout(std::string(prefix) + ".routing.csv");
     if (!f_rout) {
@@ -395,11 +388,11 @@ int main(int argc, char ** argv) {
             write_timing_row(f_timing, 0, l, data.steps.back(),
                     find_layer_stats(data.step_delegate.back(), l));
         }
-        uint64_t ss = 0, sh = 0, sm = 0;
+        uint64_t sh = 0, sm = 0;
         for (const auto & d : data.step_delegate.back()) {
-            ss += d.submits; sh += d.hit_rows; sm += d.miss_rows;
+            sh += d.hit_rows; sm += d.miss_rows;
         }
-        f_deleg << 0 << "," << ss << "," << sh << "," << sm << "\n";
+        f_deleg << 0 << "," << sh << "," << sm << "\n";
     }
 
     // decode steps
@@ -431,11 +424,11 @@ int main(int argc, char ** argv) {
             write_timing_row(f_timing, step, l, data.steps.back(),
                     find_layer_stats(data.step_delegate.back(), l));
         }
-        uint64_t ss = 0, sh = 0, sm = 0;
+        uint64_t sh = 0, sm = 0;
         for (const auto & d : data.step_delegate.back()) {
-            ss += d.submits; sh += d.hit_rows; sm += d.miss_rows;
+            sh += d.hit_rows; sm += d.miss_rows;
         }
-        f_deleg << step << "," << ss << "," << sh << "," << sm << "\n";
+        f_deleg << step << "," << sh << "," << sm << "\n";
 
         cur = common_sampler_sample(smpl, ctx, -1);
         printf("%s", common_token_to_piece(ctx, cur).c_str());

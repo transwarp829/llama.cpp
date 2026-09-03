@@ -29,9 +29,8 @@ Four CSV files, prefix from env `STEP_PROFILE_OUT` (default `step-profile`):
   layer = -1`, mean over decode steps) and one row per layer (`step = -1`,
   layer = N, mean across decode tokens)
 - `<prefix>.routing.csv` - per step x per layer: activated expert ids
-- `<prefix>.delegate.csv` - per step: delegate submission totals
-  (`submits`, `hit_rows`, `miss_rows` - expert rows computed by the GPU pool
-  delegate vs by the CPU kernel)
+- `<prefix>.delegate.csv` - per step: `hit_rows` / `miss_rows`
+  (expert rows computed by the GPU pool chain vs by the CPU kernel)
 
 ## Column reference (both timing.csv and summary.csv use the same layout)
 
@@ -44,30 +43,20 @@ The columns follow one decode step's execution order:
 | 3 | `wall_ms` | total time of the `llama_decode` call | value | - |
 | 4 | `attn_ms` | attention time | step total | this layer |
 | 5 | `router_ms` | MoE routing (gate/top-k/weights) time | step total | this layer |
-| 6 | `prep_getset_us` | delegate: cur copy to GPU scratch (H2D prep) | step total | this layer |
-| 7 | `prep_ids_us` | delegate: hit-slot ids prepare + upload | step total | this layer |
-| 8 | `prep_comp_us` | delegate: mini-graph compute submission | step total | this layer |
-| 9 | `end_sync_us` | delegate: wait for GPU completion (sync tax) | step total | this layer |
-| 10 | `end_get_us` | delegate: D2H copy of hit rows back to CPU | step total | this layer |
-| 11 | `moe_ms` | MUL_MAT_ID node time (miss compute + end sync, total node envelope) | step total | this layer |
-| 12 | `shared_ms` | shared/dense FFN time | step total | this layer |
-| 13 | `norm_ms` | norm time | step total | this layer |
-| 14 | `other_ms` | remaining nodes | step total | this layer |
-| 15 | `submits` | delegate mini-graph submissions | step total | this layer |
-| 16 | `hit_rows` | expert rows computed by the GPU delegate | step total | this layer |
-| 17 | `miss_rows` | expert rows computed by the CPU kernel | step total | this layer |
-| 18 | `gap_ms` | `wall - sum_nodes - cb`, scheduling/sync overhead | value | - |
-| 19 | `cb_ms` | instrumentation overhead (callback time) | value | - |
+| 6 | `moe_ms` | MUL_MAT_ID node time (miss compute + end sync, total node envelope) | step total | this layer |
+| 7 | `shared_ms` | shared/dense FFN time | step total | this layer |
+| 8 | `norm_ms` | norm time | step total | this layer |
+| 9 | `other_ms` | remaining nodes | step total | this layer |
+| 10 | `hit_rows` | expert rows computed by the GPU pool chain | step total | this layer |
+| 11 | `miss_rows` | expert rows computed by the CPU kernel | step total | this layer |
+| 12 | `gap_ms` | `wall - sum_nodes - cb`, scheduling/sync overhead | value | - |
+| 13 | `cb_ms` | instrumentation overhead (callback time) | value | - |
 
 Notes:
 
-- `moe_ms` is the node-envelope time. Subtract the delegate columns
-  (`end_sync_us` + `end_get_us`) from it (in ms) to get the CPU-side expert
-  compute time.
 - Empty cells: step-level columns (`wall_ms`, `gap_ms`, `cb_ms`) have no value
   in layer rows; aggregate rows leave them empty.
-- `prep_*`/`end_*`/`submits`/`hit_rows`/`miss_rows` are empty for layers that
-  are not part of the expert pool.
+- `hit_rows`/`miss_rows` are empty for layers that are not part of the expert pool.
 - Node durations include weight loading from RAM for CPU-computed experts.
 
 A compact summary (mean wall / attn / expert / gap / cb over decode steps) is

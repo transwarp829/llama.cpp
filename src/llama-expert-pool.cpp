@@ -14,6 +14,16 @@ namespace {
     std::vector<llama_expert_pool_mount> g_mount; // indexed by layer id
 }
 
+// draft-context flag: the CPU moe delegate is a global hook and cannot tell
+// graphs apart; a draft context (MTP shares the main model's tensors) must
+// not feed the pool's routing statistics, so llama_context::decode marks the
+// calling thread while it runs a draft graph
+static thread_local bool g_draft_decode = false;
+
+void llama_expert_pool_set_draft_decode(bool on) {
+    g_draft_decode = on;
+}
+
 void llama_expert_pool_register_mount(int il, const llama_expert_pool_mount & mount) {
     if (il < 0) {
         return;
@@ -64,6 +74,7 @@ void llama_expert_pool_state::reset() {
     rt_step_done = false;
 
     swap_auto = false;
+    fill_done = false;
     win_step = 0;
     win_cnt.clear();
     win_hist.clear();
@@ -103,7 +114,9 @@ void llama_expert_pool_start_worker(llama_expert_pool_state & st) {
     if (st.cp_worker.joinable()) {
         return;
     }
-    st.cp_inflight.assign(st.pooled_layers.size(), -1);
+    // the exchange pipeline indexes cp_inflight by the actual layer number;
+    // size by the max pooled layer so a sparse pool never writes past the end
+    st.cp_inflight.assign(st.pooled_layers.empty() ? 0 : st.pooled_layers.back() + 1, -1);
     st.cp_stop = false;
     st.cp_worker = std::thread([&st]() {
         for (;;) {
@@ -191,29 +204,33 @@ bool llama_expert_pool_parse_init(const std::string & path, int32_t n_layer,
 }
 
 // random resident set per layer (fixed seed for reproducibility); samples
-// without replacement so every slot holds a distinct expert
-void llama_expert_pool_random(int32_t n_layer, int32_t n_expert, int32_t n_slot,
+// without replacement so every slot holds a distinct expert. `widths` is
+// indexed by layer number (0 = layer not pooled)
+void llama_expert_pool_random(int32_t n_layer, int32_t n_expert,
+                              const std::vector<int32_t> & widths,
                               std::vector<std::vector<int32_t>> & resident) {
-    if (n_slot > n_expert) {
-        n_slot = n_expert;
-    }
-    resident.assign(n_layer, std::vector<int32_t>(n_slot, -1));
+    resident.assign(n_layer, std::vector<int32_t>());
     std::mt19937 rng(0);
     std::vector<int32_t> perm(n_expert);
     for (int32_t e = 0; e < n_expert; ++e) {
         perm[e] = e;
     }
     for (int32_t il = 0; il < n_layer; ++il) {
-        std::shuffle(perm.begin(), perm.end(), rng);
-        for (int32_t s = 0; s < n_slot; ++s) {
-            resident[il][s] = perm[s];
+        int32_t n_slot = (size_t) il < widths.size() ? widths[il] : 0;
+        if (n_slot > n_expert) {
+            n_slot = n_expert;
         }
+        if (n_slot <= 0) {
+            continue;
+        }
+        std::shuffle(perm.begin(), perm.end(), rng);
+        resident[il].assign(perm.begin(), perm.begin() + n_slot);
     }
 }
 // -----------------------------------------------------------------------------
 // moe routing-log hook: called by the CPU MUL_MAT_ID kernel (ith==0) before
-// row grouping. collects NO rows (nothing is skipped: the -1 ids zero the
-// columns natively since PR #26631, both chains merge in the main graph);
+// row grouping. collects NO rows (nothing is skipped: the -1 skip ids zero
+// the columns natively, both chains merge in the main graph);
 // it only feeds GGML_EXPPOOL_ROUTING_LOG.
 // -----------------------------------------------------------------------------
 
@@ -222,6 +239,9 @@ void llama_expert_pool_delegate_begin(
         const int32_t ** skip_out, void * ud) {
     llama_expert_pool_state & st = *(llama_expert_pool_state *) ud;
     *skip_out = nullptr;
+    if (g_draft_decode) {
+        return;
+    }
     if (st.pooled_layers.empty()) {
         return;
     }
@@ -286,6 +306,18 @@ void llama_expert_pool_delegate_begin(
     // previous step (rt_step_done is set at the end of this hook)
     if (ilx == st.first_active_ilx && st.rt_step_done) {
         st.rt_step_done = false;
+        // new step: re-arm the per-layer counting dedup (a single active
+        // layer would otherwise be skipped forever after its first count)
+        st.count_ilx = -1;
+        st.stat_ilx  = -1;
+        if (st.rt_log != nullptr) {
+            // the routing log's step advance lived below but was dead code
+            // (this block consumes rt_step_done first); advance the log's
+            // step counter and flush the previous step's lines here instead
+            st.log_step += 1;
+            st.logged_il = -1;
+            fflush(st.rt_log);
+        }
         if (st.swap_auto && !st.win_cnt.empty()) {
             llama_expert_pool_run_swap(st);
             st.win_step += 1;
@@ -306,17 +338,9 @@ void llama_expert_pool_delegate_begin(
             }
         }
     }
-    // routing log: keep the one-token-per-line format (B=1 decode rows only)
+    // routing log: keep the one-token-per-line format (B=1 decode rows only);
+    // the step advance happens in the main advance block above
     if (ids->ne[1] == 1 && st.rt_log != nullptr) {
-        // new decode step when the FIRST mounted layer logs again after the
-        // LAST one did (a layer-id-change test breaks with one active layer)
-        if (ilx == st.first_active_ilx && st.rt_step_done) {
-            st.log_step += 1;
-            st.logged_il = -1;
-            // step boundary: flush the PREVIOUS step's lines (1 syscall/step,
-            // vs per-line fflush which cost measurable time on the hot path)
-            fflush(st.rt_log);
-        }
         if (st.logged_il != il) {
             st.logged_il = il;
             fprintf(st.rt_log, "%llu,%d", (unsigned long long) st.log_step, il);
@@ -331,7 +355,11 @@ void llama_expert_pool_delegate_begin(
     // --- stage 3 swap window: count this row's expert ids for EVERY token
     // column of the batch (multi-seq / spec verify arrive with ne[1] > 1).
     // one decode call = one window step regardless of the token count.
-    if (st.swap_auto && !st.win_cnt.empty()) {
+    // counted once per (step, layer): the hook fires per MUL_MAT_ID node
+    // (2-3 per layer) with the same ids, and the sigma gate assumes the
+    // counts are per-layer activation counts (model-agnostic)
+    if (st.swap_auto && !st.win_cnt.empty() && st.count_ilx != ilx) {
+        st.count_ilx = ilx;
         std::vector<int32_t> & hist = st.win_hist[st.win_step % st.swap_W];
         for (int64_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
             for (int id = 0; id < (int) ids->ne[0]; ++id) {
@@ -348,8 +376,10 @@ void llama_expert_pool_delegate_begin(
     }
     // hit/miss counters (direct mount: ids come from remap_cpu, so -1 is a GPU
     // pool hit and a non-negative id is the expert computed on the CPU). idle
-    // layers (active=false) are skipped by the mount gate above.
-    if (st.direct_mount) {
+    // layers (active=false) are skipped by the mount gate above. same per
+    // (step, layer) dedup as the window counting
+    if (st.direct_mount && st.stat_ilx != ilx) {
+        st.stat_ilx = ilx;
         for (int64_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
             for (int id = 0; id < (int) ids->ne[0]; ++id) {
                 const int32_t e = *((const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]));
@@ -513,6 +543,9 @@ bool llama_expert_pool_alloc_from_counts(
     size_t take = take0 + (size_t) std::min<int32_t>(freed, (int32_t) pairs.size() - (int32_t) take0);
     for (size_t i = take0; i < take; ++i) {
         const int32_t ilx = pairs[i].second / n_expert;
+        if (width[ilx] == 0) {
+            continue; // do not re-create a 1-2 slot layer the desert pass just zeroed
+        }
         width[ilx] += 1;
     }
     // build the resident vectors: slot s holds the s-th pair of the layer

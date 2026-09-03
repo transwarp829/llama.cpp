@@ -2015,7 +2015,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * up_exps_s,
          ggml_tensor * gate_exps_s,
          ggml_tensor * down_exps_s,
-         ggml_tensor * selected_experts_in) const {
+         ggml_tensor * selected_experts_in,
+         ggml_tensor * chain_weights_in) const {
     const int64_t n_embd   = cur->ne[0];
     const int64_t n_tokens = cur->ne[1];
     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
@@ -2185,7 +2186,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // chain runs inside THIS graph (chain_only over the pool weights; the
     // real layer index is passed through, so the activation variants -
     // including the swiglu_clamp limits - are identical to the main chain).
-    // PR #26631 -1 ids zero a column natively on both
+    // the -1 skip ids zero a column natively on both
     // backends, so the split is by construction: the GPU chain ids route
     // non-resident experts to -1 (zero), the CPU chain ids route resident
     // experts to -1. the merge is a single add: hit col = 0(cpu) + gpu,
@@ -2228,7 +2229,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
             // inverse table for the CPU chain: resident -> -1, non-resident ->
             // expert id, so the CPU mul_mat_id zeroes the hit columns natively
-            // (PR #26631) and computes exactly the miss columns. the table
+            // (the -1 skip ids) and computes exactly the miss columns. the table
             // read is the CPU-HOSTED copy (remap_cpu_cpu) and runs ON the CPU
             // segment (src0 on the CPU device): the GPU-side get_rows output
             // slot is shared with the pool remap and is not A1-final, so a
@@ -2270,6 +2271,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     }
 
 build_expert_chain:
+    if (chain_weights_in != nullptr) {
+        // the mounted chain (chain_only) skips the routing section, so the
+        // routing weights were never gathered; take the miss chain's weights
+        // (weight_before_ffn archs apply them pre-FFN inside the chain)
+        weights = chain_weights_in;
+    }
     if (mount_ids_cpu != nullptr) {
         // the CPU chain reads the inverse remap: resident columns are -1
         // (zeroed natively), non-resident columns keep their expert ids
@@ -2517,7 +2524,7 @@ build_expert_chain:
         mount_out = build_moe_ffn(mnt_cur, gate_inp, gate_inp_b,
             mount_p->w_up, nullptr, mount_p->w_gate, nullptr, mount_p->w_down, mount_p->w_down_b, exp_probs_b,
             n_expert, n_expert_used, type_op, norm_w, w_scale, gating_op, il,
-            mnt_cur, mount_p->w_gate_up, nullptr, nullptr, nullptr, nullptr, ids_remap);
+            mnt_cur, mount_p->w_gate_up, nullptr, nullptr, nullptr, nullptr, ids_remap, weights);
         cb(mount_out, "ffn_moe_mount", il);
 
         if (mount_scale != nullptr) {

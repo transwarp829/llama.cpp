@@ -807,6 +807,30 @@ static bool ggml_is_view_op(enum ggml_op op) {
 #define GGML_SCHED_MAX_COPIES 4
 #endif
 
+// layer-parallel split markers: the llama graph builder tags the mount
+// block head/tail and the moe gate via cb() (src/llama-graph.cpp
+// build_moe_ffn); the scheduler splits on these names. keep both sides in
+// sync when renaming (the gate prefix also covers ffn_moe_gate_up/...).
+static const char * const SPLIT_MARK_MOUNT_CUR = "ffn_moe_mount_cur";
+static const char * const SPLIT_MARK_GATE      = "ffn_moe_gate";
+static const char * const SPLIT_MARK_OUT       = "ffn_moe_out";
+static const char * const SPLIT_MARK_MOUNT     = "ffn_moe_mount";
+
+static bool split_name_is(const struct ggml_tensor * t, const char * prefix, size_t len) {
+    return t != NULL && t->name != NULL && strncmp(t->name, prefix, len) == 0;
+}
+
+// env gates read once (they sit on the per-split hot path)
+static bool split_early_off() {
+    static const bool v = getenv("GGML_EXPPOOL_EARLY_OFF") != nullptr;
+    return v;
+}
+
+static int split_op_min_batch() {
+    static const int v = getenv("GGML_OP_OFFLOAD_MIN_BATCH") ? atoi(getenv("GGML_OP_OFFLOAD_MIN_BATCH")) : 32;
+    return v;
+}
+
 struct ggml_backend_sched_split {
     int backend_id;
     int i_start;
@@ -1389,24 +1413,23 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             // is the same env as the CUDA backend (GGML_OP_OFFLOAD_MIN_BATCH,
             // default 32); the batch of a MUL_MAT_ID / the mount block head
             // is its ne[2].
-            static const int op_min_batch = getenv("GGML_OP_OFFLOAD_MIN_BATCH") ? atoi(getenv("GGML_OP_OFFLOAD_MIN_BATCH")) : 32;
             if (sched->layer_parallel && node->name != NULL &&
                 (node_backend_id == cur_backend_id || ggml_is_view_op(node->op)) &&
                 node_backend_id != sched->n_backends - 1) {
-                const bool is_moe_head = strncmp(node->name, "ffn_moe_mount_cur", 17) == 0 ||
-                                         strncmp(node->name, "ffn_moe_gate", 12) == 0;
+                const bool is_moe_head = split_name_is(node, SPLIT_MARK_MOUNT_CUR, 17) ||
+                                         split_name_is(node, SPLIT_MARK_GATE, 12);
                 if (is_moe_head) {
                     layer_T = node->ne[2];
                 }
-                const bool small_batch = layer_T >= 0 && layer_T < op_min_batch;
+                const bool small_batch = layer_T >= 0 && layer_T < split_op_min_batch();
                 if (sched->layer_parallel && small_batch) {
-                    if (strncmp(node->name, "ffn_moe_mount_cur", 17) == 0) {
+                    if (split_name_is(node, SPLIT_MARK_MOUNT_CUR, 17)) {
                         mount_block = true;
                         need_new_split = true;
-                    } else if (strncmp(node->name, "ffn_moe_out", 11) == 0) {
+                    } else if (split_name_is(node, SPLIT_MARK_OUT, 11)) {
                         mount_block = false;
                         need_new_split = true;
-                    } else if (!mount_block && strncmp(node->name, "ffn_moe_gate", 12) == 0) {
+                    } else if (!mount_block && split_name_is(node, SPLIT_MARK_GATE, 12)) {
                         need_new_split = true;
                     }
                 }
@@ -1857,8 +1880,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             for (int64_t i0 = 0; i0 < ids_tensor->ne[0]; i0++) {
                                 int32_t id = ids[i1 * ids_tensor->nb[1]/sizeof(int32_t) + i0 * ids_tensor->nb[0]/sizeof(int32_t)];
                                 if (id == -1) {
-                                    // skipped column (PR #26631 -1 ids): the
-                                    // kernel zeroes it - no weight range needed
+                                    // skipped column (-1 skip ids): the kernel
+                                    // zeroes it - no weight range needed
                                     continue;
                                 }
                                 GGML_ASSERT(id >= 0 && id < n_expert);
@@ -1953,11 +1976,11 @@ compute_this_split:;
         // CPU miss split's critical path (the miss processing runs while the
         // GPU executes A1 + mount).
         if (sched->layer_parallel && !sched->callback_eval &&
-            getenv("GGML_EXPPOOL_EARLY_OFF") == nullptr &&
+            !split_early_off() &&
             !split->submitted_early &&
             split_backend_id != sched->n_backends - 1 &&
             split->graph.n_nodes > 0 && split->graph.nodes[0]->name != NULL &&
-            strncmp(split->graph.nodes[0]->name, "ffn_moe_gate", 12) == 0 &&
+            split_name_is(split->graph.nodes[0], SPLIT_MARK_GATE, 12) &&
             split_id + 1 < sched->n_splits) {
             // TEMP (9/2): early submit the mounted chain for every batch size:
             // find the next pure mount split (ffn_moe_gate + ffn_moe_mount
@@ -1969,16 +1992,15 @@ compute_this_split:;
                     continue; // the CPU miss split of this layer - skip it
                 }
                 if (cand->graph.n_nodes > 0 && cand->graph.nodes[0]->name != NULL &&
-                    (strncmp(cand->graph.nodes[0]->name, "ffn_moe_mount_cur", 17) == 0 ||
-                     strncmp(cand->graph.nodes[0]->name, "ffn_moe_gate", 12) == 0)) {
+                    (split_name_is(cand->graph.nodes[0], SPLIT_MARK_MOUNT_CUR, 17) ||
+                     split_name_is(cand->graph.nodes[0], SPLIT_MARK_GATE, 12))) {
                     // only the mounted (pool) chain qualifies: the split must
                     // contain a ffn_moe_mount node. plain MoE segments (e.g.
                     // draft/MTP graphs without the pool) have gate nodes too,
                     // but no mount chain - never submit those ahead.
                     bool has_mount = false;
                     for (int k = 0; k < cand->graph.n_nodes; k++) {
-                        if (cand->graph.nodes[k]->name != NULL &&
-                            strncmp(cand->graph.nodes[k]->name, "ffn_moe_mount", 13) == 0) {
+                        if (split_name_is(cand->graph.nodes[k], SPLIT_MARK_MOUNT, 13)) {
                             has_mount = true;
                             break;
                         }
@@ -1989,9 +2011,8 @@ compute_this_split:;
                         // too (selective expert copy), the mount block is
                         // inside the natural layer run: never submit ahead,
                         // the native path must run untouched.
-                        static const int op_min_batch = getenv("GGML_OP_OFFLOAD_MIN_BATCH") ? atoi(getenv("GGML_OP_OFFLOAD_MIN_BATCH")) : 32;
                         const int64_t cand_T = cand->graph.nodes[0]->ne[2];
-                        if (cand_T >= op_min_batch) {
+                        if (cand_T >= split_op_min_batch()) {
                             break;
                         }
                         nxt = cand;

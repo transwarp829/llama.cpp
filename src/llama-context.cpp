@@ -701,6 +701,10 @@ void llama_context::expert_pool_init() {
             }
         }
         ggml_cpu_set_moe_delegate(llama_expert_pool_delegate_begin, &st);
+        // no mounts in this mode: every pooled layer is "active" for the
+        // step-boundary anchors (the hook fires for all of them in order)
+        st.first_active_ilx = 0;
+        st.last_active_ilx  = (int32_t) st.pooled_layers.size() - 1;
         LLAMA_LOG_INFO("%s: routing-log-only mode (%d MoE layers, no delegation)\n",
                 __func__, (int) st.pooled_layers.size());
         return;
@@ -781,10 +785,29 @@ void llama_context::expert_pool_init() {
         return;
     }
 
-    const int32_t n_pooled = (int32_t) pooled_ils.size();
+    int32_t n_pooled = (int32_t) pooled_ils.size();
+    // uniform width from the budget. the desert rule (same as the realloc:
+    // fewer than 3 slots per layer is not worth the mount roundtrip) trims
+    // the pooled set instead of spreading the budget thin, and the total
+    // slot count stays exactly at the budget (remainder to the first layers)
     int32_t n_slot = cparams.expert_pool / n_pooled;
-    if (n_slot <= 0) {
-        n_slot = 1;
+    int32_t rem    = cparams.expert_pool % n_pooled;
+    if (n_slot > 0 && n_slot < 3) {
+        const int32_t n_pooled_all = n_pooled;
+        const int32_t n_keep = std::min(n_pooled, cparams.expert_pool / 3);
+        if (n_keep <= 0) {
+            LLAMA_LOG_WARN("%s: expert pool budget %d too small for %d pooled layers (min 3 slots each), pool disabled\n",
+                    __func__, cparams.expert_pool, n_pooled_all);
+            return;
+        }
+        // keep the first n_keep pooled layers (layer order); the segment-end
+        // realloc re-ranks from the cumulative counts anyway
+        pooled_ils.resize(n_keep);
+        n_slot = cparams.expert_pool / n_keep;
+        rem    = cparams.expert_pool % n_keep;
+        n_pooled = n_keep;
+        LLAMA_LOG_WARN("%s: budget %d < 3 slots x %d pooled layers: pooled %d layers x ~%d slots (desert rule)\n",
+                __func__, cparams.expert_pool, n_pooled_all, n_keep, n_slot);
     }
 
     st.enabled = true;
@@ -812,6 +835,12 @@ void llama_context::expert_pool_init() {
                        "saturating to full coverage per layer\n",
                 __func__, cparams.expert_pool, n_pooled, n_expert);
         n_slot = n_expert;
+        rem    = 0;
+    }
+    // per-layer widths: uniform n_slot, the budget remainder to the first layers
+    std::vector<int32_t> widths(n_layer, 0);
+    for (size_t i = 0; i < pooled_ils.size(); ++i) {
+        widths[pooled_ils[i]] = n_slot + ((int32_t) i < rem ? 1 : 0);
     }
     st.seg_cnt.assign((size_t) n_pooled * n_expert, 0);
     if (cparams.expert_pool_init && cparams.expert_pool_init[0]) {
@@ -820,7 +849,7 @@ void llama_context::expert_pool_init() {
         if (!ok) {
             LLAMA_LOG_WARN("%s: failed to read GGML_EXPPOOL_INIT_CSV '%s', falling back to random\n",
                     __func__, cparams.expert_pool_init);
-            llama_expert_pool_random(n_layer, n_expert, n_slot, st.resident);
+            llama_expert_pool_random(n_layer, n_expert, widths, st.resident);
         }
         st.pool_ready = true;
         expert_pool_build();
@@ -831,7 +860,7 @@ void llama_context::expert_pool_init() {
     // shape costs less than 7% vs the global top-N at the same budget, while
     // a random+swap pool beats a stale csv seed; the segment-end realloc
     // refines the widths once the cumulative counts accumulate)
-    llama_expert_pool_random(n_layer, n_expert, n_slot, st.resident);
+    llama_expert_pool_random(n_layer, n_expert, widths, st.resident);
     st.pool_ready = true;
     expert_pool_build();
 }
@@ -842,6 +871,13 @@ void llama_context::expert_pool_build() {
     const std::vector<int32_t> & pooled_ils = st.pooled_layers;
     const int32_t n_pooled = (int32_t) pooled_ils.size();
 
+    // a rebuild (segment-end realloc) leaves stale pointers in layers that
+    // lost all slots; clear so a zero-slot layer never touches a freed pool
+    std::fill(st.w_pool_gate_up.begin(), st.w_pool_gate_up.end(), nullptr);
+    std::fill(st.w_pool_up.begin(),     st.w_pool_up.end(),     nullptr);
+    std::fill(st.w_pool_gate.begin(),   st.w_pool_gate.end(),   nullptr);
+    std::fill(st.w_pool_down.begin(),   st.w_pool_down.end(),   nullptr);
+
     // --- create pool weight tensors ---
     pool_ctx = ggml_init({ 4u*1024u*1024u, nullptr, true }); // no_alloc = true (allocated via buft)
 
@@ -851,7 +887,7 @@ void llama_context::expert_pool_build() {
         // zero-slot layers get no pool tensors (the layer falls back to CPU).
         // COMPACT layout: slot s holds resident expert res[s] (S slots, no
         // zero padding). non-resident experts route to -1 in the GPU remap
-        // (PR #26631 skip -> exact zero), so no sentinel slice is needed.
+        // (the -1 skip ids -> exact zero), so no sentinel slice is needed.
         // keeping ne2 = S (not n_expert) matters for the MMQ kernel: its
         // prep work (quantize/grouping) scales with the slot count, and the
         // 128-slot identity layout cost ~7.5x there (measured 2.65 vs
@@ -2461,7 +2497,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
         // expose the current ubatch to the eval-callback bridge (routing capture)
         ctx_ubatch       = &ubatch;
         last_ec_ids      = nullptr;
+        // draft contexts must not feed the expert pool's routing statistics
+        // (the global CPU moe delegate cannot tell graphs apart)
+        llama_expert_pool_set_draft_decode(cparams.ctx_other != nullptr);
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
+        llama_expert_pool_set_draft_decode(false);
         ctx_ubatch       = nullptr;
 
         if (!res) {
@@ -5058,15 +5098,9 @@ uint32_t llama_context::expert_pool_stats_snapshot(llama_expert_pool_layer_stats
     }
     const uint32_t n = (uint32_t) std::min((size_t) max_layers, st.pooled_layers.size());
     for (uint32_t i = 0; i < n; ++i) {
-        out[i].layer      = st.pooled_layers[i];
-        out[i].submits    = 0;
-        out[i].hit_rows   = st.stat_hit[i];
-        out[i].miss_rows  = st.stat_miss[i];
-        out[i].prep_getset_us = 0;
-        out[i].prep_ids_us    = 0;
-        out[i].prep_comp_us   = 0;
-        out[i].end_sync_us    = 0;
-        out[i].end_get_us     = 0;
+        out[i].layer     = st.pooled_layers[i];
+        out[i].hit_rows  = st.stat_hit[i];
+        out[i].miss_rows = st.stat_miss[i];
     }
     // snapshot semantics: returns the totals since the previous call (per
     // decode-step usage resets after each read)
@@ -5123,6 +5157,21 @@ void llama_context::expert_pool_finalize() {
         if (!changed) {
             return;
         }
+        // stop the swap-copy worker and drain its queues first: the rebuild
+        // below frees the pool tensors the worker may still be copying into
+        // (a stale request would also index the narrower new pool out of bounds)
+        {
+            std::lock_guard<std::mutex> lk(st.cp_mtx);
+            st.cp_stop = true;
+            st.cp_todo.clear();
+            st.cp_done.clear();
+        }
+        st.cp_cv.notify_all();
+        if (st.cp_worker.joinable()) {
+            st.cp_worker.join();
+        }
+        st.cp_stop = false;
+        st.cp_inflight.clear();
         // rebuild: the old pool tensors/tables go away with their contexts.
         // the sched may still run in-flight async copies (the marginal-swap
         // pipeline issues them per step): synchronize before freeing.
