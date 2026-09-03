@@ -22,7 +22,7 @@
 // the routing tables that split the two chains of the direct mount.
 // the pool starts from a csv seed (GGML_EXPPOOL_INIT_CSV, debug) or
 // random; the marginal exchange refreshes the content per step and the
-// segment-end reallocation refits the slot widths (see 阶段3-设计.md).
+// segment-end reallocation refits the slot widths (see the stage-3 design doc).
 struct llama_expert_pool_state {
     bool enabled = false;
 
@@ -51,7 +51,7 @@ struct llama_expert_pool_state {
     bool fill_done = false;
 
     // direct mount (GGML_EXPPOOL_MOUNT=0 disables it): a second GPU-resident
-    // expert chain runs inside the main graph; PR #26631 -1 ids zero the
+    // expert chain runs inside the main graph; the -1 skip ids zero the
     // non-resident columns on the GPU chain (and the resident columns on the
     // CPU chain via the inverse table), so no delegate hook is needed
     bool direct_mount = false;
@@ -81,6 +81,11 @@ struct llama_expert_pool_state {
     int32_t win_step = 0;                  // decode steps accounted in the window
     std::vector<int32_t> win_cnt;          // [pooled layers * n_expert]
     std::vector<std::vector<int32_t>> win_hist; // [W] flat (ilx, e) pairs per step
+    // per-step per-layer dedup markers: the hook fires once per MUL_MAT_ID
+    // node (2-3 per layer per step) and the ids are identical across a
+    // layer's nodes, so the window/hit-miss counting runs once per layer
+    int32_t count_ilx = -1;                // last layer counted into the window
+    int32_t stat_ilx  = -1;                // last layer counted into the stats
 
     // built flag: expert_pool_build() has run (sched_reserve() re-enters
     // expert_pool_init after a rebuild, and a reset() would wipe the fresh
@@ -140,8 +145,9 @@ struct llama_expert_pool_state {
     std::deque<pending_exchange> cp_todo;    // requests, worker pops
     std::deque<pending_exchange> cp_done;    // completed, step consumes
     bool cp_stop = false;                    // worker shutdown flag
-    std::vector<int32_t> cp_inflight;        // [pooled layers] slot of an in-flight fill
-                                             // (or -1); protects against double-fill
+    std::vector<int32_t> cp_inflight;        // [max pooled layer + 1] slot of an
+                                             // in-flight fill (or -1), indexed by
+                                             // layer number; double-fill protection
 
     // merged mount tables (9/1): all layers' remap/remap_cpu live in ONE
     // contiguous [2*n_expert, n_layers] I32 tensor; each layer's views are
@@ -171,8 +177,10 @@ bool llama_expert_pool_parse_init(const std::string & path, int32_t n_layer,
                                   int32_t n_expert,
                                   std::vector<std::vector<int32_t>> & resident);
 
-// random resident set per layer (fixed seed, reproducible)
-void llama_expert_pool_random(int32_t n_layer, int32_t n_expert, int32_t n_slot,
+// random resident set per layer (fixed seed, reproducible); `widths` is
+// indexed by layer number (0 = layer not pooled)
+void llama_expert_pool_random(int32_t n_layer, int32_t n_expert,
+                              const std::vector<int32_t> & widths,
                               std::vector<std::vector<int32_t>> & resident);
 
 // moe routing-log hook: called by the CPU MUL_MAT_ID kernel (ith==0), feeds
@@ -181,6 +189,11 @@ void llama_expert_pool_random(int32_t n_layer, int32_t n_expert, int32_t n_slot,
 void llama_expert_pool_delegate_begin(
         ggml_tensor * src0, ggml_tensor * src1, ggml_tensor * ids, ggml_tensor * dst,
         const int32_t ** skip_out, void * ud);
+
+// mark the calling thread as running a draft-context graph: the CPU moe
+// delegate is global and cannot tell contexts apart, so draft rows (MTP
+// shares the main model's tensors) must not feed the pool statistics
+void llama_expert_pool_set_draft_decode(bool on);
 
 // stage 3: one marginal exchange per pooled layer per step. called at a
 // decode step boundary from the delegate hook (swap is on by default with -nep).
@@ -202,7 +215,7 @@ bool llama_expert_pool_alloc_from_counts(
 // ---------------------------------------------------------------
 // direct mount (main-graph execution): per-layer tensors that let
 // build_moe_ffn run a second, GPU-resident chain over the pool
-// weights inside the MAIN graph. PR #26631 -1 ids zero the matching
+// weights inside the MAIN graph. the -1 skip ids zero the matching
 // column, so the two chains split the columns by construction:
 // remap (device, for the GPU chain) sends non-resident experts to -1,
 // remap_cpu (host, for the CPU chain) sends resident experts to -1.

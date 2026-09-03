@@ -794,16 +794,16 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
                 if (d.dev == dev_out) { dev_known = true; break; }
             }
             if (!dev_known) {
-            if (dmodel->out_host == nullptr) {
-                dmodel->out_ctx = ggml_init({ ggml_nbytes(output) + ggml_tensor_overhead(), nullptr, true });
-                dmodel->out_host = ggml_new_tensor_2d(dmodel->out_ctx, output->type, output->ne[0], output->ne[1]);
-                ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(dmodel->out_ctx, ggml_backend_cpu_buffer_type());
-                if (buf == nullptr) {
-                    GGML_ABORT("DFlash: failed to allocate host copy of the target lm_head");
+                if (dmodel->out_host == nullptr) {
+                    dmodel->out_ctx = ggml_init({ ggml_nbytes(output) + ggml_tensor_overhead(), nullptr, true });
+                    dmodel->out_host = ggml_new_tensor_2d(dmodel->out_ctx, output->type, output->ne[0], output->ne[1]);
+                    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(dmodel->out_ctx, ggml_backend_cpu_buffer_type());
+                    if (buf == nullptr) {
+                        GGML_ABORT("DFlash: failed to allocate host copy of the target lm_head");
+                    }
+                    dmodel->out_buf.reset(buf);
+                    ggml_backend_tensor_copy(output, dmodel->out_host);
                 }
-                dmodel->out_buf.reset(buf);
-                ggml_backend_tensor_copy(output, dmodel->out_host);
-            }
                 output    = dmodel->out_host;
                 output_s  = nullptr; // the target head's scale tensor is not copied; not carried by DFlash/DSpark paths
             }
@@ -1032,16 +1032,16 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llama_model & model, const llm_
                 if (d.dev == dev_out) { dev_known = true; break; }
             }
             if (!dev_known) {
-            if (dmodel->out_host == nullptr) {
-                dmodel->out_ctx = ggml_init({ ggml_nbytes(output) + ggml_tensor_overhead(), nullptr, true });
-                dmodel->out_host = ggml_new_tensor_2d(dmodel->out_ctx, output->type, output->ne[0], output->ne[1]);
-                ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(dmodel->out_ctx, ggml_backend_cpu_buffer_type());
-                if (buf == nullptr) {
-                    GGML_ABORT("DSpark: failed to allocate host copy of the target lm_head");
+                if (dmodel->out_host == nullptr) {
+                    dmodel->out_ctx = ggml_init({ ggml_nbytes(output) + ggml_tensor_overhead(), nullptr, true });
+                    dmodel->out_host = ggml_new_tensor_2d(dmodel->out_ctx, output->type, output->ne[0], output->ne[1]);
+                    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(dmodel->out_ctx, ggml_backend_cpu_buffer_type());
+                    if (buf == nullptr) {
+                        GGML_ABORT("DSpark: failed to allocate host copy of the target lm_head");
+                    }
+                    dmodel->out_buf.reset(buf);
+                    ggml_backend_tensor_copy(output, dmodel->out_host);
                 }
-                dmodel->out_buf.reset(buf);
-                ggml_backend_tensor_copy(output, dmodel->out_host);
-            }
                 output    = dmodel->out_host;
                 output_s  = nullptr; // the target head's scale tensor is not copied; not carried by DFlash/DSpark paths
             }
