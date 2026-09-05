@@ -103,7 +103,7 @@ struct llama_expert_pool_state {
     // decayed, so the prefill's small under-count is negligible noise.
     std::vector<int32_t> seg_cnt;          // [pooled layers * n_expert]
     // per-pooled-layer hit/miss counters (direct mount: the CPU segment
-    // receives remap_cpu ids, so e < 0 means the GPU pool chain computed the
+    // receives remap_inv ids, so e < 0 means the GPU pool chain computed the
     // row and e >= 0 is a CPU miss); read (and cleared) via
     // llama_expert_pool_get_stats
     std::vector<uint64_t> stat_hit;        // [pooled layers]
@@ -149,12 +149,12 @@ struct llama_expert_pool_state {
                                              // in-flight fill (or -1), indexed by
                                              // layer number; double-fill protection
 
-    // merged mount tables (9/1): all layers' remap/remap_cpu live in ONE
+    // merged mount tables (9/1): all layers' remap/remap_inv live in ONE
     // contiguous [2*n_expert, n_layers] I32 tensor; each layer's views are
     // sliced from it. the host mirror is rebuilt from resident[] once per
     // step and flushed with a single tensor_set (step-granular swap update).
     ggml_tensor * tab_all = nullptr;             // [2*n_expert, n_layers]
-    // 9/1: CPU-hosted mirror of the remap_cpu half of tab_all (same layout),
+    // 9/1: CPU-hosted mirror of the remap_inv half of tab_all (same layout),
     // read by the CPU-segment get_rows of the miss chain. updated in the same
     // tab_sync_impl flush. keeps the CPU chain independent of the pool
     // segment's 32B output slot race.
@@ -218,9 +218,9 @@ bool llama_expert_pool_alloc_from_counts(
 // weights inside the MAIN graph. the -1 skip ids zero the matching
 // column, so the two chains split the columns by construction:
 // remap (device, for the GPU chain) sends non-resident experts to -1,
-// remap_cpu (host, for the CPU chain) sends resident experts to -1.
+// remap_inv (host, for the CPU chain) sends resident experts to -1.
 // a single add merges both chains.
-// NOTE: remap/remap_cpu are I32: ggml_get_rows supports I32 tables natively
+// NOTE: remap/remap_inv are I32: ggml_get_rows supports I32 tables natively
 // (the output type follows the table, ggml.c) on every backend, so the ids
 // gathering needs no cast. the F32 REPEAT gate on CUDA only matters for the
 // scale tables, which are F32.
@@ -236,11 +236,10 @@ struct llama_expert_pool_mount {
                                        // it a no-op for skipped columns)
     ggml_tensor * remap     = nullptr; // I32 [1, n_expert] on the pool device:
                                        // resident -> pool slot, non-resident -> -1
-    ggml_tensor * remap_cpu = nullptr; // I32 [1, n_expert] on the pool device:
-                                       // resident -> -1, non-resident -> expert id
-    ggml_tensor * remap_cpu_cpu = nullptr; // I32 [1, n_expert] on the CPU device:
-                                           // same content as remap_cpu, for the
-                                           // CPU-segment get_rows (host mirror)
+    ggml_tensor * remap_inv_host = nullptr; // I32 [1, n_expert] on the CPU device:
+                                           // resident -> -1, non-resident -> expert id
+                                           // (CPU-segment get_rows host mirror; the
+                                           // GPU side has NO inv table - only remap)
     ggml_tensor * scale     = nullptr; // F32 [1, n_expert] on the pool device:
                                        // per-expert down scale (null = no scale)
 };

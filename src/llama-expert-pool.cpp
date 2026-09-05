@@ -374,7 +374,7 @@ void llama_expert_pool_delegate_begin(
             }
         }
     }
-    // hit/miss counters (direct mount: ids come from remap_cpu, so -1 is a GPU
+    // hit/miss counters (direct mount: ids come from remap_inv, so -1 is a GPU
     // pool hit and a non-negative id is the expert computed on the CPU). idle
     // layers (active=false) are skipped by the mount gate above. same per
     // (step, layer) dedup as the window counting
@@ -410,16 +410,18 @@ namespace {
 // rebuild the merged host mirror from resident[] and flush it to the device
 // with ONE tensor_set (step-granular swap update: one API per step, no
 // per-layer table writes). mirror layout: [2*n_expert, n_layers]; layer il =
-// [il*2*n_expert + e] remap, [+n_expert] remap_cpu (ordered like tab_all).
+// [il*2*n_expert + e] remap, [+n_expert] remap_inv (the inv half is copied to
+// tab_cpu only - tab_all on the GPU holds just the remap half).
 void llama_expert_pool_tab_sync_impl(llama_expert_pool_state & st) {
     if (st.tab_all == nullptr) {
         return;
     }
     const int32_t n_expert = st.n_expert;
     const size_t n_total = (size_t) st.tab_all->ne[0] * (size_t) st.tab_all->ne[1];
+    const size_t n_half  = n_total; // one half of the mirror (remap or inv) per table
     std::vector<int32_t> & mir = st.tab_mirror[st.tab_mirror_flip];
-    if (mir.size() != n_total) {
-        mir.assign(n_total, -1);
+    if (mir.size() != 2 * n_total) {
+        mir.assign(2 * n_total, -1);
     }
     for (int32_t il : st.pooled_layers) {
         const llama_expert_pool_mount & m = llama_expert_pool_get_mount(il);
@@ -427,8 +429,8 @@ void llama_expert_pool_tab_sync_impl(llama_expert_pool_state & st) {
             continue;
         }
         const std::vector<int32_t> & res = st.resident[il];
-        int32_t * rmp    = mir.data() + il * 2 * n_expert;
-        int32_t * rmp_cu = rmp + n_expert;
+        int32_t * rmp    = mir.data() + il * n_expert;
+        int32_t * rmp_cu = mir.data() + n_half + il * n_expert;
         // default: nothing resident (remap -1, inverse = its own id)
         for (int32_t e = 0; e < n_expert; ++e) {
             rmp[e] = -1;
@@ -448,7 +450,7 @@ void llama_expert_pool_tab_sync_impl(llama_expert_pool_state & st) {
     // via the compute stream and can see a torn/stale table (the 8/31 D'
     // second root cause class; the scheduler sanitizer caught it as
     // "write-after-read on tab_all, no happens-before edge").
-    ggml_backend_tensor_set_async(st.pool_backend, st.tab_all, mir.data(), 0, n_total * sizeof(int32_t));
+    ggml_backend_tensor_set_async(st.pool_backend, st.tab_all, mir.data(), 0, n_half * sizeof(int32_t));
     // the flush is queued after all in-flight compute on the main stream
     // (this step's remaining layers still read the OLD table). no host sync:
     // the next tab_sync writes the other mirror, so the source of this flush
@@ -456,7 +458,7 @@ void llama_expert_pool_tab_sync_impl(llama_expert_pool_state & st) {
     // same flush to the CPU-hosted copy (the miss chain's get_rows reads it;
     // 80KB host-to-host copy, executed on the sync buffer path)
     if (st.tab_cpu != nullptr) {
-        ggml_backend_tensor_set(st.tab_cpu, mir.data(), 0, n_total * sizeof(int32_t));
+        ggml_backend_tensor_set(st.tab_cpu, mir.data() + n_half, 0, n_half * sizeof(int32_t));
     }
     st.tab_mirror_flip ^= 1;
 }
