@@ -2486,18 +2486,22 @@ build_expert_chain:
         cb(mount_out, "ffn_moe_mount", il);
     }
 
-    if (!weight_before_ffn) {
-        experts = ggml_mul(ctx0, experts, weights);
-        cb(experts, "ffn_moe_weighted", il);
-    }
+    // the miss columns are weighted once below, on the merge result (see the
+    // mount merge block); only the plain (no-pool) chain weights here
+    if (mount_out == nullptr) {
+        if (!weight_before_ffn) {
+            experts = ggml_mul(ctx0, experts, weights);
+            cb(experts, "ffn_moe_weighted", il);
+        }
 
-    if (mount_scale != nullptr) {
-        // down scale gathered on the GPU segment from the same topk ids and
-        // handed to the CPU segment as a split input; the -1 ids keep the
-        // skipped columns zero on the CPU chain too, so 0*any_scale = 0 -
-        // exact.
-        experts = ggml_mul(ctx0, experts, mount_scale);
-        cb(experts, "ffn_moe_cpu_scaled", il);
+        if (mount_scale != nullptr) {
+            // down scale gathered on the GPU segment from the same topk ids and
+            // handed to the CPU segment as a split input; the -1 ids keep the
+            // skipped columns zero on the CPU chain too, so 0*any_scale = 0 -
+            // exact.
+            experts = ggml_mul(ctx0, experts, mount_scale);
+            cb(experts, "ffn_moe_cpu_scaled", il);
+        }
     }
 
     ggml_build_forward_expand(gf, experts);
