@@ -195,16 +195,10 @@ static void write_timing_row(std::ofstream & fout, int step, int layer, const st
         const double other  = layer < (int) lc[CAT_OTHER].size()  ? lc[CAT_OTHER][layer]  : 0.0;
         fout << ","
              << attn << "," << router << ","
-             << (dl ? std::to_string(dl->prep_getset_us) : "") << ","
-             << (dl ? std::to_string(dl->prep_ids_us) : "") << ","
-             << (dl ? std::to_string(dl->prep_comp_us) : "") << ","
-             << (dl ? std::to_string(dl->end_sync_us) : "") << ","
-             << (dl ? std::to_string(dl->end_get_us) : "") << ","
              << moe << "," << shared << "," << norm << "," << other << ","
-             << (dl ? std::to_string(dl->submits) : "0") << ","
              << (dl ? std::to_string(dl->hit_rows) : "0") << ","
              << (dl ? std::to_string(dl->miss_rows) : "0")
-             << ",,\n"; // gap/cb are step-level only
+             << ",,\n"; // wall/gap/cb are step-level only
     }
     fout.flush();
 }
@@ -459,39 +453,29 @@ int main(int argc, char ** argv) {
         for (int c = 0; c < CAT_COUNT; ++c) {
             run.cat_ms[c] /= nd;
         }
-        uint64_t r_submits = 0, r_hit = 0, r_miss = 0, r_gs = 0, r_ids = 0, r_comp = 0, r_sync = 0, r_get = 0;
-        std::vector<uint64_t> l_submits(data.n_layers, 0), l_hit(data.n_layers, 0), l_miss(data.n_layers, 0),
-                              l_gs(data.n_layers, 0), l_ids(data.n_layers, 0), l_comp(data.n_layers, 0),
-                              l_sync(data.n_layers, 0), l_get(data.n_layers, 0);
+        uint64_t r_hit = 0, r_miss = 0;
+        std::vector<uint64_t> l_hit(data.n_layers, 0), l_miss(data.n_layers, 0);
         for (size_t i = 1; i < data.steps.size(); ++i) {
             for (const auto & d : data.step_delegate[i]) {
-                r_submits += d.submits; r_hit += d.hit_rows; r_miss += d.miss_rows;
-                r_gs += d.prep_getset_us; r_ids += d.prep_ids_us; r_comp += d.prep_comp_us;
-                r_sync += d.end_sync_us; r_get += d.end_get_us;
+                r_hit += d.hit_rows; r_miss += d.miss_rows;
                 if (d.layer >= 0 && d.layer < (int) data.n_layers) {
-                    l_submits[d.layer] += d.submits; l_hit[d.layer] += d.hit_rows; l_miss[d.layer] += d.miss_rows;
-                    l_gs[d.layer] += d.prep_getset_us; l_ids[d.layer] += d.prep_ids_us; l_comp[d.layer] += d.prep_comp_us;
-                    l_sync[d.layer] += d.end_sync_us; l_get[d.layer] += d.end_get_us;
+                    l_hit[d.layer] += d.hit_rows; l_miss[d.layer] += d.miss_rows;
                 }
             }
         }
         {
-            const double subs = r_submits / nd, hit = r_hit / nd, miss = r_miss / nd;
-            const double gs = r_gs / nd, ids = r_ids / nd, comp = r_comp / nd, sync = r_sync / nd, get = r_get / nd;
+            const double hit = r_hit / nd, miss = r_miss / nd;
             f_summary << "-1,-1," << run.wall_ms << "," << run.cat_ms[CAT_ATTN] << "," << run.cat_ms[CAT_ROUTER] << ","
-                      << gs << "," << ids << "," << comp << "," << sync << "," << get << ","
                       << run.cat_ms[CAT_EXPERT] << "," << run.cat_ms[CAT_SHARED] << "," << run.cat_ms[CAT_NORM] << ","
-                      << run.cat_ms[CAT_OTHER] << "," << subs << "," << hit << "," << miss << ","
+                      << run.cat_ms[CAT_OTHER] << "," << hit << "," << miss << ","
                       << std::max(0.0, run.wall_ms - run.sum_nodes_ms - run.cb_ms) << "," << run.cb_ms << "\n";
         }
         for (int l = 0; l < (int) data.n_layers; ++l) {
             f_summary << "-1," << l << ","
                       << run.cat_ms[CAT_ATTN] << "," << run.cat_ms[CAT_ROUTER] << ","
-                      << (l_gs[l] / nd) << "," << (l_ids[l] / nd) << "," << (l_comp[l] / nd) << ","
-                      << (l_sync[l] / nd) << "," << (l_get[l] / nd) << ","
                       << run.cat_ms[CAT_EXPERT] << "," << run.cat_ms[CAT_SHARED] << "," << run.cat_ms[CAT_NORM] << ","
                       << run.cat_ms[CAT_OTHER] << ","
-                      << (l_submits[l] / nd) << "," << (l_hit[l] / nd) << "," << (l_miss[l] / nd) << ",,\n";
+                      << (l_hit[l] / nd) << "," << (l_miss[l] / nd) << ",,\n";
         }
         f_summary.flush();
     }

@@ -2217,8 +2217,16 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             ggml_tensor * ids_c = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_expert_used, n_tokens);
             ggml_tensor * ids_cpy = ggml_cpy(ctx0, selected_experts, ids_c);
             ggml_tensor * ids_flat = ggml_reshape_2d(ctx0, ids_cpy, n_expert_used * n_tokens, 1);
-            ggml_tensor * remap3 = ggml_reshape_3d(ctx0, mnt.remap, 1, n_expert, 1);
-            ids_remap = ggml_get_rows(ctx0, remap3, ids_flat);
+            // the pool remap gather (below, GPU segment) and the inverse remap
+            // gather (CPU segment) share this one clean contiguous topk copy;
+            // each side produces its own -1 (pool skip / inverse) locally.
+            // private copy of the flat ids: the copy shares the small-slot
+            // family with the remapped outputs of the same step; the window
+            // keeps both sides reading a -1-free source.
+            ids_flat = ggml_cont(ctx0, ids_flat);
+            cb(ids_flat, "ffn_moe_ids_flat_priv", il);
+            ggml_tensor * remap_3d = ggml_reshape_3d(ctx0, mnt.remap, 1, n_expert, 1);
+            ids_remap = ggml_get_rows(ctx0, remap_3d, ids_flat);
             ids_remap = ggml_reshape_2d(ctx0, ids_remap, n_expert_used, n_tokens);
             // TEMP (9/2): force a private copy of the ids: the get_rows output
             // shares a 32B galloc slot with other small tensors, and the
@@ -2230,12 +2238,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             // inverse table for the CPU chain: resident -> -1, non-resident ->
             // expert id, so the CPU mul_mat_id zeroes the hit columns natively
             // (the -1 skip ids) and computes exactly the miss columns. the table
-            // read is the CPU-HOSTED copy (remap_cpu_cpu) and runs ON the CPU
+            // read is the CPU-HOSTED copy (remap_inv_host) and runs ON the CPU
             // segment (src0 on the CPU device): the GPU-side get_rows output
             // slot is shared with the pool remap and is not A1-final, so a
             // cross-side read races with the pool chain.
-            ggml_tensor * remap_cpu3 = ggml_reshape_3d(ctx0, mnt.remap_cpu_cpu, 1, n_expert, 1);
-            ggml_tensor * ids_cpu = ggml_get_rows(ctx0, remap_cpu3, ids_flat);
+            ggml_tensor * remap_inv_3d = ggml_reshape_3d(ctx0, mnt.remap_inv_host, 1, n_expert, 1);
+            ggml_tensor * ids_cpu = ggml_get_rows(ctx0, remap_inv_3d, ids_flat);
             // pin the inverse remap to the CPU segment (on the raw output,
             // before the reshape view is created): without the pin the sched's
             // "most supported inputs" tie can place the get_rows on the GPU,
@@ -2459,6 +2467,25 @@ build_expert_chain:
         return experts;
     }
 
+    // mounted chain, built BEFORE the miss aggregation on purpose: the mount
+    // block is SELF-CONTAINED (A1-final inputs only), and the layer-parallel
+    // early submit runs it ahead of the CPU miss chain. the block computes
+    // ONLY the (unweighted) expert outputs. graph order: gate/ids/gather ->
+    // CPU miss -> GPU mount chain (expanded first) -> shared/merge.
+    if (mount_out == nullptr && mount_p != nullptr) {
+        ggml_tensor * mnt_cur = cur_mount_in;
+        // the mount block must be SELF-CONTAINED for the layer-parallel
+        // early submit: its only in-graph inputs are A1-final (cur, ids,
+        // tables) - the cur prep (chain_only reshape, named inside
+        // build_expert_chain) and the ids lookup ride inside, so the whole
+        // block can run ahead of the CPU miss chain.
+        mount_out = build_moe_ffn(mnt_cur, gate_inp, gate_inp_b,
+            mount_p->w_up, nullptr, mount_p->w_gate, nullptr, mount_p->w_down, mount_p->w_down_b, exp_probs_b,
+            n_expert, n_expert_used, type_op, norm_w, w_scale, gating_op, il,
+            mnt_cur, mount_p->w_gate_up, nullptr, nullptr, nullptr, nullptr, ids_remap, weights);
+        cb(mount_out, "ffn_moe_mount", il);
+    }
+
     if (!weight_before_ffn) {
         experts = ggml_mul(ctx0, experts, weights);
         cb(experts, "ffn_moe_weighted", il);
@@ -2473,17 +2500,31 @@ build_expert_chain:
         cb(experts, "ffn_moe_cpu_scaled", il);
     }
 
-    if (mount_out != nullptr) {
-        // direct-mount merge moves AFTER the aggregation below: the CPU chain
-        // output (miss columns) is aggregated first, then the aggregated GPU
-        // chain contribution (ffn_moe_mount_agg) is added - the layer tail
-        // then follows the native -cmoe path exactly (aggregated result is
-        // sent back to the GPU for the residual + cvec).
-        // (the merge add is tagged CPU below; the aggregation views/adds of
-        // the miss columns stay on the CPU segment via the experts input)
-    }
-
     ggml_build_forward_expand(gf, experts);
+
+    // shared expert output [n_embd, n_used, T]: the mount (hit) columns and
+    // the CPU miss columns are mutually exclusive (-1 skip ids), so a single
+    // element-wise add is exact per column (0 + x == x) - no scatter needed.
+    // the whole weighting + aggregation then happens ONCE on the GPU segment,
+    // and the dedup sched H2D's the CPU experts block into it (same IO as
+    // the standalone weighted segment, but one split and one weight pass
+    // fewer). the layer tail (merge + residual + norm) folds in after.
+    ggml_tensor * moe_out = experts;
+    if (mount_out != nullptr) {
+        ggml_tensor * shared = ggml_add(ctx0, mount_out, experts);
+        cb(shared, "ffn_moe_shared", il);
+        ggml_backend_sched_set_tensor_backend(sched, shared,
+                                              ggml_backend_sched_get_backend(sched, 0));
+        if (!weight_before_ffn) {
+            shared = ggml_mul(ctx0, shared, weights);
+            cb(shared, "ffn_moe_weighted", il);
+        }
+        if (mount_scale != nullptr) {
+            shared = ggml_mul(ctx0, shared, mount_scale);
+            cb(shared, "ffn_moe_cpu_scaled", il);
+        }
+        moe_out = shared;
+    }
 
     ggml_tensor * cur_experts[LLAMA_MAX_EXPERTS] = { nullptr };
 
@@ -2495,13 +2536,13 @@ build_expert_chain:
     // value is correct). ref: https://github.com/ggml-org/llama.cpp/pull/14753
     const uint32_t n_expert_used_il = hparams.n_expert_used(il);
     for (uint32_t i = 0; i < n_expert_used_il; ++i) {
-        cur_experts[i] = ggml_view_2d(ctx0, experts, n_embd, n_tokens, experts->nb[2], i*experts->nb[1]);
+        cur_experts[i] = ggml_view_2d(ctx0, moe_out, n_embd, n_tokens, moe_out->nb[2], i*moe_out->nb[1]);
 
         ggml_build_forward_expand(gf, cur_experts[i]);
     }
 
     // aggregate experts
-    ggml_tensor * moe_out = cur_experts[0];
+    moe_out = cur_experts[0];
 
     for (uint32_t i = 1; i < n_expert_used_il; ++i) {
         moe_out = ggml_add(ctx0, moe_out, cur_experts[i]);
@@ -2509,69 +2550,6 @@ build_expert_chain:
         ggml_build_forward_expand(gf, moe_out);
     }
 
-    // mounted chain, built AFTER the miss chain + aggregation on purpose:
-    // the whole GPU-side chain (hit experts) runs in the layer tail segment,
-    // after the CPU miss chain. graph order: gate/ids/gather -> CPU miss ->
-    // GPU mount chain -> merge. the aggregate add below (moe_out) and the
-    // merge add (mount_agg) keep their operands, so the math is unchanged.
-    if (mount_out == nullptr && mount_p != nullptr) {
-        ggml_tensor * mnt_cur = cur_mount_in;
-        // the mount block must be SELF-CONTAINED for the layer-parallel
-        // early submit: its only in-graph inputs are A1-final (cur, ids,
-        // tables) - the cur prep (chain_only reshape, named inside
-        // build_expert_chain) and the ids lookup ride inside, so the whole
-        // block can run ahead of the CPU miss chain.
-        mount_out = build_moe_ffn(mnt_cur, gate_inp, gate_inp_b,
-            mount_p->w_up, nullptr, mount_p->w_gate, nullptr, mount_p->w_down, mount_p->w_down_b, exp_probs_b,
-            n_expert, n_expert_used, type_op, norm_w, w_scale, gating_op, il,
-            mnt_cur, mount_p->w_gate_up, nullptr, nullptr, nullptr, nullptr, ids_remap, weights);
-        cb(mount_out, "ffn_moe_mount", il);
-
-        if (mount_scale != nullptr) {
-            mount_out = ggml_mul(ctx0, mount_out, mount_scale);
-            cb(mount_out, "ffn_moe_mount_scaled", il);
-        }
-
-        // chain_only returns the UNWEIGHTED down output; the CPU chain
-        // below multiplies by routing weights after the merge, so apply
-        // them on the GPU side here (weight_before_ffn models weight both
-        // chains inside)
-        if (!weight_before_ffn) {
-            mount_out = ggml_mul(ctx0, mount_out, weights);
-            cb(mount_out, "ffn_moe_mount_weighted", il);
-        }
-
-        // aggregate the GPU chain output in-graph (GPU segment): the merge
-        // with the CPU chain below runs on the GPU segment too.
-        ggml_tensor * cur_experts_g[LLAMA_MAX_EXPERTS] = { nullptr };
-        for (uint32_t i = 0; i < hparams.n_expert_used; ++i) {
-            cur_experts_g[i] = ggml_view_2d(ctx0, mount_out, n_embd, n_tokens, mount_out->nb[2], i*mount_out->nb[1]);
-        }
-        ggml_tensor * pool_sum = cur_experts_g[0];
-        for (uint32_t i = 1; i < hparams.n_expert_used; ++i) {
-            pool_sum = ggml_add(ctx0, pool_sum, cur_experts_g[i]);
-        }
-        cb(pool_sum, "ffn_moe_mount_agg", il);
-        mount_agg = pool_sum;
-    }
-
-    if (mount_out != nullptr) {
-        // direct-mount merge on the GPU segment: the miss-chain aggregation
-        // crosses back via the existing H2D input of the layer tail (same
-        // path as native -cmoe), and the aggregated GPU chain contribution
-        // (mount_agg) is added where it lives. this removes one D2H per
-        // layer - the mount_agg no longer crosses to the CPU segment.
-        // the per-expert down scale (mount_scale) is still applied on the
-        // CPU segment BEFORE the aggregation (it is a per-column scale).
-        // NOTE: moving the add across backends changes the float path
-        // (CUDA FTZ vs x86) - 1-ulp class, semantic equivalence only.
-        moe_out = ggml_add(ctx0, moe_out, mount_agg);
-        cb(moe_out, "ffn_moe_mount_merged", il);
-        // sched backends are ordered [gpu..., cpu] (sched_new asserts the
-        // last backend is CPU), so index 0 is the pool device
-        ggml_backend_sched_set_tensor_backend(sched, moe_out,
-                                              ggml_backend_sched_get_backend(sched, 0));
-    }
 
     if (n_expert_used_il == 1) {
         // avoid returning a non-contiguous tensor

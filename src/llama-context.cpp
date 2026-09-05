@@ -985,12 +985,12 @@ void llama_context::expert_pool_build() {
     // each), so the CPU segment stays lookup-free.
     if (st.direct_mount) {
         pool_tab_ctx = ggml_init({ 1u*1024u*1024u, nullptr, true }); // no_alloc
-        // CPU-hosted copy of the merged table: the miss chain's get_rows reads
-        // remap_cpu from HERE (host memory), so its ids are not tied to the
-        // pool segment's 32B output slot. same [2*n_expert, n_layers] layout,
+        // CPU-hosted copy of the inverse table: the miss chain's get_rows reads
+        // remap_inv_host from HERE (host memory), so its ids are not tied to the
+        // pool segment's 32B output slot. [n_expert, n_layers] layout,
         // filled in the same tab_sync_impl flush as tab_all.
         pool_tab_cpu_ctx = ggml_init({ 64u*1024u, nullptr, true });
-        st.tab_cpu = ggml_new_tensor_2d(pool_tab_cpu_ctx, GGML_TYPE_I32, 2 * n_expert,
+        st.tab_cpu = ggml_new_tensor_2d(pool_tab_cpu_ctx, GGML_TYPE_I32, n_expert,
                                         llama_model_n_layer(&model));
         ggml_set_name(st.tab_cpu, "mnt_tab_cpu");
     }
@@ -1003,31 +1003,29 @@ void llama_context::expert_pool_build() {
             continue;
         }
         const llama_layer & L = model.layers[il];
-        // merged table: ONE contiguous [2*n_expert, n_layers] I32 tensor;
-        // each layer gets a 1KB view for remap and a 1KB view for remap_cpu
+        // merged table: ONE contiguous [n_expert, n_layers] I32 tensor;
+        // each layer gets a 1KB view for remap (the inv half lives only in
+        // the CPU host mirror).
         if (st.tab_all == nullptr) {
-            st.tab_all = ggml_new_tensor_2d(pool_tab_ctx, GGML_TYPE_I32, 2 * n_expert,
+            st.tab_all = ggml_new_tensor_2d(pool_tab_ctx, GGML_TYPE_I32, n_expert,
                                             llama_model_n_layer(&model));
             ggml_set_name(st.tab_all, "mnt_tab_all");
         }
         const size_t i32sz = ggml_type_size(GGML_TYPE_I32);
         m.remap     = ggml_view_2d(pool_tab_ctx, st.tab_all, 1, n_expert, i32sz,
-                                   il * 2 * n_expert * i32sz);
-        m.remap_cpu = ggml_view_2d(pool_tab_ctx, st.tab_all, 1, n_expert, i32sz,
-                                   (il * 2 + 1) * n_expert * i32sz);
-        // CPU-side view of the host table (same offset as remap_cpu)
-        m.remap_cpu_cpu = ggml_view_2d(pool_tab_cpu_ctx, st.tab_cpu, 1, n_expert, i32sz,
-                                       (il * 2 + 1) * n_expert * i32sz);
+                                   il * n_expert * i32sz);
+        // CPU-side view of the host table (remap_inv_host mirrors the inv
+        // half of the tab_mirror; tab_cpu holds only the inv part)
+        m.remap_inv_host = ggml_view_2d(pool_tab_cpu_ctx, st.tab_cpu, 1, n_expert, i32sz,
+                                       il * n_expert * i32sz);
         if (L.ffn_down_exps_s != nullptr) {
             m.scale = ggml_new_tensor_2d(pool_tab_ctx, GGML_TYPE_F32, 1, n_expert);
         }
         char nm[64];
         snprintf(nm, sizeof(nm), "mnt_remap_%d", il);
         ggml_set_name(m.remap, nm);
-        snprintf(nm, sizeof(nm), "mnt_remap_cpu_%d", il);
-        ggml_set_name(m.remap_cpu, nm);
-        snprintf(nm, sizeof(nm), "mnt_remap_cpu_cpu_%d", il);
-        ggml_set_name(m.remap_cpu_cpu, nm);
+        snprintf(nm, sizeof(nm), "mnt_remap_inv_host_%d", il);
+        ggml_set_name(m.remap_inv_host, nm);
         if (m.scale != nullptr) {
             snprintf(nm, sizeof(nm), "mnt_scale_%d", il);
             ggml_set_name(m.scale, nm);
@@ -1125,12 +1123,12 @@ void llama_context::expert_pool_build() {
     if (st.direct_mount) {
         for (int32_t il : pooled_ils) {
             llama_expert_pool_mount & m = llama_expert_pool_get_mount(il);
-            if (!m.active || m.remap == nullptr || m.remap_cpu == nullptr) {
+            if (!m.active || m.remap == nullptr || m.remap_inv_host == nullptr) {
                 continue;
             }
             const std::vector<int32_t> & res = st.resident[il];
             // (table contents are written once by expert_pool_fill() via the
-            // merged tab_sync: every layer's remap/remap_cpu in one set)
+            // merged tab_sync: remap -> tab_all, inv -> tab_cpu in one set)
             (void) res;
         }
     }
@@ -1177,11 +1175,11 @@ void llama_context::expert_pool_fill() {
         // second write keeps them correct if fill() ever refreshes the resident set)
         llama_expert_pool_mount & m = llama_expert_pool_get_mount(il);
         const bool has_mount = st.direct_mount && m.active &&
-                               m.remap != nullptr && m.remap_cpu != nullptr;
+                               m.remap != nullptr && m.remap_inv_host != nullptr;
         if (has_mount) {
             // I32 ids tables: get_rows outputs the table type natively on
             // every backend (ggml.c), so no cast is needed anywhere. the
-            // merged remap/remap_cpu tables are flushed once below, after
+            // remap + inv tables are flushed once below, after
             // the loop (tab_sync), so no per-layer set here.
             if (m.scale != nullptr) {
                 // one flat table: expert e -> its down scale value. the -1 ids
