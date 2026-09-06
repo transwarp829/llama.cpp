@@ -53,7 +53,6 @@ struct llama_cparams {
     bool op_offload;
     bool kv_unified;
     bool pipeline_parallel;
-    bool expert_cache;       // collect per-seq expert routing window statistics
 
     int32_t expert_pool;       // total expert-pool slots (0 = disabled)
     const char * expert_pool_init; // csv file to seed the pool, null = random

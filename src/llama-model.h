@@ -6,7 +6,6 @@
 #include "llama-hparams.h"
 #include "llama-memory.h"
 #include "llama-vocab.h"
-#include "llama-expert-cache.h"
 #include "llama-expert-pool.h"
 
 #include <map>
@@ -616,11 +615,6 @@ struct llama_model {
 
     llama_hparams hparams = {};
     llama_vocab   vocab;
-
-    // expert cache aggregator (stage 2+: global pool snapshot / gate / LUT)
-    // statistical side state, not model data; writable even when the model
-    // is accessed through a const reference (llama_context holds one)
-    mutable llama_model_expert_cache expert_cache;
 
     // expert pool runtime state (stage 2): GPU pool weights + mapping tables
     mutable llama_expert_pool_state expert_pool_state;

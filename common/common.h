@@ -571,7 +571,6 @@ struct common_params {
     bool ctx_shift         = false; // context shift on infinite text generation
     bool swa_full          = false; // use full-size SWA cache (https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055)
     bool kv_unified        = false; // enable unified KV cache
-    bool expert_cache      = false; // collect per-seq expert routing window statistics
 
     int32_t expert_pool        = 0;      // total expert-pool slots (0 = disabled)
     std::string expert_pool_init;         // csv file to seed the pool (empty = random)

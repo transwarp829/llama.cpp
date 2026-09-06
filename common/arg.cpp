@@ -1697,13 +1697,6 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_SWA_FULL"));
     add_opt(common_arg(
-        {"--expert-cache"},
-        "collect per-seq expert routing window statistics (expert cache stage 1)",
-        [](common_params & params) {
-            params.expert_cache = true;
-        }
-    ));
-    add_opt(common_arg(
         {"-nep", "--expert-pool"}, "N",
         "total number of expert slots across all pooled MoE layers (expert pool stage 2; 0 = disabled)",
         [](common_params & params, int value) {
