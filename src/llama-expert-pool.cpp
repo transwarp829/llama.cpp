@@ -636,104 +636,143 @@ bool llama_expert_pool_alloc_from_counts(
     return true;
 }
 
-// marginal exchange + weight copies + mirror rebuild (worker thread only).
-// swap the worst resident expert with the best non-resident one, at most one
-// pair per pooled layer per settled step, gated by the z-sigma confidence
-// test below (the cost-gate/payback terms were retired 8/30; the gate is a
-// property of the estimator, not of the model or hardware).
+// rate-gated window top-k refresh + weight copies + mirror rebuild
+// (worker thread only). each settled step, every pooled layer's resident
+// set converges towards the window's k most used experts (k = slot count):
+// the new top-k is the experts with positive window count ranked by count
+// (zero-count experts never evict anything - a cold window only fills),
+// incoming experts take the empty slots first, then the slots of resident
+// experts that fell out of the top-k (coldest first). the resulting pairs
+// are executed globally in window-count order, descending, until the
+// per-step pair limit (swap_per_step, negative = unlimited) is exhausted -
+// the hottest experts copy first, the tail waits for the next settled step.
 static int32_t worker_decide_and_copy(llama_expert_pool_state & st) {
     const int32_t P = (int32_t) st.pooled_layers.size();
     const int32_t n_expert = st.n_expert;
     if (P <= 0 || st.win_cnt.empty()) {
         return 0;
     }
-    int32_t delta = 0;
+    struct pair_t {
+        int32_t ilx;
+        int32_t e;    // expert to swap in
+        int32_t slot; // slot to fill
+        int32_t cnt;  // window count of the incoming expert
+    };
+    std::vector<pair_t> queue;
+    queue.reserve(P);
     for (int32_t ilx = 0; ilx < P; ++ilx) {
         const int32_t il = st.pooled_layers[ilx];
-        std::vector<int32_t> & res = st.resident[il];
+        const std::vector<int32_t> & res = st.resident[il];
         if (res.empty()) {
             continue;
         }
-        // the exchange only affects layers with an active mount; others run
+        // the refresh only affects layers with an active mount; others run
         // the plain CPU chain, so swapping their resident set is a no-op
         const llama_expert_pool_mount & mnt = llama_expert_pool_get_mount(il);
         if (!mnt.active) {
             continue;
         }
-        // worst resident: prefer an EMPTY slot (a sparse seed leaves free
-        // slots that the swap fills as the window accumulates; an empty slot
-        // has no incumbent to lose); otherwise the mapped expert with the
-        // LOWEST window count - the counts are FULL activation counts now
-        // (resident hits included), so the eviction side has real evidence.
-        int32_t worst_s = -1;
-        int32_t worst_cnt = 0;
-        for (int32_t s = 0; s < (int32_t) res.size(); ++s) {
-            if (res[s] < 0) {
-                worst_s = s;
-                worst_cnt = 0;
-                break;
-            }
-            const int32_t c = st.win_cnt[ilx * n_expert + res[s]];
-            if (worst_s < 0 || c < worst_cnt) {
-                worst_s = s;
-                worst_cnt = c;
-            }
-        }
-        if (worst_s < 0) {
-            continue;
-        }
-        // best non-resident expert (not mapped in this layer)
-        int32_t best_e = -1;
-        int32_t best_cnt = 0;
+        const int32_t K = (int32_t) res.size();
+        // positive-count experts, (count, id) descending = the top-k pool
+        std::vector<std::pair<int32_t, int32_t>> hot; // (cnt, e)
+        hot.reserve((size_t) n_expert);
         for (int32_t e = 0; e < n_expert; ++e) {
             const int32_t c = st.win_cnt[ilx * n_expert + e];
-            if (c <= best_cnt) {
-                continue;
+            if (c > 0) {
+                hot.emplace_back(c, e);
             }
+        }
+        std::sort(hot.begin(), hot.end(), [](const auto & a, const auto & b) {
+            return a.first > b.first || (a.first == b.first && a.second < b.second);
+        });
+        const int32_t n_new = std::min<int32_t>(K, (int32_t) hot.size());
+        std::vector<bool> in_topk((size_t) n_expert, false);
+        for (int32_t i = 0; i < n_new; ++i) {
+            in_topk[hot[i].second] = true;
+        }
+        // incoming: hot experts of the new top-k that are not resident
+        std::vector<std::pair<int32_t, int32_t>> in; // (cnt, e)
+        for (int32_t i = 0; i < n_new; ++i) {
+            const int32_t e = hot[i].second;
             bool resident = false;
-            for (int32_t s = 0; s < (int32_t) res.size(); ++s) {
+            for (int32_t s = 0; s < K; ++s) {
                 if (res[s] == e) {
                     resident = true;
                     break;
                 }
             }
-            if (resident) {
-                continue;
+            if (!resident) {
+                in.emplace_back(hot[i].first, e);
             }
-            best_e = e;
-            best_cnt = c;
         }
-        if (best_e < 0) {
-            continue;
+        // outgoing slots: empty slots first (an empty slot has no incumbent
+        // to lose), then resident experts outside the new top-k, coldest
+        // first; when the top-k is smaller than K, slots beyond it keep
+        // their content - the pool only fills, it never shrinks
+        std::vector<int32_t> empty;
+        std::vector<std::pair<int32_t, int32_t>> out; // (cnt, slot)
+        for (int32_t s = 0; s < K; ++s) {
+            const int32_t e = res[s];
+            if (e < 0) {
+                empty.push_back(s);
+            } else if (!in_topk[e]) {
+                out.emplace_back(st.win_cnt[ilx * n_expert + e], s);
+            }
         }
-        // gate: the count gap must exceed z sigma of its Poisson noise (two
-        // independent window bins, Var(gap) = cnt_out + cnt_in). the counts
-        // are REAL on both sides (the eviction side counts resident hits),
-        // so the gate protects a hot resident from a marginally hotter
-        // candidate. z = 3: model- and backend-independent.
-        const double gap = (double) (best_cnt - worst_cnt);
-        if (gap <= (double) st.swap_sigma * sqrt((double) best_cnt + (double) worst_cnt)) {
-            continue;
+        std::sort(out.begin(), out.end(), [](const auto & a, const auto & b) {
+            return a.first < b.first || (a.first == b.first && a.second < b.second);
+        });
+        const int32_t npairs = std::min<int32_t>((int32_t) in.size(),
+                (int32_t) (empty.size() + out.size()));
+        for (int32_t i = 0; i < npairs; ++i) {
+            const int32_t slot = i < (int32_t) empty.size()
+                ? empty[i] : out[i - (int32_t) empty.size()].second;
+            queue.push_back({ilx, in[i].second, slot, in[i].first});
         }
-        // exchange: the weight copies run here, synchronously on the worker
-        // thread; the resident set commits only after the copies returned,
-        // and the tables keep the OLD mapping until the hook publishes the
-        // rebuilt mirror - so no graph ever sees a half-filled slot (the
+    }
+    // execute the queue in window-count order, descending, until the
+    // per-step pair limit: the first pair over the limit stops the batch
+    const int32_t limit = st.swap_per_step < 0 ? -1 : st.swap_per_step;
+    std::sort(queue.begin(), queue.end(), [](const pair_t & a, const pair_t & b) {
+        if (a.cnt != b.cnt) return a.cnt > b.cnt;
+        if (a.ilx != b.ilx) return a.ilx < b.ilx;
+        if (a.e != b.e)     return a.e < b.e;
+        return a.slot < b.slot;
+    });
+    const int32_t total = (int32_t) queue.size();
+    int32_t delta = 0;
+    int32_t deferred = 0;
+    for (const pair_t & p : queue) {
+        if (limit >= 0 && delta >= limit) {
+            deferred = total - delta;
+            break;
+        }
+        const int32_t il = st.pooled_layers[p.ilx];
+        // the weight copies run here, synchronously on the worker thread;
+        // the resident set commits only after the copies returned, and the
+        // tables keep the OLD mapping until the hook publishes the rebuilt
+        // mirror - so no graph ever sees a half-filled slot (the
         // one-step-unmap of the old pipeline is gone).
-        const int32_t victim_e = res[worst_s];
-        swap_copy_one_sync(st.pool_backend, st.orig_gate_up[il], st.w_pool_gate_up[il], best_e, worst_s);
-        swap_copy_one_sync(st.pool_backend, st.orig_up[il],      st.w_pool_up[il],      best_e, worst_s);
-        swap_copy_one_sync(st.pool_backend, st.orig_gate[il],    st.w_pool_gate[il],    best_e, worst_s);
-        swap_copy_one_sync(st.pool_backend, st.orig_down[il],    st.w_pool_down[il],    best_e, worst_s);
-        res[worst_s] = best_e;
-        LLAMA_LOG_INFV(LLAMA_LOG_VERBOSITY_TRACE,
-                "%s: exchange layer %d (step %d): evict e=%d (cnt %d), fill e=%d (cnt %d)",
-                __func__, il, st.win_step, victim_e, worst_cnt, best_e, best_cnt);
+        std::vector<int32_t> & res = st.resident[il];
+        const int32_t victim_e = res[p.slot];
+        swap_copy_one_sync(st.pool_backend, st.orig_gate_up[il], st.w_pool_gate_up[il], p.e, p.slot);
+        swap_copy_one_sync(st.pool_backend, st.orig_up[il],      st.w_pool_up[il],      p.e, p.slot);
+        swap_copy_one_sync(st.pool_backend, st.orig_gate[il],    st.w_pool_gate[il],    p.e, p.slot);
+        swap_copy_one_sync(st.pool_backend, st.orig_down[il],    st.w_pool_down[il],    p.e, p.slot);
+        res[p.slot] = p.e;
         delta += 1;
+        LLAMA_LOG_INFV(LLAMA_LOG_VERBOSITY_TRACE,
+                "%s: exchange layer %d (step %d): evict e=%d, fill e=%d (cnt %d)",
+                __func__, il, st.win_step, victim_e, p.e, p.cnt);
     }
     if (delta > 0) {
         llama_expert_pool_tab_build(st);
         st.swap_sum += delta;
+    }
+    if (deferred > 0) {
+        LLAMA_LOG_INFV(LLAMA_LOG_VERBOSITY_DEBUG,
+                "%s: %d pair(s) deferred by the per-step swap limit (step %d)",
+                __func__, deferred, st.win_step);
     }
     return delta;
 }
