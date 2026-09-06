@@ -406,7 +406,6 @@ extern "C" {
         bool kv_unified;  // use a unified buffer across the input sequences when computing the attention
                           // try to disable when n_seq_max > 1 for improved performance when the sequences do not share a large prefix
                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363
-        bool expert_cache; // [EXPERIMENTAL] collect per-seq expert routing window statistics (expert cache stage 1)
 
         int32_t expert_pool;        // [EXPERIMENTAL] total expert-pool slots (0 = disabled)
         const char * expert_pool_init; // [EXPERIMENTAL] csv file to seed the pool ("il,e1,e2,..."), null = random
