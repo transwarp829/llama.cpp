@@ -84,11 +84,19 @@ struct llama_expert_pool_state {
                                            // step advance (single-layer-safe step detect)
 
     // stage 3 swap (on by default with -nep): sliding decode window count of
-    // expert activations, one entry per (pooled layer, expert); the marginal
-    // exchange refreshes the resident set one pair per layer per step
+    // expert activations, one entry per (pooled layer, expert); the rate-
+    // gated top-k refresh converges the resident set to the window's k most
+    // used experts (k = slot count), at most swap_per_step expert pairs per
+    // settled step
     bool swap_auto = false;
     int32_t swap_W = 512;                  // window length in decode steps
-    int32_t swap_sigma = 3;                // marginal-exchange confidence (z sigma)
+    int32_t swap_per_step = 10;            // max expert pairs swapped in per
+                                           // settled step, across all pooled
+                                           // layers (negative = unlimited);
+                                           // the swap rate control of the
+                                           // window top-k refresh (the window
+                                           // warm-up fill is fast by design;
+                                           // this caps the tail)
     int32_t n_expert = 0;                  // experts per layer (set at init)
     // hook-side step counter (the hook only pushes routing rows; the swap
     // worker owns the window below)

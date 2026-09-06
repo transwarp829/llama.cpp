@@ -151,7 +151,7 @@ llama_context::llama_context(
     cparams.expert_pool_init = params.expert_pool_init;
     cparams.expert_pool_swap = params.expert_pool_swap;
     cparams.expert_pool_swap_window = params.expert_pool_swap_window;
-    cparams.expert_pool_swap_sigma = params.expert_pool_swap_sigma;
+    cparams.expert_pool_swap_per_step = params.expert_pool_swap_per_step;
     if (cparams.expert_cache) {
         expert_cache.enabled = true;
         expert_cache.init(cparams.n_seq_max, hparams.n_layer());
@@ -734,16 +734,17 @@ void llama_context::expert_pool_init() {
         st.swap_auto = false;
     }
     const char * swap_w_env = getenv("GGML_EXPPOOL_SWAP_WINDOW");
-    const char * swap_sigma_env = getenv("GGML_EXPPOOL_SWAP_SIGMA");
     if (cparams.expert_pool_swap_window > 0) {
         st.swap_W = cparams.expert_pool_swap_window;
     } else if (swap_w_env != nullptr && std::atoi(swap_w_env) > 0) {
         st.swap_W = std::atoi(swap_w_env);
     }
-    if (cparams.expert_pool_swap_sigma > 0) {
-        st.swap_sigma = cparams.expert_pool_swap_sigma;
-    } else if (swap_sigma_env != nullptr && std::atoi(swap_sigma_env) > 0) {
-        st.swap_sigma = std::atoi(swap_sigma_env);
+    // per-step swap limit: 0 = default 10 pairs, negative = unlimited
+    const char * swap_per_step_env = getenv("GGML_EXPPOOL_SWAP_PER_STEP");
+    if (cparams.expert_pool_swap_per_step != 0) {
+        st.swap_per_step = cparams.expert_pool_swap_per_step;
+    } else if (swap_per_step_env != nullptr && std::atoi(swap_per_step_env) != 0) {
+        st.swap_per_step = std::atoi(swap_per_step_env);
     }
 
     // --- find the pooled layers (MoE weights that live on the CPU) ---

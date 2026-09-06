@@ -1725,10 +1725,10 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ));
     add_opt(common_arg(
-        {"--expert-pool-swap-sigma"}, "Z",
-        "swap confidence interval in sigma (default 3; higher = fewer swaps, lower swap-in tax, slower adaptation)",
+        {"--expert-pool-swap-per-step"}, "N",
+        "max expert pairs swapped in per decode step (0 = default 10, negative = unlimited)",
         [](common_params & params, int value) {
-            params.expert_pool_swap_sigma = value;
+            params.expert_pool_swap_per_step = value;
         }
     ));
     add_opt(common_arg(
