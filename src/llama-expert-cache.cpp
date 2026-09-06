@@ -129,7 +129,20 @@ void llama_model_expert_cache::ensure(int32_t n_layer, int64_t n_expert) {
 }
 
 void llama_model_expert_cache::aggregate(const llama_context_expert_cache & ctx_cache) {
-    ensure(ctx_cache.n_layer, 256);
+    // expert count from the observed windows (model agnostic: never assume a constant)
+    int64_t n_expert = 0;
+    for (int32_t s = 0; s < ctx_cache.n_seq_max && n_expert == 0; ++s) {
+        for (int32_t il = 0; il < ctx_cache.n_layer; ++il) {
+            if (ctx_cache.seqs[s][il].cap != 0) {
+                n_expert = ctx_cache.seqs[s][il].n_expert;
+                break;
+            }
+        }
+    }
+    if (n_expert <= 0) {
+        return;
+    }
+    ensure(ctx_cache.n_layer, n_expert);
     for (int32_t s = 0; s < ctx_cache.n_seq_max; ++s) {
         for (int32_t il = 0; il < ctx_cache.n_layer; ++il) {
             const llama_expert_window & w = ctx_cache.seqs[s][il];

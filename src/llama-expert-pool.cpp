@@ -75,9 +75,13 @@ void llama_expert_pool_state::reset() {
 
     swap_auto = false;
     fill_done = false;
+    hook_step = 0;
+    count_ilx = -1;
+    stat_ilx  = -1;
     win_step = 0;
     win_cnt.clear();
     win_hist.clear();
+    swap_sum = 0;
     stat_hit.clear();
     stat_miss.clear();
     win_hit  = 0;
@@ -88,62 +92,129 @@ void llama_expert_pool_state::reset() {
     seg_cnt.clear();
 
     pool_backend  = nullptr;
-    swap_sum      = 0;
+    mirror_ready.store(-1);
+    mirror_pub.store(-1);
 
-    // stop the copy worker (if running): signal, join, drain
+    // stop the swap worker (if running): signal, join, drain the route queue
     {
-        std::lock_guard<std::mutex> lk(cp_mtx);
-        cp_stop = true;
-        cp_todo.clear();
-        cp_done.clear();
+        std::lock_guard<std::mutex> lk(route_mtx);
+        route_stop = true;
+        route_q.clear();
     }
-    cp_cv.notify_all();
+    route_cv.notify_all();
     if (cp_worker.joinable()) {
         cp_worker.join();
     }
-    cp_stop = false;
-    cp_inflight.clear();
+    route_stop = false;
 }
 
-// start the dedicated swap-copy worker thread (one per pool). the worker
-// performs the H2D weight copies off the inference thread and off the main
-// graph stream; runaway workers are drained on reset().
+// push a step marker: the rows previously queued now belong to a complete
+// step and the worker may settle them. hook thread only, except the
+// segment-end drain in llama_context::expert_pool_finalize (no decode in
+// flight there, so no hook can race it).
+void llama_expert_pool_push_marker(llama_expert_pool_state & st) {
+    llama_expert_pool_state::route_block m;
+    m.step = st.hook_step;
+    m.ilx  = -1;
+    {
+        std::lock_guard<std::mutex> lk(st.route_mtx);
+        st.route_q.push_back(std::move(m));
+    }
+    st.route_cv.notify_one();
+}
+
+// push the FULL activation row of one (step, layer): the ids the CPU chain
+// actually used, with the -1 (pool hit) entries recovered from the original
+// top-k ids before the inverse remap. hook thread only, inside the cpu mmid
+// delegate (no locks held while walking/reading; queue lock is brief).
+static void route_push_row(llama_expert_pool_state & st, int32_t step, int32_t ilx,
+                           const ggml_tensor * ids) {
+    const int64_t n_used = ids->ne[0];
+    const int64_t n_tok  = ids->ne[1];
+    // original top-k ids: the inverse-remap get_rows' src[1] is the private
+    // continuous copy of selected_experts (ffn_moe_ids_flat_priv). walk:
+    // ids (cpu chain) = reshape(get_rows(remap_inv_host, ids_flat)); the
+    // scheduler rewrites cross-backend inputs to CPU-side copies (src[1]
+    // points at a CPU#... copy tensor), so the data is host-readable here.
+    const ggml_tensor * gr = ids;
+    if (gr->op == GGML_OP_RESHAPE && gr->src[0] != nullptr) {
+        gr = gr->src[0];
+    }
+    const ggml_tensor * raw_t = nullptr;
+    if (gr->op == GGML_OP_GET_ROWS && gr->src[1] != nullptr) {
+        raw_t = gr->src[1];
+    }
+    const int32_t * raw = raw_t != nullptr ? (const int32_t *) raw_t->data : nullptr;
+    if (raw == nullptr) {
+        // defensive: without the original row the -1 (resident) activations
+        // cannot be attributed. the swap is degraded to miss-side counting
+        // (the pre-9/6 behavior), but never crashes.
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            LLAMA_LOG_WARN("%s: cannot walk to original top-k ids (swap rows degrades to miss-side)\n", __func__);
+        }
+    }
+
+    llama_expert_pool_state::route_block rb;
+    rb.step = step;
+    rb.ilx  = ilx;
+    rb.ids.reserve((size_t) n_used * (size_t) n_tok);
+    for (int64_t t = 0; t < n_tok; ++t) {
+        for (int64_t j = 0; j < n_used; ++j) {
+            const int32_t e = *((const int32_t *) ((const char *) ids->data + t*ids->nb[1] + j*ids->nb[0]));
+            int32_t o = e;
+            if (e < 0) {
+                // pool hit: recover the resident expert from the original row
+                // raw is the flat row-major [n_used, n_tok] top-k copy, so (j, t) = j + t*n_used
+                o = raw != nullptr ? raw[j + t*n_used] : -1;
+            }
+            if (o >= 0 && o < st.n_expert) {
+                rb.ids.push_back(o);
+            }
+        }
+    }
+    if (rb.ids.empty()) {
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lk(st.route_mtx);
+        st.route_q.push_back(std::move(rb));
+    }
+    st.route_cv.notify_one();
+}
+
+// start the swap worker thread (one per pool). the worker consumes the
+// route rows, owns the window counters and the marginal exchange, performs
+// the H2D weight copies (sync tensor_set on its own thread - the inference
+// thread and the main graph stream never wait for it), and rebuilds the
+// table mirror for the hook to publish. runaway workers are drained on reset().
 namespace { void swap_copy_one_sync(ggml_backend_t, ggml_tensor *, ggml_tensor *, int32_t, int32_t); }
 
 void llama_expert_pool_start_worker(llama_expert_pool_state & st) {
     if (st.cp_worker.joinable()) {
         return;
     }
-    // the exchange pipeline indexes cp_inflight by the actual layer number;
-    // size by the max pooled layer so a sparse pool never writes past the end
-    st.cp_inflight.assign(st.pooled_layers.empty() ? 0 : st.pooled_layers.back() + 1, -1);
-    st.cp_stop = false;
+    st.route_stop = false;
     st.cp_worker = std::thread([&st]() {
         for (;;) {
-            llama_expert_pool_state::pending_exchange req;
             {
-                std::unique_lock<std::mutex> lk(st.cp_mtx);
-                st.cp_cv.wait(lk, [&st]() { return st.cp_stop || !st.cp_todo.empty(); });
-                if (st.cp_stop) {
+                std::unique_lock<std::mutex> lk(st.route_mtx);
+                st.route_cv.wait(lk, [&st]() { return st.route_stop || !st.route_q.empty(); });
+                if (st.route_stop) {
+                    // drain before exit: settle every marker queued before the
+                    // stop so no counted step is lost (finalize pushes a final
+                    // marker for the tail rows first; teardown paths clear the
+                    // queue, so this is a no-op there)
+                    lk.unlock();
+                    while (llama_expert_pool_worker_settle(st)) {
+                    }
                     return;
                 }
-                req = st.cp_todo.front();
-                st.cp_todo.pop_front();
             }
-            // SYNC copy on the worker's own context: ggml_backend_tensor_set
-            // blocks the worker thread only; the inference thread and the
-            // main graph stream never wait for it. the fill is reported done
-            // only after the copy returned.
-            const llama_expert_pool_mount & mnt = llama_expert_pool_get_mount(req.il);
-            if (mnt.active) {
-                swap_copy_one_sync(st.pool_backend, st.orig_gate_up[req.il], st.w_pool_gate_up[req.il], req.e, req.slot);
-                swap_copy_one_sync(st.pool_backend, st.orig_up[req.il],      st.w_pool_up[req.il],      req.e, req.slot);
-                swap_copy_one_sync(st.pool_backend, st.orig_gate[req.il],    st.w_pool_gate[req.il],    req.e, req.slot);
-                swap_copy_one_sync(st.pool_backend, st.orig_down[req.il],    st.w_pool_down[req.il],    req.e, req.slot);
-            }
-            {
-                std::lock_guard<std::mutex> lk(st.cp_mtx);
-                st.cp_done.push_back(req);
+            // settle every marker queued so far (each marker completes the
+            // previous step; a slow worker drains the backlog step by step)
+            while (llama_expert_pool_worker_settle(st)) {
             }
         }
     });
@@ -271,10 +342,15 @@ void llama_expert_pool_delegate_begin(
             return;
         }
     }
-    // NOTE: no single-token gate here. the swap window and the hit/miss
-    // counters must see EVERY token column of the batch: multi-sequence runs
-    // (-np N) and speculative verify batches (T = 1 + n_draft) both arrive
-    // with ids->ne[1] > 1, and dropping them silently disables the swap under
+    // batch gate: prefill-scale batches (at/above the MoE offload threshold)
+    // run the native path with the pool fully inert - no table publish, no
+    // window rows, no hit/miss counting. same threshold as the graph-side
+    // small-batch gate, never a literal.
+    const bool small_batch = ids->ne[1] < llama_expert_pool_offload_min_batch();
+    // NOTE: below the threshold the swap window and the hit/miss counters
+    // must see EVERY token column of the batch: multi-sequence runs (-np N)
+    // and speculative verify batches (T = 1 + n_draft) both arrive with
+    // ids->ne[1] > 1, and dropping them silently disables the swap under
     // -np N or speculative decoding (the window is a global mix of all
     // sequences routed in this decode). only the routing log below keeps the
     // one-token-per-line format.
@@ -292,11 +368,8 @@ void llama_expert_pool_delegate_begin(
             }
         }
     }
-    // lazy window allocation: pooled_layers must be known (first decode row)
-    if (st.swap_auto && st.win_cnt.empty() && !st.pooled_layers.empty()) {
-        st.win_cnt.assign((size_t) st.pooled_layers.size() * st.n_expert, 0);
-        st.win_hist.resize(st.swap_W);
-    }
+    // lazy window allocation is gone from the hook: the swap worker owns
+    // win_cnt/win_hist and allocates them at its first settlement.
     if (st.stat_hit.empty() && !st.pooled_layers.empty()) {
         st.stat_hit.assign(st.pooled_layers.size(), 0);
         st.stat_miss.assign(st.pooled_layers.size(), 0);
@@ -311,31 +384,23 @@ void llama_expert_pool_delegate_begin(
         st.count_ilx = -1;
         st.stat_ilx  = -1;
         if (st.rt_log != nullptr) {
-            // the routing log's step advance lived below but was dead code
-            // (this block consumes rt_step_done first); advance the log's
-            // step counter and flush the previous step's lines here instead
+            // advance the log's step counter and flush the previous step's
+            // lines (the swap never lives in this block anymore)
             st.log_step += 1;
             st.logged_il = -1;
             fflush(st.rt_log);
         }
-        if (st.swap_auto && !st.win_cnt.empty()) {
-            llama_expert_pool_run_swap(st);
-            st.win_step += 1;
-            // WRITE-TIME eviction, once per step: after the increment, the
-            // slot win_step % W still holds the step from one full window
-            // ago (win_step - W); decrement those pairs and clear it before
-            // the counting block pushes this step's rows. the previous
-            // implementation evicted at the OLD win_step (one step late):
-            // it removed the newest step's data while a full window leaked
-            // in the counters, and the gate's sigma collapsed once the
-            // window slid (the DSV4 rebound to ~40/step).
-            std::vector<int32_t> & old = st.win_hist[st.win_step % st.swap_W];
-            if (!old.empty()) {
-                for (size_t i = 0; i + 1 < old.size(); i += 2) {
-                    st.win_cnt[old[i] * st.n_expert + old[i+1]] --;
-                }
-                old.clear();
-            }
+        if (st.swap_auto && small_batch) {
+            // publish the worker's latest ready mirror: the only table write
+            // point. if the worker is still copying (no new ready mirror),
+            // the tables keep the old mapping - the swap decision takes
+            // effect one or more steps after it was made, which the sigma
+            // gate tolerates (the drift it tracks is slow).
+            llama_expert_pool_tab_publish(st);
+            // step marker: the rows queued before it are now a complete step
+            // and the worker may settle them (count + exchange + mirror).
+            llama_expert_pool_push_marker(st);
+            st.hook_step += 1;
         }
     }
     // routing log: keep the one-token-per-line format (B=1 decode rows only);
@@ -352,33 +417,21 @@ void llama_expert_pool_delegate_begin(
         }
     }
 
-    // --- stage 3 swap window: count this row's expert ids for EVERY token
-    // column of the batch (multi-seq / spec verify arrive with ne[1] > 1).
-    // one decode call = one window step regardless of the token count.
-    // counted once per (step, layer): the hook fires per MUL_MAT_ID node
-    // (2-3 per layer) with the same ids, and the sigma gate assumes the
-    // counts are per-layer activation counts (model-agnostic)
-    if (st.swap_auto && !st.win_cnt.empty() && st.count_ilx != ilx) {
+    // --- stage 3 swap window: push the FULL activation row of this layer
+    // (resident + non-resident, every token column of the batch) to the swap
+    // worker. one decode step = one window step regardless of the token
+    // count; pushed once per (step, layer): the hook fires per MUL_MAT_ID
+    // node (2-3 per layer) with the same ids, and the worker attributes the
+    // row from the -1 positions against the original top-k ids.
+    if (st.swap_auto && small_batch && st.count_ilx != ilx) {
         st.count_ilx = ilx;
-        std::vector<int32_t> & hist = st.win_hist[st.win_step % st.swap_W];
-        for (int64_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
-            for (int id = 0; id < (int) ids->ne[0]; ++id) {
-                const int32_t e = *((const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]));
-                if (e < 0 || e >= st.n_expert) {
-                    continue;
-                }
-                st.win_cnt[ilx * st.n_expert + e] ++;
-                st.seg_cnt[ilx * st.n_expert + e] ++;
-                hist.push_back(ilx);
-                hist.push_back(e);
-            }
-        }
+        route_push_row(st, st.hook_step, ilx, ids);
     }
     // hit/miss counters (direct mount: ids come from remap_inv, so -1 is a GPU
     // pool hit and a non-negative id is the expert computed on the CPU). idle
     // layers (active=false) are skipped by the mount gate above. same per
     // (step, layer) dedup as the window counting
-    if (st.direct_mount && st.stat_ilx != ilx) {
+    if (st.direct_mount && small_batch && st.stat_ilx != ilx) {
         st.stat_ilx = ilx;
         for (int64_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
             for (int id = 0; id < (int) ids->ne[0]; ++id) {
@@ -403,23 +456,54 @@ void llama_expert_pool_delegate_begin(
 }
 
 // ---------------------------------------------------------------
-// stage 3: sliding-window resident-set refresh (--expert-pool-swap)
+// stage 3: merged mount-table mirror and its publish point
 
 namespace {
 
-// rebuild the merged host mirror from resident[] and flush it to the device
-// with ONE tensor_set (step-granular swap update: one API per step, no
-// per-layer table writes). mirror layout: [2*n_expert, n_layers]; layer il =
-// [il*2*n_expert + e] remap, [+n_expert] remap_inv (the inv half is copied to
-// tab_cpu only - tab_all on the GPU holds just the remap half).
-void llama_expert_pool_tab_sync_impl(llama_expert_pool_state & st) {
+// copy one expert weight slice into a pool slot (sync, worker's own thread)
+void swap_copy_one_sync(ggml_backend_t be, ggml_tensor * src, ggml_tensor * pw, int32_t e, int32_t slot) {
+    if (src == nullptr || pw == nullptr) {
+        return;
+    }
+    const size_t sz = src->nb[2];
+    const char * data = (const char *) src->data + e * src->nb[2];
+    const size_t off  = slot * pw->nb[2];
+    // SYNC copy: the worker blocks only its own thread, and the settled step
+    // publishes the result into the mirror (the tables change at the next
+    // hook publish, so no torn slot is ever readable by a graph).
+    ggml_backend_tensor_set(pw, data, off, sz);
+}
+
+} // namespace
+
+// rebuild the merged host mirror from resident[] (worker thread only) and
+// mark it ready. mirror layout: [2*n_expert, n_layers]; layer il =
+// [il*2*n_expert + e] remap, [+n_expert] remap_inv (the inv half feeds
+// tab_cpu). the tables themselves are NOT written here.
+void llama_expert_pool_tab_build(llama_expert_pool_state & st) {
     if (st.tab_all == nullptr) {
         return;
     }
     const int32_t n_expert = st.n_expert;
     const size_t n_total = (size_t) st.tab_all->ne[0] * (size_t) st.tab_all->ne[1];
     const size_t n_half  = n_total; // one half of the mirror (remap or inv) per table
-    std::vector<int32_t> & mir = st.tab_mirror[st.tab_mirror_flip];
+    // pick a free mirror slot: never the ready one (the hook may not have
+    // published it yet) and never the published one (its set_async may still
+    // be in flight). three slots, so at most two are busy - no waiting.
+    const int32_t ready = st.mirror_ready.load(std::memory_order_acquire);
+    const int32_t pub   = st.mirror_pub.load(std::memory_order_acquire);
+    int32_t k = -1;
+    for (int32_t c = 0; c < 3; ++c) {
+        const int32_t cand = pub < 0 ? c : (pub + 1 + c) % 3;
+        if (cand != ready && cand != pub) {
+            k = cand;
+            break;
+        }
+    }
+    if (k < 0) {
+        return; // cannot happen: ready and pub occupy at most two of three
+    }
+    std::vector<int32_t> & mir = st.tab_mirror[k];
     if (mir.size() != 2 * n_total) {
         mir.assign(2 * n_total, -1);
     }
@@ -444,43 +528,31 @@ void llama_expert_pool_tab_sync_impl(llama_expert_pool_state & st) {
             }
         }
     }
-    // the GPU table write uses the BACKEND iface (main graph stream): the
-    // buffer-iface tensor_set runs on the legacy per-thread stream which has
-    // no ordering with the compute stream -, the mount chain reads the table
-    // via the compute stream and can see a torn/stale table (the 8/31 D'
-    // second root cause class; the scheduler sanitizer caught it as
-    // "write-after-read on tab_all, no happens-before edge").
-    ggml_backend_tensor_set_async(st.pool_backend, st.tab_all, mir.data(), 0, n_half * sizeof(int32_t));
-    // the flush is queued after all in-flight compute on the main stream
-    // (this step's remaining layers still read the OLD table). no host sync:
-    // the next tab_sync writes the other mirror, so the source of this flush
-    // is not touched until two steps later (a ping-pong, not a wait).
-    // same flush to the CPU-hosted copy (the miss chain's get_rows reads it;
-    // 80KB host-to-host copy, executed on the sync buffer path)
-    if (st.tab_cpu != nullptr) {
-        ggml_backend_tensor_set(st.tab_cpu, mir.data() + n_half, 0, n_half * sizeof(int32_t));
-    }
-    st.tab_mirror_flip ^= 1;
+    st.mirror_ready.store(k, std::memory_order_release);
 }
 
-void swap_copy_one_sync(ggml_backend_t be, ggml_tensor * src, ggml_tensor * pw, int32_t e, int32_t slot) {
-    if (src == nullptr || pw == nullptr) {
+// publish the ready mirror (hook thread only, at a step boundary): the GPU
+// table write uses the BACKEND iface so it is stream-ordered after all
+// in-flight compute on the main stream, and it is queued before the current
+// step's remaining GPU segments submit (the hook runs before the sched
+// resumes, see run_swap in the previous form). no host sync: the worker only
+// reuses a published slot after another publish cycle (mirror slot rules).
+// the CPU-hosted copy is a sync set - same-thread ordering with the miss
+// chain's get_rows reads, exactly as before.
+void llama_expert_pool_tab_publish(llama_expert_pool_state & st) {
+    if (st.tab_all == nullptr) {
         return;
     }
-    const size_t sz = src->nb[2];
-    const char * data = (const char *) src->data + e * src->nb[2];
-    const size_t off  = slot * pw->nb[2];
-    // SYNC copy: only for the dedicated swap worker. the worker reports the
-    // fill "done" only after this returns, so the tables are published after
-    // the copy actually completed (no torn slots; the async variant above is
-    // for the legacy inline path where the sched's split sync covers it).
-    ggml_backend_tensor_set(pw, data, off, sz);
-}
-
-} // namespace
-
-void llama_expert_pool_tab_sync(llama_expert_pool_state & st) {
-    llama_expert_pool_tab_sync_impl(st);
+    const int32_t r = st.mirror_ready.load(std::memory_order_acquire);
+    if (r < 0 || r == st.mirror_pub.load(std::memory_order_acquire)) {
+        return;
+    }
+    const size_t n_half = (size_t) st.tab_all->ne[0] * (size_t) st.tab_all->ne[1];
+    ggml_backend_tensor_set_async(st.pool_backend, st.tab_all, st.tab_mirror[r].data(), 0, n_half * sizeof(int32_t));
+    if (st.tab_cpu != nullptr) {
+        ggml_backend_tensor_set(st.tab_cpu, st.tab_mirror[r].data() + n_half, 0, n_half * sizeof(int32_t));
+    }
+    st.mirror_pub.store(r, std::memory_order_release);
 }
 
 // allocate the per-layer slot widths from the cumulative activation counts
@@ -564,35 +636,17 @@ bool llama_expert_pool_alloc_from_counts(
     return true;
 }
 
-void llama_expert_pool_run_swap(llama_expert_pool_state & st) {
+// marginal exchange + weight copies + mirror rebuild (worker thread only).
+// swap the worst resident expert with the best non-resident one, at most one
+// pair per pooled layer per settled step, gated by the z-sigma confidence
+// test below (the cost-gate/payback terms were retired 8/30; the gate is a
+// property of the estimator, not of the model or hardware).
+static int32_t worker_decide_and_copy(llama_expert_pool_state & st) {
     const int32_t P = (int32_t) st.pooled_layers.size();
     const int32_t n_expert = st.n_expert;
     if (P <= 0 || st.win_cnt.empty()) {
-        return;
+        return 0;
     }
-
-
-    // --- publish the exchanges whose copies the worker completed ---
-    // (double sync point: the slot was unmaped in the tables when its fill
-    // was queued; it is only remapped here, after the copy finished, so a
-    // running graph never sees a torn slot. the merged tables are flushed
-    // once per step at the end of this function.)
-    {
-        std::lock_guard<std::mutex> lk(st.cp_mtx);
-        for (const auto & pe : st.cp_done) {
-            std::vector<int32_t> & res = st.resident[pe.il];
-            if (pe.slot >= 0 && pe.slot < (int32_t) res.size() && res[pe.slot] < 0) {
-                res[pe.slot] = pe.e;
-            }
-            st.cp_inflight[pe.il] = -1;
-        }
-        st.cp_done.clear();
-    }
-    // --- marginal exchange: swap the worst resident expert with the best
-    // non-resident one, at most one pair per pooled layer per step, gated by
-    // the z-sigma confidence test below (the cost-gate/payback terms were
-    // retired 8/30; the gate is a property of the estimator, not of the
-    // model or hardware).
     int32_t delta = 0;
     for (int32_t ilx = 0; ilx < P; ++ilx) {
         const int32_t il = st.pooled_layers[ilx];
@@ -606,10 +660,11 @@ void llama_expert_pool_run_swap(llama_expert_pool_state & st) {
         if (!mnt.active) {
             continue;
         }
-        // worst resident: prefer an EMPTY slot (the sparse-prefill fallback
-        // seeds free slots that the swap fills as the window accumulates;
-        // an empty slot has no incumbent to lose); otherwise the mapped
-        // expert with the lowest window count
+        // worst resident: prefer an EMPTY slot (a sparse seed leaves free
+        // slots that the swap fills as the window accumulates; an empty slot
+        // has no incumbent to lose); otherwise the mapped expert with the
+        // LOWEST window count - the counts are FULL activation counts now
+        // (resident hits included), so the eviction side has real evidence.
         int32_t worst_s = -1;
         int32_t worst_cnt = 0;
         for (int32_t s = 0; s < (int32_t) res.size(); ++s) {
@@ -652,67 +707,121 @@ void llama_expert_pool_run_swap(llama_expert_pool_state & st) {
             continue;
         }
         // gate: the count gap must exceed z sigma of its Poisson noise (two
-        // independent window bins, Var(gap) = cnt_out + cnt_in). z = 3: the
-        // statistical confidence level, independent of model and backend -
-        // boundaries only move when the drift is real and > 3 sigma, so the
-        // exchange frequency is governed by the actual drift rate, not by
-        // noise. drift adaptation in the long run belongs to the segment-end
-        // reallocation (cumulative seg_cnt), not to this per-step test.
+        // independent window bins, Var(gap) = cnt_out + cnt_in). the counts
+        // are REAL on both sides (the eviction side counts resident hits),
+        // so the gate protects a hot resident from a marginally hotter
+        // candidate. z = 3: model- and backend-independent.
         const double gap = (double) (best_cnt - worst_cnt);
         if (gap <= (double) st.swap_sigma * sqrt((double) best_cnt + (double) worst_cnt)) {
             continue;
         }
-        // unmap the victim, queue the fill for the copy worker, publish the
-        // victim at the next step boundary (the slot stays -1 in the tables
-        // until the worker completes, so the step's graphs never read the
-        // in-flight slot: no torn data, one copy per slot)
+        // exchange: the weight copies run here, synchronously on the worker
+        // thread; the resident set commits only after the copies returned,
+        // and the tables keep the OLD mapping until the hook publishes the
+        // rebuilt mirror - so no graph ever sees a half-filled slot (the
+        // one-step-unmap of the old pipeline is gone).
         const int32_t victim_e = res[worst_s];
-        res[worst_s] = -1;
-        // (the merged tables are flushed once at the end of this function;
-        // the flush runs before the step's next GPU segments submit, so the
-        // unmap is visible in time - no per-exchange table write here)
-        // if this layer already has an in-flight fill, its slot is pending -
-        // do not queue a second copy onto the same layer until the first
-        // completed (double-fill protection; skipped exchanges are dropped)
-        if (st.cp_inflight[il] < 0) {
-            st.cp_inflight[il] = worst_s;
-            std::lock_guard<std::mutex> lk(st.cp_mtx);
-            st.cp_todo.push_back({ il, best_e, worst_s });
-            st.cp_cv.notify_one();
-        } else {
-            // layer busy: revert the unmap (the exchange is not issued)
-            res[worst_s] = victim_e;
-            continue;
-        }
+        swap_copy_one_sync(st.pool_backend, st.orig_gate_up[il], st.w_pool_gate_up[il], best_e, worst_s);
+        swap_copy_one_sync(st.pool_backend, st.orig_up[il],      st.w_pool_up[il],      best_e, worst_s);
+        swap_copy_one_sync(st.pool_backend, st.orig_gate[il],    st.w_pool_gate[il],    best_e, worst_s);
+        swap_copy_one_sync(st.pool_backend, st.orig_down[il],    st.w_pool_down[il],    best_e, worst_s);
+        res[worst_s] = best_e;
         LLAMA_LOG_INFV(LLAMA_LOG_VERBOSITY_TRACE,
                 "%s: exchange layer %d (step %d): evict e=%d (cnt %d), fill e=%d (cnt %d)",
                 __func__, il, st.win_step, victim_e, worst_cnt, best_e, best_cnt);
         delta += 1;
     }
-
-    // per-exchange lines: the pair detail (TRACE) and the per-step count
-    // (DEBUG). the INFO level gets a PERIODIC average instead of per-step
-    // noise: the swap runs every step, but by far most steps exchange 0 or 1
-    // pair, so a per-step INFO line is either spam (churn) or silence
-    // (converged). print_timings-style: every 64 steps, one average line.
-    st.swap_sum += delta;
-    if (st.win_step > 0 && st.win_step % 64 == 0) {
-        LLAMA_LOG_INFV(LLAMA_LOG_VERBOSITY_INFO,
-                "%s: marginal swap avg %.1f expert slots/step (past 64 steps, step %d)\n",
-                __func__, (float) st.swap_sum / 64.0f, st.win_step);
-        st.swap_sum = 0;
+    if (delta > 0) {
+        llama_expert_pool_tab_build(st);
+        st.swap_sum += delta;
     }
-    LLAMA_LOG_INFV(LLAMA_LOG_VERBOSITY_DEBUG,
-            "%s: marginal step %d: swapped %d\n",
-            __func__, st.win_step, delta);
-    // ONE merged table flush per step: rebuild the host mirror from the
-    // updated resident sets and write it with a single tensor_set. this
-    // runs before the step's remaining GPU segments submit (they are
-    // submitted by the scheduler after run_swap returns), so both the
-    // unmap (-1 for in-flight slots) and the publish (completed fills) of
-    // this step become visible for the rest of the step.
-    llama_expert_pool_tab_sync(st);
+    return delta;
+}
+
+// settle one queued step marker: drain the route rows pushed before it (the
+// previous step's FULL activation counts), count them into the window
+// window, run the marginal exchange, and rebuild the mirror. worker thread
+// only; the hook never touches win_cnt/win_hist/resident.
+bool llama_expert_pool_worker_settle(llama_expert_pool_state & st) {
+    std::vector<llama_expert_pool_state::route_block> rows;
+    {
+        std::lock_guard<std::mutex> lk(st.route_mtx);
+        // find the first marker WITHOUT consuming anything: rows are only
+        // complete once their marker arrives, so an early wake (rows pushed,
+        // marker not yet) must leave the queue untouched.
+        size_t nrows = 0;
+        for (; nrows < st.route_q.size() && st.route_q[nrows].ilx >= 0; ++nrows) {
+        }
+        if (nrows >= st.route_q.size()) {
+            return false; // no marker queued - nothing to settle
+        }
+        rows.reserve(nrows);
+        for (size_t i = 0; i < nrows; ++i) {
+            rows.push_back(std::move(st.route_q.front()));
+            st.route_q.pop_front();
+        }
+        st.route_q.pop_front(); // the step marker itself
+    }
+    if (rows.empty()) {
+        // a marker with no rows (the first step marker): nothing settled.
+        return true;
+    }
+    // lazy window allocation (the rows are the first thing the worker sees)
+    if (st.win_cnt.empty() && !st.pooled_layers.empty()) {
+        st.win_cnt.assign((size_t) st.pooled_layers.size() * st.n_expert, 0);
+        st.win_hist.resize(st.swap_W);
+    }
+    // count the rows by their own step id. a lagging worker may drain rows
+    // of several old steps at once (multiple markers queued), so group by
+    // step: each step's slot is evicted exactly once, before its rows land.
+    size_t i = 0;
+    while (i < rows.size()) {
+        const int32_t t = rows[i].step;
+        // WRITE-TIME eviction, per step: the slot t % W still holds the rows
+        // of step t - W (or of the previous incarnation of this slot);
+        // decrement them before this step's rows land in the same slot.
+        std::vector<int32_t> & old = st.win_hist[t % st.swap_W];
+        if (!old.empty()) {
+            for (size_t j = 0; j + 1 < old.size(); j += 2) {
+                st.win_cnt[old[j] * st.n_expert + old[j+1]] --;
+            }
+            old.clear();
+        }
+        size_t j = i;
+        for (; j < rows.size() && rows[j].step == t; ++j) {
+            const llama_expert_pool_state::route_block & rb = rows[j];
+            std::vector<int32_t> & hist = st.win_hist[t % st.swap_W];
+            for (const int32_t e : rb.ids) {
+                st.win_cnt[rb.ilx * st.n_expert + e] ++;
+                st.seg_cnt[rb.ilx * st.n_expert + e] ++;
+                hist.push_back(rb.ilx);
+                hist.push_back(e);
+            }
+        }
+        i = j;
+        // the marginal exchange runs after this step's rows are counted: the
+        // decision window now ends at this step, mirroring the old boundary
+        // semantics (run_swap at the next step boundary with the window
+        // including the settled step).
+        const int32_t delta = worker_decide_and_copy(st);
+        st.win_step = t + 1;
+        // per-exchange lines: the pair detail (TRACE) and the per-step count
+        // (DEBUG). the INFO level gets a PERIODIC average instead of per-step
+        // noise. print_timings-style: every 64 steps, one average line.
+        if (delta > 0) {
+            LLAMA_LOG_INFV(LLAMA_LOG_VERBOSITY_DEBUG,
+                    "%s: marginal step %d: swapped %d\n",
+                    __func__, st.win_step, delta);
+        }
+        if (st.win_step > 0 && st.win_step % 64 == 0) {
+            LLAMA_LOG_INFV(LLAMA_LOG_VERBOSITY_INFO,
+                    "%s: marginal swap avg %.1f expert slots/step (past 64 steps, step %d)\n",
+                    __func__, (float) st.swap_sum / 64.0f, st.win_step);
+            st.swap_sum = 0;
+        }
+    }
     // the pool hit rate is printed once at the end of the generation segment
     // by llama_expert_pool_finalize; win_hit/win_miss accumulate across the
     // segment (no per-swap reset here)
+    return true;
 }

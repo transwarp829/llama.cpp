@@ -4,15 +4,27 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 
+#include <atomic>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <deque>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
 #include <utility>
+
+// single source for the MoE small-batch threshold: env
+// GGML_OP_OFFLOAD_MIN_BATCH (same variable and default as the CUDA backend
+// and the sched). every batch-size gate in the pool mechanism derives from
+// this - never a literal.
+inline int32_t llama_expert_pool_offload_min_batch() {
+    static const int32_t v = getenv("GGML_OP_OFFLOAD_MIN_BATCH") != nullptr
+        ? atoi(getenv("GGML_OP_OFFLOAD_MIN_BATCH")) : 32;
+    return v;
+}
 
 // ---------------------------------------------------------------
 // model-level runtime state of the expert pool (direct-mount mode)
@@ -78,14 +90,62 @@ struct llama_expert_pool_state {
     int32_t swap_W = 512;                  // window length in decode steps
     int32_t swap_sigma = 3;                // marginal-exchange confidence (z sigma)
     int32_t n_expert = 0;                  // experts per layer (set at init)
-    int32_t win_step = 0;                  // decode steps accounted in the window
-    std::vector<int32_t> win_cnt;          // [pooled layers * n_expert]
-    std::vector<std::vector<int32_t>> win_hist; // [W] flat (ilx, e) pairs per step
+    // hook-side step counter (the hook only pushes routing rows; the swap
+    // worker owns the window below)
+    int32_t hook_step = 0;
     // per-step per-layer dedup markers: the hook fires once per MUL_MAT_ID
     // node (2-3 per layer per step) and the ids are identical across a
-    // layer's nodes, so the window/hit-miss counting runs once per layer
-    int32_t count_ilx = -1;                // last layer counted into the window
+    // layer's nodes, so the row push/hit-miss counting runs once per layer
+    int32_t count_ilx = -1;                // last layer pushed into the queue
     int32_t stat_ilx  = -1;                // last layer counted into the stats
+
+    // routing rows from the delegate hook to the swap worker. one
+    // block per (step, layer): the FULL activation list of the layer -
+    // resident entries are recovered from the original top-k ids at the -1
+    // positions of the inverse-remapped ids the CPU chain received, so the
+    // window counts BOTH sides (miss + hit) and the eviction side is no
+    // longer blind. the row carries its own mapping facts (the -1 pattern),
+    // so the worker needs no table-version to attribute it.
+    struct route_block {
+        int32_t step = 0;                  // decode step this row belongs to
+        int32_t ilx  = -1;                 // pooled layer index (-1 = step marker)
+        std::vector<int32_t> ids;          // FULL activation expert ids (pool hits recovered from the original top-k row)
+    };
+    std::mutex      route_mtx;
+    std::condition_variable route_cv;
+    std::deque<route_block> route_q;
+    bool route_stop = false;
+
+    // worker-owned swap state (only the swap worker thread touches these):
+    // window counts, history, and the marginal exchange decisions. the hook
+    // NEVER reads them - it only pushes route rows and, at each step
+    // boundary, publishes the mirror the worker hands over.
+    int32_t win_step = 0;                  // decode steps accounted in the window
+    std::vector<int32_t> win_cnt;          // [pooled layers * n_expert] FULL counts
+    std::vector<std::vector<int32_t>> win_hist; // [W] flat (ilx, e) pairs per step
+    int32_t swap_sum = 0;                  // exchanges accumulated this period
+
+    // swap window aggregates of the inference-side counters (cleared by each
+    // publish/stable reader; independent of the per-layer snapshot counters)
+    uint64_t win_hit  = 0;
+    uint64_t win_miss = 0;
+
+    // swap worker thread: consumes the route rows, attributes
+    // counts, runs the marginal exchange (one pair per pooled layer per step
+    // settled), performs the H2D weight copies synchronously (off the
+    // inference thread, off the main graph stream), and rebuilds the merged
+    // table mirror. the tables themselves are only written by the hook at a
+    // step boundary (tab_publish) - the worker does not touch the table
+    // tensors, so no stream/CPU-side ordering is lost.
+    std::thread cp_worker;
+    // mirror handshake: three mirrored table slots. the worker rebuilds
+    // mirror[k] then sets ready=k; the hook publishes the ready mirror (one
+    // set_async to tab_all + one sync set to tab_cpu) once per step boundary
+    // and records pub=k. the worker only writes slots that are neither ready
+    // nor pub, so an async set's source is never overwritten inside the
+    // two-step distance (see the old ping-pong comment below).
+    std::atomic<int32_t> mirror_ready{-1};
+    std::atomic<int32_t> mirror_pub{-1};
 
     // built flag: expert_pool_build() has run (sched_reserve() re-enters
     // expert_pool_init after a rebuild, and a reset() would wipe the fresh
@@ -108,62 +168,28 @@ struct llama_expert_pool_state {
     // llama_expert_pool_get_stats
     std::vector<uint64_t> stat_hit;        // [pooled layers]
     std::vector<uint64_t> stat_miss;       // [pooled layers]
-    // swap-window aggregates (cleared by each swap; independent of the
-    // per-layer snapshot counters above, which a frequent stats reader
-    // resets)
-    uint64_t win_hit  = 0;
-    uint64_t win_miss = 0;
 
-    // marginal-swap exchange pipeline. decisions are made at the step
-    // boundary (win_cnt statistics); the weight copies run on a DEDICATED
-    // worker thread (sync tensor_set), fully decoupled from the main-graph
-    // stream and from inference - the step only pushes requests and, at the
-    // next boundary, commits the ones the worker reported done. this keeps
-    // the swap-in cost off the main graph (no FIFO with the GPU segment)
-    // and guarantees one in-flight copy per slot (the slot stays -1 until
-    // the worker completes; a re-exchange of the same slot waits for the
-    // commit, which only happens after the copy finished).
-    ggml_backend_t pool_backend = nullptr;   // backend owning the pool buft
-    struct pending_exchange {
-        int32_t il;      // pooled layer index
-        int32_t e;       // incoming expert id
-        int32_t slot;    // pool slot it occupies
-    };
-    // swap summary aggregation (periodic INFO line, like print_timings)
-    int32_t swap_sum = 0;                    // exchanges accumulated this period
+    // backend owning the pool buft (the hook publishes the tables on its
+    // main stream, see tab_publish below)
+    ggml_backend_t pool_backend = nullptr;
 
-    // asynchronous copy worker (stage 3, swap tax -> 0):
-    //  - the step's run_swap() only decides and queues requests;
-    //  - the worker performs the H2D copies (ggml_backend_tensor_set, sync on
-    //    the worker's own context) and reports done;
-    //  - the next step boundary publishes completed fills (double sync point,
-    //    no torn slots: a slot is unmaped in the tables when its fill is
-    //    queued and only remapped after the copy completed).
-    std::thread cp_worker;
-    std::mutex cp_mtx;
-    std::condition_variable cp_cv;
-    std::deque<pending_exchange> cp_todo;    // requests, worker pops
-    std::deque<pending_exchange> cp_done;    // completed, step consumes
-    bool cp_stop = false;                    // worker shutdown flag
-    std::vector<int32_t> cp_inflight;        // [max pooled layer + 1] slot of an
-                                             // in-flight fill (or -1), indexed by
-                                             // layer number; double-fill protection
-
-    // merged mount tables (9/1): all layers' remap/remap_inv live in ONE
-    // contiguous [2*n_expert, n_layers] I32 tensor; each layer's views are
-    // sliced from it. the host mirror is rebuilt from resident[] once per
-    // step and flushed with a single tensor_set (step-granular swap update).
-    ggml_tensor * tab_all = nullptr;             // [2*n_expert, n_layers]
-    // 9/1: CPU-hosted mirror of the remap_inv half of tab_all (same layout),
-    // read by the CPU-segment get_rows of the miss chain. updated in the same
-    // tab_sync_impl flush. keeps the CPU chain independent of the pool
-    // segment's 32B output slot race.
-    ggml_tensor * tab_cpu = nullptr;             // [2*n_expert, n_layers] (CPU buft)
-    // ping-pong host mirrors of the merged table: the sync-less flush reads
-    // the mirror written this step, the next tab_sync writes the other one
-    // (two-step distance guarantees the previous set_async finished).
-    std::vector<int32_t> tab_mirror[2];
-    int tab_mirror_flip = 0;
+    // merged mount tables: the remap half lives in tab_all on the pool
+    // device (read by the GPU chain's get_rows), the remap_inv half in
+    // tab_cpu on the CPU device (read by the miss chain's get_rows). both
+    // are [n_expert, n_layers] I32; each layer's remap/remap_inv_host are
+    // views sliced from them. the host mirrors rebuilt by the worker and
+    // published by the hook (step-granular swap update).
+    ggml_tensor * tab_all = nullptr;             // [n_expert, n_layers] remap (pool device)
+    // CPU-hosted copy of the inverse table: the miss chain's get_rows reads
+    // remap_inv_host from HERE (host memory), so its ids are not tied to the
+    // pool segment's 32B output slot. [n_expert, n_layers] layout,
+    // filled in the same tab_build/tab_publish flush as tab_all.
+    ggml_tensor * tab_cpu = nullptr;             // [n_expert, n_layers] remap_inv (CPU buft)
+    // host mirror slots of the merged table (three, see mirror_ready/pub):
+    // the worker writes a slot only when it is neither the ready one nor the
+    // published one, so an async set's source buffer stays untouched for at
+    // least one publish cycle.
+    std::vector<int32_t> tab_mirror[3];
 
     void reset();
 };
@@ -195,13 +221,27 @@ void llama_expert_pool_delegate_begin(
 // shares the main model's tensors) must not feed the pool statistics
 void llama_expert_pool_set_draft_decode(bool on);
 
-// stage 3: one marginal exchange per pooled layer per step. called at a
-// decode step boundary from the delegate hook (swap is on by default with -nep).
-void llama_expert_pool_run_swap(llama_expert_pool_state & st);
+// stage 3 swap worker: the worker owns the window counters, the
+// marginal exchange decisions and the weight copies; the hook only pushes
+// routing rows and publishes ready mirrors at step boundaries.
 void llama_expert_pool_start_worker(llama_expert_pool_state & st);
-// merged mount-table refresh: rebuild the host mirror from resident[] and
-// flush it with a single tensor_set (step-granular update).
-void llama_expert_pool_tab_sync(llama_expert_pool_state & st);
+// push one step marker: the rows queued before it are now a complete step
+// and the worker may settle them. hook use, plus the segment-end drain in
+// llama_context::expert_pool_finalize (which has no decode in flight).
+void llama_expert_pool_push_marker(llama_expert_pool_state & st);
+// settle one queued step marker: the rows pushed before it are the previous
+// step's FULL activation counts (resident + non-resident); they are counted
+// into the window, then the marginal exchange runs (one pair per pooled
+// layer per settled step, sigma gated), and the ready mirror is rebuilt.
+// returns false when no marker is queued.
+bool llama_expert_pool_worker_settle(llama_expert_pool_state & st);
+// rebuild the merged table mirror from resident[] (worker thread only: picks
+// a free slot, writes it, sets mirror_ready). no tensor writes here.
+void llama_expert_pool_tab_build(llama_expert_pool_state & st);
+// publish the ready mirror (hook thread only, at a step boundary): one
+// set_async to tab_all and one sync set to tab_cpu. the single place the
+// table tensors are written, so the old stream/CPU ordering is preserved.
+void llama_expert_pool_tab_publish(llama_expert_pool_state & st);
 
 // segment-end width allocation: the global top-N (layer, expert) pairs of
 // the cumulative activation counts (N = budget slots) decide the per-layer

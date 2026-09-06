@@ -542,17 +542,16 @@ llama_context::~llama_context() {
     // after this body, touching freed pool tensors -> use-after-free at exit)
     sched.reset();
 
-    // stop the swap-copy worker BEFORE the pool buffers are freed: its sync
+    // stop the swap worker BEFORE the pool buffers are freed: its sync
     // tensor_set calls reference the pool tensors; a live worker touching
     // them after the frees below is a use-after-free at exit
     llama_expert_pool_state & st = model.expert_pool_state;
     {
-        std::lock_guard<std::mutex> lk(st.cp_mtx);
-        st.cp_stop = true;
-        st.cp_todo.clear();
-        st.cp_done.clear();
+        std::lock_guard<std::mutex> lk(st.route_mtx);
+        st.route_stop = true;
+        st.route_q.clear();
     }
-    st.cp_cv.notify_all();
+    st.route_cv.notify_all();
     if (st.cp_worker.joinable()) {
         st.cp_worker.join();
     }
@@ -918,7 +917,7 @@ void llama_context::expert_pool_build() {
         }
     }
 
-    // --- direct-mount registration (GGML_EXPPOOL_MOUNT=1) ---
+    // --- direct-mount registration ---
     // registered HERE, not at first fill: sched_reserve() builds probe graphs
     // before the first process_ubatch, and the mount adds nodes, so the probe
     // must see the same topology as real runs. the remap/mask tables are
@@ -926,43 +925,40 @@ void llama_context::expert_pool_build() {
     // in pool_buf); their CONTENT is written by expert_pool_fill(), which
     // fills every element (sentinel default + resident override).
     // NOTE: the gate only skips REGISTRATION - never the allocation below.
+    // GGML_EXPPOOL_MOUNT=0 is handled in expert_pool_init (whole-pool
+    // disable); only the gated layers below skip registration.
     llama_expert_pool_clear_mount();
-    const char * mount_env = getenv("GGML_EXPPOOL_MOUNT");
-    if (mount_env != nullptr && mount_env[0] == '0') {
-        st.direct_mount = false;
-    } else {
-        st.direct_mount = true;
-        for (int32_t il : pooled_ils) {
-            const int32_t s_il = (int32_t) st.resident[il].size();
-            if (s_il <= 0) {
-                continue;
-            }
-            const llama_layer & L = model.layers[il];
-            if (L.ffn_up_exps_s || L.ffn_gate_exps_s ||
-                L.ffn_gate_up_exps_b || L.ffn_up_exps_b || L.ffn_gate_exps_b ||
-                (L.ffn_down_exps_s && L.ffn_down_exps_b)) {
-                // gate/up-side scale/bias cannot be replicated by the GPU chain
-                // (they are baked into the merged gate_up flow); down-side scale
-                // alone is fine (applied via the scale table) and down-side
-                // bias alone is fine (add_id -1 = no-op), but BOTH
-                // together would change the operator order, so disable the mount
-                LLAMA_LOG_WARN("%s: per-expert scale/bias on layer %d, direct mount disabled for it\n",
-                        __func__, il);
-                continue;
-            }
-            if (!st.w_pool_down[il]) {
-                continue;
-            }
-            llama_expert_pool_mount m;
-            m.active  = true;
-            m.w_up      = st.w_pool_up[il];
-            m.w_gate    = st.w_pool_gate[il];
-            m.w_down    = st.w_pool_down[il];
-            m.w_gate_up = st.w_pool_gate_up[il];
-            m.w_down_s  = L.ffn_down_exps_s;
-            m.w_down_b  = L.ffn_down_exps_b;
-            llama_expert_pool_register_mount(il, m);
+    st.direct_mount = true;
+    for (int32_t il : pooled_ils) {
+        const int32_t s_il = (int32_t) st.resident[il].size();
+        if (s_il <= 0) {
+            continue;
         }
+        const llama_layer & L = model.layers[il];
+        if (L.ffn_up_exps_s || L.ffn_gate_exps_s ||
+            L.ffn_gate_up_exps_b || L.ffn_up_exps_b || L.ffn_gate_exps_b ||
+            (L.ffn_down_exps_s && L.ffn_down_exps_b)) {
+            // gate/up-side scale/bias cannot be replicated by the GPU chain
+            // (they are baked into the merged gate_up flow); down-side scale
+            // alone is fine (applied via the scale table) and down-side
+            // bias alone is fine (add_id -1 = no-op), but BOTH
+            // together would change the operator order, so disable the mount
+            LLAMA_LOG_WARN("%s: per-expert scale/bias on layer %d, direct mount disabled for it\n",
+                    __func__, il);
+            continue;
+        }
+        if (!st.w_pool_down[il]) {
+            continue;
+        }
+        llama_expert_pool_mount m;
+        m.active  = true;
+        m.w_up      = st.w_pool_up[il];
+        m.w_gate    = st.w_pool_gate[il];
+        m.w_down    = st.w_pool_down[il];
+        m.w_gate_up = st.w_pool_gate_up[il];
+        m.w_down_s  = L.ffn_down_exps_s;
+        m.w_down_b  = L.ffn_down_exps_b;
+        llama_expert_pool_register_mount(il, m);
     }
     // step-boundary anchors: the first/last shared layer that actually has a
     // mount (a 0-slot layer is not registered and its hook early-returns, so
@@ -988,7 +984,7 @@ void llama_context::expert_pool_build() {
         // CPU-hosted copy of the inverse table: the miss chain's get_rows reads
         // remap_inv_host from HERE (host memory), so its ids are not tied to the
         // pool segment's 32B output slot. [n_expert, n_layers] layout,
-        // filled in the same tab_sync_impl flush as tab_all.
+        // filled in the same tab_build/tab_publish flush as tab_all.
         pool_tab_cpu_ctx = ggml_init({ 64u*1024u, nullptr, true });
         st.tab_cpu = ggml_new_tensor_2d(pool_tab_cpu_ctx, GGML_TYPE_I32, n_expert,
                                         llama_model_n_layer(&model));
@@ -1128,7 +1124,7 @@ void llama_context::expert_pool_build() {
             }
             const std::vector<int32_t> & res = st.resident[il];
             // (table contents are written once by expert_pool_fill() via the
-            // merged tab_sync: remap -> tab_all, inv -> tab_cpu in one set)
+            // merged tab_build/tab_publish: remap -> tab_all, inv -> tab_cpu in one set)
             (void) res;
         }
     }
@@ -1180,7 +1176,7 @@ void llama_context::expert_pool_fill() {
             // I32 ids tables: get_rows outputs the table type natively on
             // every backend (ggml.c), so no cast is needed anywhere. the
             // remap + inv tables are flushed once below, after
-            // the loop (tab_sync), so no per-layer set here.
+            // the loop (tab_build/tab_publish), so no per-layer set here.
             if (m.scale != nullptr) {
                 // one flat table: expert e -> its down scale value. the -1 ids
                 // already zero the skipped columns on both chains, so no
@@ -1225,9 +1221,11 @@ void llama_context::expert_pool_fill() {
         llama_expert_pool_start_worker(st);
     }
 
-    // initial merged table flush: the resident sets from expert_pool_init()
-    // land on the device in ONE tensor_set (before the first decode)
-    llama_expert_pool_tab_sync(st);
+    // initial merged table mirror: the resident sets from expert_pool_init()
+    // land on the device in ONE publish (before the first decode). the worker
+    // is not running yet, so build+publish run safely on this thread.
+    llama_expert_pool_tab_build(st);
+    llama_expert_pool_tab_publish(st);
 
     // --- moe routing-log hook (feeds GGML_EXPPOOL_ROUTING_LOG) ---
     if (st.direct_mount) {
@@ -4317,6 +4315,7 @@ bool llama_context::cb_eval_wrapper(ggml_tensor * t, bool ask, void * user_data)
 void llama_context::expert_cache_record_node(ggml_tensor * node) {
     const ggml_tensor * ids_t = node->src[2];
 
+    GGML_ASSERT(ids_t->type == GGML_TYPE_I32); // mul_mat_id routing ids are always I32
     if (ids_t == last_ec_ids) {
         return; // gate/up/down share the same ids tensor
     }
@@ -5083,7 +5082,7 @@ llama_context * llama_get_ctx_other(struct llama_context * ctx) {
 
 extern "C" uint32_t llama_expert_pool_get_stats(struct llama_context * ctx,
         struct llama_expert_pool_layer_stats * out, uint32_t max_layers) {
-    if (ctx == nullptr) {
+    if (ctx == nullptr || (max_layers > 0 && out == nullptr)) {
         return 0;
     }
     return ctx->expert_pool_stats_snapshot(out, max_layers);
@@ -5101,7 +5100,9 @@ uint32_t llama_context::expert_pool_stats_snapshot(llama_expert_pool_layer_stats
         out[i].miss_rows = st.stat_miss[i];
     }
     // snapshot semantics: returns the totals since the previous call (per
-    // decode-step usage resets after each read)
+    // decode-step usage resets after each read). partial reads (n < pooled
+    // layers) reset only the layers returned - always read all layers when
+    // comparing counters across layers.
     std::fill(st.stat_hit.begin(),  st.stat_hit.begin()  + n, 0);
     std::fill(st.stat_miss.begin(), st.stat_miss.begin() + n, 0);
     return n;
@@ -5112,14 +5113,32 @@ void llama_context::expert_pool_finalize() {
     if (st.win_hit + st.win_miss == 0) {
         return;
     }
-    // generation-segment hit rate, printed once at segment end (see
-    // llama_expert_pool_run_swap: win_hit/win_miss accumulate across swaps)
+    // generation-segment hit rate, printed once at segment end
+    // (win_hit/win_miss accumulate across swaps)
     LLAMA_LOG_INFV(LLAMA_LOG_VERBOSITY_INFO, "%s: pool hit rate %.1f%% (%llu/%llu rows, generation segment)\n", __func__,
             100.0 * st.win_hit / (double) (st.win_hit + st.win_miss),
             (unsigned long long) st.win_hit,
             (unsigned long long) (st.win_hit + st.win_miss));
     st.win_hit  = 0;
     st.win_miss = 0;
+
+    // the segment-end accounting below reads worker-owned state (win_step,
+    // swap_sum, seg_cnt, resident sizes): settle the tail first, then stop
+    // the worker (the join is the barrier). restart it if no rebuild follows.
+    const bool had_worker = st.swap_auto && st.cp_worker.joinable();
+    if (had_worker) {
+        // tail drain: rows queued since the last step boundary have no marker
+        // yet - push one so the worker settles them before the join instead
+        // of dropping the segment tail from the window/seg_cnt
+        llama_expert_pool_push_marker(st);
+        {
+            std::lock_guard<std::mutex> lk(st.route_mtx);
+            st.route_stop = true;
+        }
+        st.route_cv.notify_all();
+        st.cp_worker.join();
+        st.route_stop = false;
+    }
 
     // segment-end flush: if the segment ended between two 64-step report
     // boundaries, print the partial-window average (a short second round
@@ -5143,6 +5162,9 @@ void llama_context::expert_pool_finalize() {
         std::vector<std::vector<int32_t>> resident;
         if (!llama_expert_pool_alloc_from_counts(
                     st.seg_cnt, n_pooled, st.n_expert, st.budget_slots, resident)) {
+            if (had_worker) {
+                llama_expert_pool_start_worker(st);
+            }
             return;
         }
         bool changed = false;
@@ -5153,26 +5175,15 @@ void llama_context::expert_pool_finalize() {
             }
         }
         if (!changed) {
+            if (had_worker) {
+                llama_expert_pool_start_worker(st);
+            }
             return;
         }
-        // stop the swap-copy worker and drain its queues first: the rebuild
-        // below frees the pool tensors the worker may still be copying into
-        // (a stale request would also index the narrower new pool out of bounds)
-        {
-            std::lock_guard<std::mutex> lk(st.cp_mtx);
-            st.cp_stop = true;
-            st.cp_todo.clear();
-            st.cp_done.clear();
-        }
-        st.cp_cv.notify_all();
-        if (st.cp_worker.joinable()) {
-            st.cp_worker.join();
-        }
-        st.cp_stop = false;
-        st.cp_inflight.clear();
         // rebuild: the old pool tensors/tables go away with their contexts.
-        // the sched may still run in-flight async copies (the marginal-swap
-        // pipeline issues them per step): synchronize before freeing.
+        // the worker is already stopped; the sched may still run in-flight
+        // async copies (the publish pipeline issues them per step):
+        // synchronize before freeing.
         synchronize();
         llama_expert_pool_clear_mount();
         pool_buf.reset();
@@ -5196,6 +5207,8 @@ void llama_context::expert_pool_finalize() {
         for (auto & m : st.tab_mirror) {
             m.clear();
         }
+        st.mirror_ready.store(-1);
+        st.mirror_pub.store(-1);
         st.resident.assign(model.hparams.n_layer(), {});
         for (int32_t ilx = 0; ilx < n_pooled; ++ilx) {
             st.resident[st.pooled_layers[ilx]] = resident[ilx];

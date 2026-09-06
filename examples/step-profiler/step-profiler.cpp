@@ -20,7 +20,7 @@
 // llama-step-profiler
 //
 // measures per-step (per-token) decode timing using the scheduler eval callback
-// wrtes:
+// writes:
 //   <prefix>.timing.csv   raw view, one row per (step, layer): the 20-column
 //                         execution-order layout, plus a per-step summary row
 //                         (layer = -1) carrying wall/gap/cb and totals
@@ -150,6 +150,7 @@ static bool cb_eval(ggml_tensor * t, bool ask, void * user_data) {
             if (layer >= 0 && layer < (int) data->n_layers &&
                 (cur_step != data->last_routing_step || layer != data->last_routing_layer)) {
                 const ggml_tensor * ids = t->src[2];
+                GGML_ASSERT(ids->type == GGML_TYPE_I32); // routing ids are always I32
                 const int64_t n = ids->ne[0] * ids->ne[1]; // [n_expert_used, n_tokens]
                 std::vector<int32_t> buf(n > 0 ? n : 1, 0);
                 ggml_backend_tensor_get(ids, buf.data(), 0, n * sizeof(int32_t));
@@ -170,35 +171,57 @@ static bool cb_eval(ggml_tensor * t, bool ask, void * user_data) {
     return true;
 }
 
-// write one timing row. layer < 0 = step summary row (wall/gap/cb + totals),
-// layer >= 0 = per-layer row. the delegate stats come from `dl` (nullptr for
-// non-pooled layers).
+// open <prefix><suffix> for writing and emit the header row; false on failure
+static bool open_csv(std::ofstream & f, const std::string & path, const char * header) {
+    f.open(path);
+    if (!f) {
+        LOG_ERR("failed to open %s\n", path.c_str());
+        return false;
+    }
+    f << header;
+    return true;
+}
+
+// six category columns in csv order
+static void write_cat_cols(std::ofstream & f, const double cats[CAT_COUNT]) {
+    f << cats[CAT_ATTN] << "," << cats[CAT_ROUTER] << "," << cats[CAT_EXPERT] << ","
+      << cats[CAT_SHARED] << "," << cats[CAT_NORM] << "," << cats[CAT_OTHER];
+}
+
+// delegate hit/miss columns (zeros when no pool stats)
+static void write_hit_cols(std::ofstream & f, double hit, double miss) {
+    f << hit << "," << miss;
+}
+
+// per-layer category value, 0 when the layer never ran a node of that bucket
+static double layer_cat_at(const step_record & s, int cat, int layer) {
+    const auto & v = s.layer_cat[cat];
+    return layer < (int) v.size() ? v[layer] : 0.0;
+}
+
 static void write_timing_row(std::ofstream & fout, int step, int layer, const step_record & s,
                              const llama_expert_pool_layer_stats * dl) {
+    // layer < 0 = step summary row (wall/gap/cb + totals), else per-layer row
     const double gap_ms = std::max(0.0, s.wall_ms - s.sum_nodes_ms - s.cb_ms);
+    const double hit  = dl != nullptr ? (double) dl->hit_rows  : 0.0;
+    const double miss = dl != nullptr ? (double) dl->miss_rows : 0.0;
     fout << step << "," << layer << ",";
     if (layer < 0) {
-        fout << s.wall_ms << ","
-             << s.cat_ms[CAT_ATTN] << "," << s.cat_ms[CAT_ROUTER] << ","
-             << s.cat_ms[CAT_EXPERT] << "," << s.cat_ms[CAT_SHARED] << ","
-             << s.cat_ms[CAT_NORM] << "," << s.cat_ms[CAT_OTHER] << ","
-             << (dl ? std::to_string(dl->hit_rows) : "0") << ","
-             << (dl ? std::to_string(dl->miss_rows) : "0") << ","
-             << gap_ms << "," << s.cb_ms << "\n";
+        fout << s.wall_ms << ",";
+        write_cat_cols(fout, s.cat_ms);
+        fout << ",";
+        write_hit_cols(fout, hit, miss);
+        fout << "," << gap_ms << "," << s.cb_ms << "\n";
     } else {
-        const auto & lc = s.layer_cat;
-        const double attn   = layer < (int) lc[CAT_ATTN].size()   ? lc[CAT_ATTN][layer]   : 0.0;
-        const double router = layer < (int) lc[CAT_ROUTER].size() ? lc[CAT_ROUTER][layer] : 0.0;
-        const double moe    = layer < (int) lc[CAT_EXPERT].size() ? lc[CAT_EXPERT][layer] : 0.0;
-        const double shared = layer < (int) lc[CAT_SHARED].size() ? lc[CAT_SHARED][layer] : 0.0;
-        const double norm   = layer < (int) lc[CAT_NORM].size()   ? lc[CAT_NORM][layer]   : 0.0;
-        const double other  = layer < (int) lc[CAT_OTHER].size()  ? lc[CAT_OTHER][layer]  : 0.0;
-        fout << ","
-             << attn << "," << router << ","
-             << moe << "," << shared << "," << norm << "," << other << ","
-             << (dl ? std::to_string(dl->hit_rows) : "0") << ","
-             << (dl ? std::to_string(dl->miss_rows) : "0")
-             << ",,\n"; // wall/gap/cb are step-level only
+        double cats[CAT_COUNT];
+        for (int c = 0; c < CAT_COUNT; ++c) {
+            cats[c] = layer_cat_at(s, c, layer);
+        }
+        fout << ",";
+        write_cat_cols(fout, cats);
+        fout << ",";
+        write_hit_cols(fout, hit, miss);
+        fout << ",,\n"; // wall/gap/cb are step-level only
     }
     fout.flush();
 }
@@ -319,33 +342,13 @@ int main(int argc, char ** argv) {
         prefix = "step-profile";
     }
 
-    std::ofstream f_timing(std::string(prefix) + ".timing.csv");
-    if (!f_timing) {
-        LOG_ERR("failed to open %s\n", (std::string(prefix) + ".timing.csv").c_str());
+    std::ofstream f_timing, f_summary, f_deleg, f_rout;
+    if (!open_csv(f_timing, std::string(prefix) + ".timing.csv", csv_header) ||
+        !open_csv(f_summary, std::string(prefix) + ".summary.csv", csv_header) ||
+        !open_csv(f_deleg, std::string(prefix) + ".delegate.csv", "step,hit_rows,miss_rows\n") ||
+        !open_csv(f_rout, std::string(prefix) + ".routing.csv", "step,layer,expert_ids\n")) {
         return 1;
     }
-    f_timing << csv_header;
-
-    std::ofstream f_summary(std::string(prefix) + ".summary.csv");
-    if (!f_summary) {
-        LOG_ERR("failed to open %s\n", (std::string(prefix) + ".summary.csv").c_str());
-        return 1;
-    }
-    f_summary << csv_header;
-
-    std::ofstream f_deleg(std::string(prefix) + ".delegate.csv");
-    if (!f_deleg) {
-        LOG_ERR("failed to open %s\n", (std::string(prefix) + ".delegate.csv").c_str());
-        return 1;
-    }
-    f_deleg << "step,hit_rows,miss_rows\n";
-
-    std::ofstream f_rout(std::string(prefix) + ".routing.csv");
-    if (!f_rout) {
-        LOG_ERR("failed to open %s\n", (std::string(prefix) + ".routing.csv").c_str());
-        return 1;
-    }
-    f_rout << "step,layer,expert_ids\n";
     f_rout.flush();
     data.f_routing = &f_rout;
 
@@ -465,17 +468,18 @@ int main(int argc, char ** argv) {
         }
         {
             const double hit = r_hit / nd, miss = r_miss / nd;
-            f_summary << "-1,-1," << run.wall_ms << "," << run.cat_ms[CAT_ATTN] << "," << run.cat_ms[CAT_ROUTER] << ","
-                      << run.cat_ms[CAT_EXPERT] << "," << run.cat_ms[CAT_SHARED] << "," << run.cat_ms[CAT_NORM] << ","
-                      << run.cat_ms[CAT_OTHER] << "," << hit << "," << miss << ","
-                      << std::max(0.0, run.wall_ms - run.sum_nodes_ms - run.cb_ms) << "," << run.cb_ms << "\n";
+            f_summary << "-1,-1," << run.wall_ms << ",";
+            write_cat_cols(f_summary, run.cat_ms);
+            f_summary << ",";
+            write_hit_cols(f_summary, hit, miss);
+            f_summary << "," << std::max(0.0, run.wall_ms - run.sum_nodes_ms - run.cb_ms) << "," << run.cb_ms << "\n";
         }
         for (int l = 0; l < (int) data.n_layers; ++l) {
-            f_summary << "-1," << l << ","
-                      << run.cat_ms[CAT_ATTN] << "," << run.cat_ms[CAT_ROUTER] << ","
-                      << run.cat_ms[CAT_EXPERT] << "," << run.cat_ms[CAT_SHARED] << "," << run.cat_ms[CAT_NORM] << ","
-                      << run.cat_ms[CAT_OTHER] << ","
-                      << (l_hit[l] / nd) << "," << (l_miss[l] / nd) << ",,\n";
+            f_summary << "-1," << l << ",";
+            write_cat_cols(f_summary, run.cat_ms);
+            f_summary << ",";
+            write_hit_cols(f_summary, l_hit[l] / nd, l_miss[l] / nd);
+            f_summary << ",,\n";
         }
         f_summary.flush();
     }
