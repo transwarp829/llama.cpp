@@ -2196,7 +2196,20 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // NOTE: draft contexts (ctx_other set) must never build the mount chain:
     // the mount registry is global and keyed by layer index only, so a drafter
     // graph would pick up the MAIN model's mounts (wrong tensors, wrong pool).
-    if (!chain_only && cparams.expert_pool > 0 && il >= 0 && cparams.ctx_other == nullptr) {
+    // small-batch gate: the mount chain is a small-batch-only feature (user
+    // ruling: layer-parallel stays below the offload threshold). at/above the MoE offload threshold the miss
+    // chain flips to the GPU and runs via the upstream selective-copy path;
+    // the mount chain (and its shared-output merge segment) must not build
+    // there, so every form (plain -cmoe, serial pool, parallel pool) runs
+    // the SAME verified native graph shape and the pool is inert for that
+    // graph.
+    static const int32_t moe_gate_min = llama_expert_pool_offload_min_batch();
+    // the graph context's n_tokens is the real batch size of THIS graph - the
+    // tensor dims are ambiguous (ids/cur can be 2D or 3D depending on the
+    // graph form), so never derive T from a tensor here.
+    const bool small_batch = n_tokens < moe_gate_min;
+    if (!chain_only && cparams.expert_pool > 0 && il >= 0 && cparams.ctx_other == nullptr &&
+        small_batch) {
         const llama_expert_pool_mount & mnt = llama_expert_pool_get_mount(il);
         if (mnt.active) {
             // all tables live on the pool device, so every gather runs on the
@@ -2220,19 +2233,15 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             // the pool remap gather (below, GPU segment) and the inverse remap
             // gather (CPU segment) share this one clean contiguous topk copy;
             // each side produces its own -1 (pool skip / inverse) locally.
-            // private copy of the flat ids: the copy shares the small-slot
-            // family with the remapped outputs of the same step; the window
-            // keeps both sides reading a -1-free source.
-            ids_flat = ggml_cont(ctx0, ids_flat);
-            cb(ids_flat, "ffn_moe_ids_flat_priv", il);
+            // (ablation B: ids_flat_priv removed - the alloc-deps added 9/4
+            // keep the mount block's tensors alive until the mount tail, so
+            // the shared-slot reuse the priv protected against is now ruled
+            // out by the scheduler dependency model)
             ggml_tensor * remap_3d = ggml_reshape_3d(ctx0, mnt.remap, 1, n_expert, 1);
             ids_remap = ggml_get_rows(ctx0, remap_3d, ids_flat);
             ids_remap = ggml_reshape_2d(ctx0, ids_remap, n_expert_used, n_tokens);
-            // TEMP (9/2): force a private copy of the ids: the get_rows output
-            // shares a 32B galloc slot with other small tensors, and the
-            // layer-parallel early submit reads it while the CPU miss chain
-            // (and later layers) write their own ids into the same slot.
-            ids_remap = ggml_cont(ctx0, ids_remap);
+            // no private copy here: the gather rides inside the mount split,
+            // so stream order reads it before any later reuse of its slot
             cb(ids_remap, "ffn_moe_ids_remap", il);
 
             // inverse table for the CPU chain: resident -> -1, non-resident ->
