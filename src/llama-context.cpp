@@ -735,7 +735,10 @@ void llama_context::expert_pool_init() {
     // a layer pools only when every present expert matrix resolves to a host
     // buffer under the same first-match rule the loader applies; one
     // device-pinned matrix (e.g. a narrow -ot) skips the whole layer instead
-    // of leaving a mixed CPU/GPU state the two chains cannot split exactly
+    // of leaving a mixed CPU/GPU state the two chains cannot split exactly.
+    // the layer must also be GPU-resident: the pool chain reads the layer's
+    // FFN input after the GPU segment, so CPU-attn layers (e.g. a partial
+    // -ngl) keep the pure -cmoe path
     std::vector<int32_t> pooled_ils;
     const llama_model_tensor_buft_override * ov = model.params.tensor_buft_overrides;
     if (ov) {
@@ -766,6 +769,10 @@ void llama_context::expert_pool_init() {
         if (!pats.empty()) {
             for (int32_t il = 0; il < n_layer; ++il) {
                 const llama_layer & L = model.layers[il];
+                // CPU-attn layers are never pooled (see comment above)
+                if (ggml_backend_dev_type(model.dev_layer(il)) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                    continue;
+                }
                 ggml_tensor * ws[4] = {L.ffn_gate_up_exps, L.ffn_up_exps, L.ffn_gate_exps, L.ffn_down_exps};
                 bool any = false;
                 bool all_cpu = true;
