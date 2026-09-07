@@ -2016,7 +2016,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * gate_exps_s,
          ggml_tensor * down_exps_s,
          ggml_tensor * selected_experts_in,
-         ggml_tensor * chain_weights_in) const {
+         ggml_tensor * chain_weights_in,
+         ggml_tensor * chain_scale_up,
+         ggml_tensor * chain_scale_gate) const {
     const int64_t n_embd   = cur->ne[0];
     const int64_t n_tokens = cur->ne[1];
     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
@@ -2042,6 +2044,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     ggml_tensor * ids_remap = nullptr; // remapped expert ids (pool chain), GPU segment
     ggml_tensor * mount_scale = nullptr; // [1, n_used, T] down scale, gathered on
                                          // the GPU segment, used by both chains
+    ggml_tensor * mount_scale_up = nullptr;   // factored up scale, pre-activation
+    ggml_tensor * mount_scale_gate = nullptr; // factored gate scale, same
 
     if (chain_only) {
         // weights are never read: the chain returns the raw down output
@@ -2272,6 +2276,21 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 mount_scale = ggml_reshape_3d(ctx0, mount_scale, 1, n_expert_used, n_tokens);
                 cb(mount_scale, "ffn_moe_scale", il);
             }
+            // factored up/gate scales: same clean-ids gather; consumed
+            // pre-activation on both chains (activation is nonlinear, so the
+            // scale cannot wait until the merge like the down scale does)
+            if (mnt.scale_up != nullptr) {
+                ggml_tensor * sc3 = ggml_reshape_3d(ctx0, mnt.scale_up, 1, n_expert, 1);
+                mount_scale_up = ggml_get_rows(ctx0, sc3, ids_flat);
+                mount_scale_up = ggml_reshape_3d(ctx0, mount_scale_up, 1, n_expert_used, n_tokens);
+                cb(mount_scale_up, "ffn_moe_scale_up", il);
+            }
+            if (mnt.scale_gate != nullptr) {
+                ggml_tensor * sc3 = ggml_reshape_3d(ctx0, mnt.scale_gate, 1, n_expert, 1);
+                mount_scale_gate = ggml_get_rows(ctx0, sc3, ids_flat);
+                mount_scale_gate = ggml_reshape_3d(ctx0, mount_scale_gate, 1, n_expert_used, n_tokens);
+                cb(mount_scale_gate, "ffn_moe_scale_gate", il);
+            }
 
             // keep the 2D cur for the mounted chain below: the miss chain
             // reshapes cur to 3d in place (see build_expert_chain), but the
@@ -2298,10 +2317,13 @@ build_expert_chain:
         // the CPU chain reads the inverse remap: resident columns are -1
         // (zeroed natively), non-resident columns keep their expert ids
         selected_experts = mount_ids_cpu;
-        // the down scale would index this ids tensor (it may contain -1,
-        // which get_rows cannot take); it is re-applied per column after
-        // the chain via mount_scale instead
+        // the scales would index this ids tensor (it may contain -1,
+        // which get_rows cannot take); they are re-applied per column via
+        // the factored mount_scale_* instead (down at the merge, up/gate
+        // pre-activation at the marker points below)
         down_exps_s = nullptr;
+        up_exps_s   = nullptr;
+        gate_exps_s = nullptr;
     }
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
     if (chain_only) {
@@ -2330,6 +2352,16 @@ build_expert_chain:
         if (up_exps_s) {
             cb(gate_up, "ffn_moe_gate_up_scaled", il);
         }
+        // factored up scale: same point (post-mm, pre-split), native order
+        // mm -> x scale -> +bias -> activation is preserved on both chains;
+        // skipped (-1) columns are 0 here, so 0 x scale = 0 is exact
+        {
+            ggml_tensor * fu = chain_only ? chain_scale_up : mount_scale_up;
+            if (fu != nullptr) {
+                gate_up = ggml_mul(ctx0, gate_up, fu);
+                cb(gate_up, "ffn_moe_gate_up_fscale", il);
+            }
+        }
 
         if (gate_up_exps_b) {
             gate_up = ggml_add_id(ctx0, gate_up, gate_up_exps_b, selected_experts);
@@ -2349,6 +2381,13 @@ build_expert_chain:
         if (up_exps_s) {
             cb(up, "ffn_moe_up_scaled", il);
         }
+        {
+            ggml_tensor * fu = chain_only ? chain_scale_up : mount_scale_up;
+            if (fu != nullptr) {
+                up = ggml_mul(ctx0, up, fu);
+                cb(up, "ffn_moe_up_fscale", il);
+            }
+        }
 
         if (up_exps_b) {
             up = ggml_add_id(ctx0, up, up_exps_b, selected_experts);
@@ -2364,6 +2403,13 @@ build_expert_chain:
 
         if (gate_exps_s) {
             cb(cur, "ffn_moe_gate_scaled", il);
+        }
+        {
+            ggml_tensor * fg = chain_only ? chain_scale_gate : mount_scale_gate;
+            if (fg != nullptr) {
+                cur = ggml_mul(ctx0, cur, fg);
+                cb(cur, "ffn_moe_gate_fscale", il);
+            }
         }
 
         if (gate_exps_b) {
@@ -2489,9 +2535,10 @@ build_expert_chain:
         // build_expert_chain) and the ids lookup ride inside, so the whole
         // block can run ahead of the CPU miss chain.
         mount_out = build_moe_ffn(mnt_cur, gate_inp, gate_inp_b,
-            mount_p->w_up, nullptr, mount_p->w_gate, nullptr, mount_p->w_down, mount_p->w_down_b, exp_probs_b,
+            mount_p->w_up, mount_p->w_up_b, mount_p->w_gate, mount_p->w_gate_b, mount_p->w_down, mount_p->w_down_b, exp_probs_b,
             n_expert, n_expert_used, type_op, norm_w, w_scale, gating_op, il,
-            mnt_cur, mount_p->w_gate_up, nullptr, nullptr, nullptr, nullptr, ids_remap, weights);
+            mnt_cur, mount_p->w_gate_up, nullptr, nullptr, nullptr, nullptr, ids_remap, weights,
+            mount_scale_up, mount_scale_gate);
         cb(mount_out, "ffn_moe_mount", il);
     }
 
