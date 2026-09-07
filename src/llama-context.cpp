@@ -695,6 +695,15 @@ void llama_context::expert_pool_init() {
     if (cparams.expert_pool <= 0) {
         return;
     }
+    // multi-GPU (layer split) is not supported by the pool yet: per-device
+    // pools are the planned design, but without a validated path the pool
+    // must not run with N devices (single-device pools on one card would
+    // round-trip every pooled layer through card 0). keep the pure -cmoe.
+    if (model.n_devices() > 1) {
+        LLAMA_LOG_WARN("%s: multi-GPU layer split not supported for the expert pool yet, "
+                       "pool disabled (pure -cmoe)\n", __func__);
+        return;
+    }
     // the pool now runs only in direct-mount mode (in-graph GPU chain); the
     // legacy mini-graph delegate path was removed with the -1-ids refactor
     {
