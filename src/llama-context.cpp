@@ -731,35 +731,64 @@ void llama_context::expert_pool_init() {
         st.swap_per_step = std::atoi(swap_per_step_env);
     }
 
-    // --- find the pooled layers (MoE weights that live on the CPU) ---
+    // --- find the pooled layers (ALL expert matrices of the layer on CPU) ---
+    // a layer pools only when every present expert matrix resolves to a host
+    // buffer under the same first-match rule the loader applies; one
+    // device-pinned matrix (e.g. a narrow -ot) skips the whole layer instead
+    // of leaving a mixed CPU/GPU state the two chains cannot split exactly
     std::vector<int32_t> pooled_ils;
     const llama_model_tensor_buft_override * ov = model.params.tensor_buft_overrides;
     if (ov) {
-        std::vector<std::regex> res;
+        struct ov_pat {
+            std::regex re;
+            bool is_host;
+            ov_pat(const std::regex & r, bool h) : re(r), is_host(h) {}
+        };
+        std::vector<ov_pat> pats;
         try {
             for (const llama_model_tensor_buft_override * o = ov; o->pattern; ++o) {
-                if (ggml_backend_buft_is_host(o->buft)) {
-                    res.emplace_back(o->pattern);
-                }
+                pats.emplace_back(std::regex(o->pattern), ggml_backend_buft_is_host(o->buft));
             }
         } catch (const std::regex_error &) {
-            res.clear();
+            pats.clear();
         }
-        if (!res.empty()) {
+        // loader order: the first matching pattern wins (host or device)
+        auto resolve_host = [&](const char * name, bool & matched_host) -> bool {
+            matched_host = false;
+            for (const auto & p : pats) {
+                if (std::regex_search(name, p.re)) {
+                    matched_host = p.is_host;
+                    return p.is_host;
+                }
+            }
+            return false; // no override: default placement, never pooled
+        };
+        if (!pats.empty()) {
             for (int32_t il = 0; il < n_layer; ++il) {
                 const llama_layer & L = model.layers[il];
-                ggml_tensor * w = L.ffn_gate_up_exps ? L.ffn_gate_up_exps :
-                                 (L.ffn_up_exps ? L.ffn_up_exps : L.ffn_gate_exps);
-                if (w == nullptr) {
-                    continue;
-                }
-                char name_buf[GGML_MAX_NAME + 1] = {0};
-                memcpy(name_buf, w->name, GGML_MAX_NAME);
-                for (const auto & re : res) {
-                    if (std::regex_search(name_buf, re)) {
-                        pooled_ils.push_back(il);
+                ggml_tensor * ws[4] = {L.ffn_gate_up_exps, L.ffn_up_exps, L.ffn_gate_exps, L.ffn_down_exps};
+                bool any = false;
+                bool all_cpu = true;
+                bool saw_host = false;
+                for (ggml_tensor * w : ws) {
+                    if (w == nullptr) {
+                        continue;
+                    }
+                    any = true;
+                    char name_buf[GGML_MAX_NAME + 1] = {0};
+                    memcpy(name_buf, w->name, GGML_MAX_NAME);
+                    bool matched_host = false;
+                    if (!resolve_host(name_buf, matched_host)) {
+                        all_cpu = false;
                         break;
                     }
+                    saw_host = saw_host || matched_host;
+                }
+                if (any && all_cpu) {
+                    pooled_ils.push_back(il);
+                } else if (any && saw_host) {
+                    LLAMA_LOG_WARN("%s: layer %d has mixed CPU/GPU expert matrices, skipped by the pool (keep the whole layer on one device)\n",
+                            __func__, il);
                 }
             }
         }
@@ -799,10 +828,16 @@ void llama_context::expert_pool_init() {
     st.orig_up.resize(n_layer, nullptr);
     st.orig_gate.resize(n_layer, nullptr);
     st.orig_down.resize(n_layer, nullptr);
+    st.orig_up_b.resize(n_layer, nullptr);
+    st.orig_gate_b.resize(n_layer, nullptr);
+    st.orig_down_b.resize(n_layer, nullptr);
     st.w_pool_gate_up.resize(n_layer, nullptr);
     st.w_pool_up.resize(n_layer, nullptr);
     st.w_pool_gate.resize(n_layer, nullptr);
     st.w_pool_down.resize(n_layer, nullptr);
+    st.w_pool_up_b.resize(n_layer, nullptr);
+    st.w_pool_gate_b.resize(n_layer, nullptr);
+    st.w_pool_down_b.resize(n_layer, nullptr);
     st.resident.resize(n_layer);
     st.pooled_layers = pooled_ils;
 
@@ -861,6 +896,9 @@ void llama_context::expert_pool_build() {
     std::fill(st.w_pool_up.begin(),     st.w_pool_up.end(),     nullptr);
     std::fill(st.w_pool_gate.begin(),   st.w_pool_gate.end(),   nullptr);
     std::fill(st.w_pool_down.begin(),   st.w_pool_down.end(),   nullptr);
+    std::fill(st.w_pool_up_b.begin(),   st.w_pool_up_b.end(),   nullptr);
+    std::fill(st.w_pool_gate_b.begin(), st.w_pool_gate_b.end(), nullptr);
+    std::fill(st.w_pool_down_b.begin(), st.w_pool_down_b.end(), nullptr);
 
     // --- create pool weight tensors ---
     pool_ctx = ggml_init({ 4u*1024u*1024u, nullptr, true }); // no_alloc = true (allocated via buft)
@@ -900,6 +938,24 @@ void llama_context::expert_pool_build() {
             st.w_pool_down[il] = ggml_new_tensor_4d(pool_ctx, L.ffn_down_exps->type,
                     L.ffn_down_exps->ne[0], L.ffn_down_exps->ne[1], s_il, 1);
         }
+        // compact bias pools: same slot layout as weights (slot s = res[s]);
+        // expert dim is last ([dim, n_expert] -> [dim, S]), so slot ids index
+        // them exactly like the weight pools. 2-D on all known carriers.
+        if (L.ffn_up_exps_b) {
+            st.orig_up_b[il] = L.ffn_up_exps_b;
+            st.w_pool_up_b[il] = ggml_new_tensor_2d(pool_ctx, L.ffn_up_exps_b->type,
+                    L.ffn_up_exps_b->ne[0], s_il);
+        }
+        if (L.ffn_gate_exps_b) {
+            st.orig_gate_b[il] = L.ffn_gate_exps_b;
+            st.w_pool_gate_b[il] = ggml_new_tensor_2d(pool_ctx, L.ffn_gate_exps_b->type,
+                    L.ffn_gate_exps_b->ne[0], s_il);
+        }
+        if (L.ffn_down_exps_b) {
+            st.orig_down_b[il] = L.ffn_down_exps_b;
+            st.w_pool_down_b[il] = ggml_new_tensor_2d(pool_ctx, L.ffn_down_exps_b->type,
+                    L.ffn_down_exps_b->ne[0], s_il);
+        }
     }
 
     // --- direct-mount registration ---
@@ -920,14 +976,13 @@ void llama_context::expert_pool_build() {
             continue;
         }
         const llama_layer & L = model.layers[il];
-        if (L.ffn_up_exps_s || L.ffn_gate_exps_s ||
-            L.ffn_gate_up_exps_b || L.ffn_up_exps_b || L.ffn_gate_exps_b ||
+        if (L.ffn_gate_up_exps_b ||
             (L.ffn_down_exps_s && L.ffn_down_exps_b)) {
-            // gate/up-side scale/bias cannot be replicated by the GPU chain
-            // (they are baked into the merged gate_up flow); down-side scale
-            // alone is fine (applied via the scale table) and down-side
-            // bias alone is fine (add_id -1 = no-op), but BOTH
-            // together would change the operator order, so disable the mount
+            // up/gate scales ride factored tables (pre-activation mul) and
+            // separate biases ride compact pool copies (slot-indexed add_id);
+            // only the fused bias (no loader, no pool copy) and the down
+            // scale+bias pair (post-merge scale vs in-chain bias order)
+            // still refuse the mount
             LLAMA_LOG_WARN("%s: per-expert scale/bias on layer %d, direct mount disabled for it\n",
                     __func__, il);
             continue;
@@ -942,7 +997,9 @@ void llama_context::expert_pool_build() {
         m.w_down    = st.w_pool_down[il];
         m.w_gate_up = st.w_pool_gate_up[il];
         m.w_down_s  = L.ffn_down_exps_s;
-        m.w_down_b  = L.ffn_down_exps_b;
+        m.w_up_b    = st.w_pool_up_b[il];
+        m.w_gate_b  = st.w_pool_gate_b[il];
+        m.w_down_b  = st.w_pool_down_b[il];
         llama_expert_pool_register_mount(il, m);
     }
     // step-boundary anchors: the first/last shared layer that actually has a
@@ -1002,6 +1059,12 @@ void llama_context::expert_pool_build() {
         if (L.ffn_down_exps_s != nullptr) {
             m.scale = ggml_new_tensor_2d(pool_tab_ctx, GGML_TYPE_F32, 1, n_expert);
         }
+        if (L.ffn_up_exps_s != nullptr) {
+            m.scale_up = ggml_new_tensor_2d(pool_tab_ctx, GGML_TYPE_F32, 1, n_expert);
+        }
+        if (L.ffn_gate_exps_s != nullptr) {
+            m.scale_gate = ggml_new_tensor_2d(pool_tab_ctx, GGML_TYPE_F32, 1, n_expert);
+        }
         char nm[64];
         snprintf(nm, sizeof(nm), "mnt_remap_%d", il);
         ggml_set_name(m.remap, nm);
@@ -1010,6 +1073,14 @@ void llama_context::expert_pool_build() {
         if (m.scale != nullptr) {
             snprintf(nm, sizeof(nm), "mnt_scale_%d", il);
             ggml_set_name(m.scale, nm);
+        }
+        if (m.scale_up != nullptr) {
+            snprintf(nm, sizeof(nm), "mnt_scale_up_%d", il);
+            ggml_set_name(m.scale_up, nm);
+        }
+        if (m.scale_gate != nullptr) {
+            snprintf(nm, sizeof(nm), "mnt_scale_gate_%d", il);
+            ggml_set_name(m.scale_gate, nm);
         }
         llama_expert_pool_register_mount(il, m);
     }
@@ -1162,17 +1233,22 @@ void llama_context::expert_pool_fill() {
             // every backend (ggml.c), so no cast is needed anywhere. the
             // remap + inv tables are flushed once below, after
             // the loop (tab_build/tab_publish), so no per-layer set here.
-            if (m.scale != nullptr) {
-                // one flat table: expert e -> its down scale value. the -1 ids
-                // already zero the skipped columns on both chains, so no
-                // 0-padding is needed here.
+            // flat scale tables: expert e -> its scale value (full [n_expert],
+            // indexed by clean ids, never changes on swap)
+            auto fill_scale = [&](ggml_tensor * tab, ggml_tensor * src) {
+                if (tab == nullptr || src == nullptr) {
+                    return;
+                }
                 std::vector<float> vals(n_expert, 0.0f);
-                const float * src_s = (const float *) L.ffn_down_exps_s->data;
+                const float * src_s = (const float *) src->data;
                 for (int32_t e = 0; e < n_expert; ++e) {
                     vals[e] = src_s[e];
                 }
-                ggml_backend_tensor_set(m.scale, vals.data(), 0, n_expert * sizeof(float));
-            }
+                ggml_backend_tensor_set(tab, vals.data(), 0, n_expert * sizeof(float));
+            };
+            fill_scale(m.scale,      L.ffn_down_exps_s);
+            fill_scale(m.scale_up,   L.ffn_up_exps_s);
+            fill_scale(m.scale_gate, L.ffn_gate_exps_s);
         }
 
         auto copy_slots = [&](ggml_tensor * src, ggml_tensor * pw) {
@@ -1195,6 +1271,9 @@ void llama_context::expert_pool_fill() {
         copy_slots(L.ffn_up_exps,      st.w_pool_up[il]);
         copy_slots(L.ffn_gate_exps,    st.w_pool_gate[il]);
         copy_slots(L.ffn_down_exps,    st.w_pool_down[il]);
+        copy_slots(L.ffn_up_exps_b,    st.w_pool_up_b[il]);
+        copy_slots(L.ffn_gate_exps_b,  st.w_pool_gate_b[il]);
+        copy_slots(L.ffn_down_exps_b,  st.w_pool_down_b[il]);
     }
     st.fill_done = true;
 

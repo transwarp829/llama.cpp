@@ -60,6 +60,9 @@ void llama_expert_pool_state::reset() {
     w_pool_up.clear();
     w_pool_gate.clear();
     w_pool_down.clear();
+    w_pool_up_b.clear();
+    w_pool_gate_b.clear();
+    w_pool_down_b.clear();
     resident.clear();
     pooled_layers.clear();
 
@@ -759,6 +762,9 @@ static int32_t worker_decide_and_copy(llama_expert_pool_state & st) {
         swap_copy_one_sync(st.pool_backend, st.orig_up[il],      st.w_pool_up[il],      p.e, p.slot);
         swap_copy_one_sync(st.pool_backend, st.orig_gate[il],    st.w_pool_gate[il],    p.e, p.slot);
         swap_copy_one_sync(st.pool_backend, st.orig_down[il],    st.w_pool_down[il],    p.e, p.slot);
+        swap_copy_one_sync(st.pool_backend, st.orig_up_b[il],    st.w_pool_up_b[il],    p.e, p.slot);
+        swap_copy_one_sync(st.pool_backend, st.orig_gate_b[il],  st.w_pool_gate_b[il],  p.e, p.slot);
+        swap_copy_one_sync(st.pool_backend, st.orig_down_b[il],  st.w_pool_down_b[il],  p.e, p.slot);
         res[p.slot] = p.e;
         delta += 1;
         LLAMA_LOG_INFV(LLAMA_LOG_VERBOSITY_TRACE,

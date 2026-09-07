@@ -44,6 +44,9 @@ struct llama_expert_pool_state {
     std::vector<ggml_tensor *> orig_up;
     std::vector<ggml_tensor *> orig_gate;
     std::vector<ggml_tensor *> orig_down;
+    std::vector<ggml_tensor *> orig_up_b;   // per-expert bias sources (host)
+    std::vector<ggml_tensor *> orig_gate_b;
+    std::vector<ggml_tensor *> orig_down_b;
 
     // pool weight tensors, indexed by layer; null = not pooled / not present.
     // compact layout: slot s holds the s-th resident expert (S slots per
@@ -52,6 +55,9 @@ struct llama_expert_pool_state {
     std::vector<ggml_tensor *> w_pool_up;      // separate [n_ff, n_embd, S]
     std::vector<ggml_tensor *> w_pool_gate;    // separate [n_ff, n_embd, S]
     std::vector<ggml_tensor *> w_pool_down;    // [n_embd, n_ff, S]
+    std::vector<ggml_tensor *> w_pool_up_b;    // compact bias [n_ff, S]
+    std::vector<ggml_tensor *> w_pool_gate_b;  // compact bias [n_ff, S]
+    std::vector<ggml_tensor *> w_pool_down_b;  // compact bias [n_embd, S]
 
     // resident expert lists, indexed by layer (for diagnostics/serialization)
     std::vector<std::vector<int32_t>> resident;
@@ -280,8 +286,11 @@ struct llama_expert_pool_mount {
     ggml_tensor * w_down    = nullptr;
     ggml_tensor * w_down_s  = nullptr; // per-expert down scale source (values
                                        // are staged into `scale` at fill time)
-    ggml_tensor * w_down_b  = nullptr; // per-expert down bias (add_id -1 makes
-                                       // it a no-op for skipped columns)
+    ggml_tensor * w_up_b      = nullptr; // pool-compacted up bias [n_ff, S]
+    ggml_tensor * w_gate_b    = nullptr; // pool-compacted gate bias [n_ff, S]
+    ggml_tensor * w_down_b    = nullptr; // pool-compacted down bias [n_embd, S]
+                                         // (slot ids index it; the old full-size
+                                         // orig misindexed hits, only -1 was safe)
     ggml_tensor * remap     = nullptr; // I32 [1, n_expert] on the pool device:
                                        // resident -> pool slot, non-resident -> -1
     ggml_tensor * remap_inv_host = nullptr; // I32 [1, n_expert] on the CPU device:
@@ -290,6 +299,9 @@ struct llama_expert_pool_mount {
                                            // GPU side has NO inv table - only remap)
     ggml_tensor * scale     = nullptr; // F32 [1, n_expert] on the pool device:
                                        // per-expert down scale (null = no scale)
+    ggml_tensor * scale_up   = nullptr; // F32 [1, n_expert]: up scale, factored
+                                       // like scale (pre-activation mul)
+    ggml_tensor * scale_gate = nullptr; // F32 [1, n_expert]: gate scale, same
 };
 
 void llama_expert_pool_register_mount(int il, const llama_expert_pool_mount & mount);
