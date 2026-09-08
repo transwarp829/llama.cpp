@@ -2038,7 +2038,6 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     ggml_tensor * weights = nullptr;
     ggml_tensor * mount_out  = nullptr; // direct-mount GPU chain result (weighted)
     ggml_tensor * mount_ids_cpu = nullptr; // inverse-remap ids for the CPU chain
-    ggml_tensor * mount_agg  = nullptr; // aggregated GPU chain output ([n_embd, T])
     ggml_tensor * cur_mount_in = nullptr; // 2D cur for the mount chain (built at the end)
     const llama_expert_pool_mount * mount_p = nullptr; // mount tables for the mount chain
     ggml_tensor * ids_remap = nullptr; // remapped expert ids (pool chain), GPU segment
@@ -2054,7 +2053,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         goto build_expert_chain;
     }
 
-    if (probs_in == nullptr) {
+    {
+        if (probs_in == nullptr) {
         logits = build_lora_mm(gate_inp, cur); // [n_expert, n_tokens]
         if (gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS) {
             ggml_prec_set_acc(logits, GGML_PREC_F32);
@@ -2304,6 +2304,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             // is: gate/ids/gather -> CPU miss chain -> GPU mount chain -> merge
 
         }
+    }
+
     }
 
 build_expert_chain:
