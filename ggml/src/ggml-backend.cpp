@@ -2033,7 +2033,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             goto copy_done;
                         }
                     }
-                    int32_t first_id = id;
+                    {
+                        int32_t first_id = id;
                     int32_t last_id = first_id;
 
                     for (++id; id < n_expert; ++id) {
@@ -2051,7 +2052,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         first_id = id;
                         last_id = id;
                     }
-                    copy_experts(first_id, last_id);
+                        copy_experts(first_id, last_id);
+                    }
                     copy_done:;
                 } else {
                     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
