@@ -5024,37 +5024,35 @@ extern "C" uint32_t llama_expert_pool_get_stats(struct llama_context * ctx,
 
 uint32_t llama_context::expert_pool_stats_snapshot(llama_expert_pool_layer_stats * out, uint32_t max_layers) {
     llama_expert_pool_state & st = model.expert_pool_state;
-    if (st.stat_hit.empty()) {
+    if (st.stat.empty()) {
         return 0;
     }
     const uint32_t n = (uint32_t) std::min((size_t) max_layers, st.pooled_layers.size());
     for (uint32_t i = 0; i < n; ++i) {
         out[i].layer     = st.pooled_layers[i];
-        out[i].hit_rows  = st.stat_hit[i];
-        out[i].miss_rows = st.stat_miss[i];
+        out[i].hit_rows  = st.stat[i].hit;
+        out[i].miss_rows = st.stat[i].miss;
     }
     // snapshot semantics: returns the totals since the previous call (per
     // decode-step usage resets after each read). partial reads (n < pooled
     // layers) reset only the layers returned - always read all layers when
     // comparing counters across layers.
-    std::fill(st.stat_hit.begin(),  st.stat_hit.begin()  + n, 0);
-    std::fill(st.stat_miss.begin(), st.stat_miss.begin() + n, 0);
+    std::fill(st.stat.begin(), st.stat.begin() + n, llama_expert_pool_counts{});
     return n;
 }
 
 void llama_context::expert_pool_finalize() {
     llama_expert_pool_state & st = model.expert_pool_state;
-    if (st.win_hit + st.win_miss == 0) {
+    if (st.win.hit + st.win.miss == 0) {
         return;
     }
     // generation-segment hit rate, printed once at segment end
-    // (win_hit/win_miss accumulate across swaps)
+    // (win accumulates across swaps)
     LLAMA_LOG_INFV(LLAMA_LOG_VERBOSITY_INFO, "%s: pool hit rate %.1f%% (%llu/%llu rows, generation segment)\n", __func__,
-            100.0 * st.win_hit / (double) (st.win_hit + st.win_miss),
-            (unsigned long long) st.win_hit,
-            (unsigned long long) (st.win_hit + st.win_miss));
-    st.win_hit  = 0;
-    st.win_miss = 0;
+            100.0 * st.win.hit / (double) (st.win.hit + st.win.miss),
+            (unsigned long long) st.win.hit,
+            (unsigned long long) (st.win.hit + st.win.miss));
+    st.win = {};
 
     // the segment-end accounting below reads worker-owned state (win_step,
     // swap_sum, seg_cnt, resident sizes): settle the tail first, then stop

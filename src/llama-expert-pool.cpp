@@ -73,16 +73,13 @@ void llama_expert_pool_state::reset() {
     swap_auto = false;
     fill_done = false;
     hook_step = 0;
-    count_ilx = -1;
-    stat_ilx  = -1;
+    last_ilx = -1;
     win_step = 0;
     win_cnt.clear();
     win_hist.clear();
     swap_sum = 0;
-    stat_hit.clear();
-    stat_miss.clear();
-    win_hit  = 0;
-    win_miss = 0;
+    stat.clear();
+    win = {};
 
     pool_ready = false;
     budget_slots = 0;
@@ -361,19 +358,17 @@ void llama_expert_pool_delegate_begin(
     }
     // lazy window allocation is gone from the hook: the swap worker owns
     // win_cnt/win_hist and allocates them at its first settlement.
-    if (st.stat_hit.empty() && !st.pooled_layers.empty()) {
-        st.stat_hit.assign(st.pooled_layers.size(), 0);
-        st.stat_miss.assign(st.pooled_layers.size(), 0);
+    if (st.stat.empty() && !st.pooled_layers.empty()) {
+        st.stat.assign(st.pooled_layers.size(), llama_expert_pool_counts{});
     }
     // step-advance detection, independent of the routing log: the first
     // layer with an active mount of a step begins after the last one of the
     // previous step (rt_step_done is set at the end of this hook)
     if (ilx == st.first_active_ilx && st.rt_step_done) {
         st.rt_step_done = false;
-        // new step: re-arm the per-layer counting dedup (a single active
-        // layer would otherwise be skipped forever after its first count)
-        st.count_ilx = -1;
-        st.stat_ilx  = -1;
+        // new step: re-arm the per-layer gate (a single active layer would
+        // otherwise be skipped forever after its first count)
+        st.last_ilx = -1;
         if (st.rt_log != nullptr) {
             // advance the log's step counter and flush the previous step's
             // lines (the swap never lives in this block anymore)
@@ -385,8 +380,8 @@ void llama_expert_pool_delegate_begin(
             // publish the worker's latest ready mirror: the only table write
             // point. if the worker is still copying (no new ready mirror),
             // the tables keep the old mapping - the swap decision takes
-            // effect one or more steps after it was made, which the sigma
-            // gate tolerates (the drift it tracks is slow).
+            // effect one or more steps later, which is fine: the window
+            // drift it tracks moves far slower than the step rate.
             llama_expert_pool_tab_publish(st);
             // step marker: the rows queued before it are now a complete step
             // and the worker may settle them (count + exchange + mirror).
@@ -414,25 +409,26 @@ void llama_expert_pool_delegate_begin(
     // count; pushed once per (step, layer): the hook fires per MUL_MAT_ID
     // node (2-3 per layer) with the same ids, and the worker attributes the
     // row from the -1 positions against the original top-k ids.
-    if (st.swap_auto && small_batch && st.count_ilx != ilx) {
-        st.count_ilx = ilx;
-        route_push_row(st, st.hook_step, ilx, ids);
-    }
-    // hit/miss counters (direct mount: ids come from remap_inv, so -1 is a GPU
-    // pool hit and a non-negative id is the expert computed on the CPU). idle
-    // layers (active=false) are skipped by the mount gate above. same per
-    // (step, layer) dedup as the window counting
-    if (st.direct_mount && small_batch && st.stat_ilx != ilx) {
-        st.stat_ilx = ilx;
-        for (int64_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
-            for (int id = 0; id < (int) ids->ne[0]; ++id) {
-                const int32_t e = *((const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]));
-                if (e < 0) {
-                    st.stat_hit[ilx] ++;
-                    st.win_hit ++;
-                } else if (e < st.n_expert) {
-                    st.stat_miss[ilx] ++;
-                    st.win_miss ++;
+    // both the window row and the hit/miss counting run once per (step,
+    // layer) - idle layers (active=false) are skipped by the mount gate
+    // above. hit/miss: with direct mount the ids come from remap_inv, so
+    // -1 is a GPU pool hit and a non-negative id is a CPU miss
+    if (small_batch && st.last_ilx != ilx) {
+        st.last_ilx = ilx;
+        if (st.swap_auto) {
+            route_push_row(st, st.hook_step, ilx, ids);
+        }
+        if (st.direct_mount) {
+            for (int64_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
+                for (int id = 0; id < (int) ids->ne[0]; ++id) {
+                    const int32_t e = *((const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]));
+                    if (e < 0) {
+                        st.stat[ilx].hit ++;
+                        st.win.hit ++;
+                    } else if (e < st.n_expert) {
+                        st.stat[ilx].miss ++;
+                        st.win.miss ++;
+                    }
                 }
             }
         }
@@ -861,7 +857,7 @@ bool llama_expert_pool_worker_settle(llama_expert_pool_state & st) {
         }
     }
     // the pool hit rate is printed once at the end of the generation segment
-    // by llama_expert_pool_finalize; win_hit/win_miss accumulate across the
+    // by llama_expert_pool_finalize; the win counters accumulate across the
     // segment (no per-swap reset here)
     return true;
 }

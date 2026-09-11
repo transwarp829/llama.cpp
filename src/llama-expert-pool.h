@@ -68,6 +68,13 @@ struct llama_expert_pool_layer {
     ggml_tensor * pool[PK_N] = {}; // pool copy (pool device); null = not pooled
 };
 
+// hit/miss row counters: per pooled layer (snapshot semantics, a read clears)
+// and one segment total (printed by expert_pool_finalize)
+struct llama_expert_pool_counts {
+    uint64_t hit  = 0;
+    uint64_t miss = 0;
+};
+
 struct llama_expert_pool_state {
     bool enabled = false;
 
@@ -124,11 +131,10 @@ struct llama_expert_pool_state {
     // hook-side step counter (the hook only pushes routing rows; the swap
     // worker owns the window below)
     int32_t hook_step = 0;
-    // per-step per-layer dedup markers: the hook fires once per MUL_MAT_ID
-    // node (2-3 per layer per step) and the ids are identical across a
-    // layer's nodes, so the row push/hit-miss counting runs once per layer
-    int32_t count_ilx = -1;                // last layer pushed into the queue
-    int32_t stat_ilx  = -1;                // last layer counted into the stats
+    // per-step per-layer gate: the hook fires once per MUL_MAT_ID node
+    // (2-3 per layer per step) and the ids are identical across a layer's
+    // nodes, so the row push and the hit/miss counting run once per layer
+    int32_t last_ilx = -1;                 // last layer handled this step
 
     // routing rows from the delegate hook to the swap worker. one
     // block per (step, layer): the FULL activation list of the layer -
@@ -156,10 +162,9 @@ struct llama_expert_pool_state {
     std::vector<std::vector<int32_t>> win_hist; // [W] flat (ilx, e) pairs per step
     int32_t swap_sum = 0;                  // exchanges accumulated this period
 
-    // swap window aggregates of the inference-side counters (cleared by each
-    // publish/stable reader; independent of the per-layer snapshot counters)
-    uint64_t win_hit  = 0;
-    uint64_t win_miss = 0;
+    // segment totals of the inference-side counters; independent of the
+    // per-layer stat array (which is cleared by each read)
+    llama_expert_pool_counts win;
 
     // swap worker thread: consumes the route rows, attributes
     // counts, runs the marginal exchange (one pair per pooled layer per step
@@ -197,8 +202,7 @@ struct llama_expert_pool_state {
     // receives remap_inv ids, so e < 0 means the GPU pool chain computed the
     // row and e >= 0 is a CPU miss); read (and cleared) via
     // llama_expert_pool_get_stats
-    std::vector<uint64_t> stat_hit;        // [pooled layers]
-    std::vector<uint64_t> stat_miss;       // [pooled layers]
+    std::vector<llama_expert_pool_counts> stat; // [pooled layers]
 
     // backend owning the pool buft (the hook publishes the tables on its
     // main stream, see tab_publish below)
@@ -263,7 +267,8 @@ void llama_expert_pool_push_marker(llama_expert_pool_state & st);
 // settle one queued step marker: the rows pushed before it are the previous
 // step's FULL activation counts (resident + non-resident); they are counted
 // into the window, then the marginal exchange runs (one pair per pooled
-// layer per settled step, sigma gated), and the ready mirror is rebuilt.
+// layer per settled step, capped by the per-step swap limit), and the
+// ready mirror is rebuilt.
 // returns false when no marker is queued.
 bool llama_expert_pool_worker_settle(llama_expert_pool_state & st);
 // rebuild the merged table mirror from resident[] (worker thread only: picks
