@@ -665,22 +665,13 @@ void llama_context::expert_pool_init() {
         const int32_t n_layer = model.hparams.n_layer();
         st.rtlog_only = true;
         st.pooled_layers.clear();
+        st.layers.assign(n_layer, llama_expert_pool_layer{});
         for (int32_t il = 0; il < n_layer; ++il) {
             const llama_layer & L = model.layers[il];
             if (L.ffn_gate_up_exps || L.ffn_up_exps || L.ffn_gate_exps) {
-                st.orig_gate_up.resize(n_layer, nullptr);
-                st.orig_up.resize(n_layer, nullptr);
-                st.orig_gate.resize(n_layer, nullptr);
-                st.orig_down.resize(n_layer, nullptr);
-                if (L.ffn_gate_up_exps) {
-                    st.orig_gate_up[il] = L.ffn_gate_up_exps;
-                }
-                if (L.ffn_up_exps) {
-                    st.orig_up[il] = L.ffn_up_exps;
-                }
-                if (L.ffn_gate_exps) {
-                    st.orig_gate[il] = L.ffn_gate_exps;
-                }
+                st.layers[il].orig[PK_GATE_UP] = L.ffn_gate_up_exps;
+                st.layers[il].orig[PK_UP]      = L.ffn_up_exps;
+                st.layers[il].orig[PK_GATE]    = L.ffn_gate_exps;
                 st.pooled_layers.push_back(il);
             }
         }
@@ -841,20 +832,7 @@ void llama_context::expert_pool_init() {
     }
 
     st.enabled = true;
-    st.orig_gate_up.resize(n_layer, nullptr);
-    st.orig_up.resize(n_layer, nullptr);
-    st.orig_gate.resize(n_layer, nullptr);
-    st.orig_down.resize(n_layer, nullptr);
-    st.orig_up_b.resize(n_layer, nullptr);
-    st.orig_gate_b.resize(n_layer, nullptr);
-    st.orig_down_b.resize(n_layer, nullptr);
-    st.w_pool_gate_up.resize(n_layer, nullptr);
-    st.w_pool_up.resize(n_layer, nullptr);
-    st.w_pool_gate.resize(n_layer, nullptr);
-    st.w_pool_down.resize(n_layer, nullptr);
-    st.w_pool_up_b.resize(n_layer, nullptr);
-    st.w_pool_gate_b.resize(n_layer, nullptr);
-    st.w_pool_down_b.resize(n_layer, nullptr);
+    st.layers.assign(n_layer, llama_expert_pool_layer{});
     st.resident.resize(n_layer);
     st.pooled_layers = pooled_ils;
 
@@ -904,14 +882,9 @@ void llama_context::expert_pool_build() {
     const int32_t n_pooled = (int32_t) pooled_ils.size();
 
     // a rebuild (segment-end realloc) leaves stale pointers in layers that
-    // lost all slots; clear so a zero-slot layer never touches a freed pool
-    std::fill(st.w_pool_gate_up.begin(), st.w_pool_gate_up.end(), nullptr);
-    std::fill(st.w_pool_up.begin(),     st.w_pool_up.end(),     nullptr);
-    std::fill(st.w_pool_gate.begin(),   st.w_pool_gate.end(),   nullptr);
-    std::fill(st.w_pool_down.begin(),   st.w_pool_down.end(),   nullptr);
-    std::fill(st.w_pool_up_b.begin(),   st.w_pool_up_b.end(),   nullptr);
-    std::fill(st.w_pool_gate_b.begin(), st.w_pool_gate_b.end(), nullptr);
-    std::fill(st.w_pool_down_b.begin(), st.w_pool_down_b.end(), nullptr);
+    // lost all slots; reset the whole array so a zero-slot layer never
+    // touches a freed pool (orig is re-derived below)
+    st.layers.assign(model.hparams.n_layer(), llama_expert_pool_layer{});
 
     // --- create pool weight tensors ---
     pool_ctx = ggml_init({ 4u*1024u*1024u, nullptr, true }); // no_alloc = true (allocated via buft)
@@ -931,43 +904,20 @@ void llama_context::expert_pool_build() {
         if (s_il <= 0) {
             continue;
         }
-        if (L.ffn_gate_up_exps) {
-            st.orig_gate_up[il] = L.ffn_gate_up_exps;
-            st.w_pool_gate_up[il] = ggml_new_tensor_4d(pool_ctx, L.ffn_gate_up_exps->type,
-                    L.ffn_gate_up_exps->ne[0], L.ffn_gate_up_exps->ne[1], s_il, 1);
-        }
-        if (L.ffn_up_exps) {
-            st.orig_up[il] = L.ffn_up_exps;
-            st.w_pool_up[il] = ggml_new_tensor_4d(pool_ctx, L.ffn_up_exps->type,
-                    L.ffn_up_exps->ne[0], L.ffn_up_exps->ne[1], s_il, 1);
-        }
-        if (L.ffn_gate_exps) {
-            st.orig_gate[il] = L.ffn_gate_exps;
-            st.w_pool_gate[il] = ggml_new_tensor_4d(pool_ctx, L.ffn_gate_exps->type,
-                    L.ffn_gate_exps->ne[0], L.ffn_gate_exps->ne[1], s_il, 1);
-        }
-        if (L.ffn_down_exps) {
-            st.orig_down[il] = L.ffn_down_exps;
-            st.w_pool_down[il] = ggml_new_tensor_4d(pool_ctx, L.ffn_down_exps->type,
-                    L.ffn_down_exps->ne[0], L.ffn_down_exps->ne[1], s_il, 1);
-        }
-        // compact bias pools: same slot layout as weights (slot s = res[s]);
-        // expert dim is last ([dim, n_expert] -> [dim, S]), so slot ids index
-        // them exactly like the weight pools. 2-D on all known carriers.
-        if (L.ffn_up_exps_b) {
-            st.orig_up_b[il] = L.ffn_up_exps_b;
-            st.w_pool_up_b[il] = ggml_new_tensor_2d(pool_ctx, L.ffn_up_exps_b->type,
-                    L.ffn_up_exps_b->ne[0], s_il);
-        }
-        if (L.ffn_gate_exps_b) {
-            st.orig_gate_b[il] = L.ffn_gate_exps_b;
-            st.w_pool_gate_b[il] = ggml_new_tensor_2d(pool_ctx, L.ffn_gate_exps_b->type,
-                    L.ffn_gate_exps_b->ne[0], s_il);
-        }
-        if (L.ffn_down_exps_b) {
-            st.orig_down_b[il] = L.ffn_down_exps_b;
-            st.w_pool_down_b[il] = ggml_new_tensor_2d(pool_ctx, L.ffn_down_exps_b->type,
-                    L.ffn_down_exps_b->ne[0], s_il);
+        // per-layer sources in llama_expert_pool_kind order
+        ggml_tensor * src[PK_N] = {
+            L.ffn_gate_up_exps, L.ffn_up_exps,      L.ffn_gate_exps, L.ffn_down_exps,
+            L.ffn_up_exps_b,    L.ffn_gate_exps_b,  L.ffn_down_exps_b,
+        };
+        llama_expert_pool_layer & l = st.layers[il];
+        for (int k = 0; k < PK_N; ++k) {
+            if (src[k] == nullptr) {
+                continue;
+            }
+            l.orig[k] = src[k];
+            l.pool[k] = (k < PK_UP_B)
+                ? ggml_new_tensor_4d(pool_ctx, src[k]->type, src[k]->ne[0], src[k]->ne[1], s_il, 1)
+                : ggml_new_tensor_2d(pool_ctx, src[k]->type, src[k]->ne[0], s_il);
         }
     }
 
@@ -999,19 +949,20 @@ void llama_context::expert_pool_build() {
                     __func__, il);
             continue;
         }
-        if (!st.w_pool_down[il]) {
+        const llama_expert_pool_layer & l = st.layers[il];
+        if (l.pool[PK_DOWN] == nullptr) {
             continue;
         }
         llama_expert_pool_mount m;
-        m.active  = true;
-        m.w_up      = st.w_pool_up[il];
-        m.w_gate    = st.w_pool_gate[il];
-        m.w_down    = st.w_pool_down[il];
-        m.w_gate_up = st.w_pool_gate_up[il];
+        m.active    = true;
+        m.w_up      = l.pool[PK_UP];
+        m.w_gate    = l.pool[PK_GATE];
+        m.w_down    = l.pool[PK_DOWN];
+        m.w_gate_up = l.pool[PK_GATE_UP];
         m.w_down_s  = L.ffn_down_exps_s;
-        m.w_up_b    = st.w_pool_up_b[il];
-        m.w_gate_b  = st.w_pool_gate_b[il];
-        m.w_down_b  = st.w_pool_down_b[il];
+        m.w_up_b    = l.pool[PK_UP_B];
+        m.w_gate_b  = l.pool[PK_GATE_B];
+        m.w_down_b  = l.pool[PK_DOWN_B];
         llama_expert_pool_register_mount(il, m);
     }
     // step-boundary anchors: the first/last shared layer that actually has a
@@ -1187,9 +1138,9 @@ void llama_context::expert_pool_build() {
     {
         size_t pool_bytes = 0;
         for (int32_t il : pooled_ils) {
-            for (ggml_tensor * t : { st.w_pool_gate_up[il], st.w_pool_up[il],
-                                     st.w_pool_gate[il],  st.w_pool_down[il] }) {
-                if (t) { pool_bytes += ggml_nbytes(t); }
+            const llama_expert_pool_layer & l = st.layers[il];
+            for (int k = 0; k < PK_UP_B; ++k) { // weights only (biases excluded, as before)
+                if (l.pool[k]) { pool_bytes += ggml_nbytes(l.pool[k]); }
             }
         }
         LLAMA_LOG_INFO("%s: pool weight bytes = %.2f GB (%.1f MiB per expert)\n",
@@ -1204,7 +1155,7 @@ void llama_context::expert_pool_build() {
 
 void llama_context::expert_pool_fill() {
     llama_expert_pool_state & st = model.expert_pool_state;
-    if (st.fill_done || !st.enabled || st.w_pool_down.empty()) {
+    if (st.fill_done || !st.enabled || st.layers.empty()) {
         return;
     }
     const int32_t n_expert = model.hparams.n_expert;
@@ -1260,13 +1211,10 @@ void llama_context::expert_pool_fill() {
                         s * pw->nb[2], sz);
             }
         };
-        copy_slots(L.ffn_gate_up_exps, st.w_pool_gate_up[il]);
-        copy_slots(L.ffn_up_exps,      st.w_pool_up[il]);
-        copy_slots(L.ffn_gate_exps,    st.w_pool_gate[il]);
-        copy_slots(L.ffn_down_exps,    st.w_pool_down[il]);
-        copy_slots(L.ffn_up_exps_b,    st.w_pool_up_b[il]);
-        copy_slots(L.ffn_gate_exps_b,  st.w_pool_gate_b[il]);
-        copy_slots(L.ffn_down_exps_b,  st.w_pool_down_b[il]);
+        const llama_expert_pool_layer & l = st.layers[il];
+        for (int k = 0; k < PK_N; ++k) {
+            copy_slots(l.orig[k], l.pool[k]);
+        }
     }
     st.fill_done = true;
 

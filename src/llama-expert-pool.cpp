@@ -56,13 +56,7 @@ void llama_expert_pool_state::reset() {
     enabled = false;
     direct_mount = false;
     rtlog_only = false;
-    w_pool_gate_up.clear();
-    w_pool_up.clear();
-    w_pool_gate.clear();
-    w_pool_down.clear();
-    w_pool_up_b.clear();
-    w_pool_gate_b.clear();
-    w_pool_down_b.clear();
+    layers.clear();
     resident.clear();
     pooled_layers.clear();
 
@@ -321,12 +315,12 @@ void llama_expert_pool_delegate_begin(
     // pooled_layers; il = actual layer number)
     int32_t il = -1;
     int32_t ilx = -1;
-    for (size_t ix = 0; ix < st.pooled_layers.size(); ++ix) {
+    for (size_t ix = 0; ix < st.pooled_layers.size() && il < 0; ++ix) {
         const int32_t i = st.pooled_layers[ix];
-        if      (st.orig_gate_up[i] == src0) { il = i; ilx = (int32_t) ix; break; }
-        else if (st.orig_up[i]       == src0) { il = i; ilx = (int32_t) ix; break; }
-        else if (st.orig_gate[i]     == src0) { il = i; ilx = (int32_t) ix; break; }
-        else if (st.orig_down[i]     == src0) { il = i; ilx = (int32_t) ix; break; }
+        const llama_expert_pool_layer & l = st.layers[i];
+        for (int k = 0; k < PK_N; ++k) {
+            if (l.orig[k] == src0) { il = i; ilx = (int32_t) ix; break; }
+        }
     }
     if (il < 0) {
         return;
@@ -762,13 +756,10 @@ static int32_t worker_decide_and_copy(llama_expert_pool_state & st) {
         // one-step-unmap of the old pipeline is gone).
         std::vector<int32_t> & res = st.resident[il];
         const int32_t victim_e = res[p.slot];
-        swap_copy_one_sync(st.pool_backend, st.orig_gate_up[il], st.w_pool_gate_up[il], p.e, p.slot);
-        swap_copy_one_sync(st.pool_backend, st.orig_up[il],      st.w_pool_up[il],      p.e, p.slot);
-        swap_copy_one_sync(st.pool_backend, st.orig_gate[il],    st.w_pool_gate[il],    p.e, p.slot);
-        swap_copy_one_sync(st.pool_backend, st.orig_down[il],    st.w_pool_down[il],    p.e, p.slot);
-        swap_copy_one_sync(st.pool_backend, st.orig_up_b[il],    st.w_pool_up_b[il],    p.e, p.slot);
-        swap_copy_one_sync(st.pool_backend, st.orig_gate_b[il],  st.w_pool_gate_b[il],  p.e, p.slot);
-        swap_copy_one_sync(st.pool_backend, st.orig_down_b[il],  st.w_pool_down_b[il],  p.e, p.slot);
+        const llama_expert_pool_layer & l = st.layers[il];
+        for (int k = 0; k < PK_N; ++k) {
+            swap_copy_one_sync(st.pool_backend, l.orig[k], l.pool[k], p.e, p.slot);
+        }
         res[p.slot] = p.e;
         delta += 1;
         LLAMA_LOG_INFV(LLAMA_LOG_VERBOSITY_TRACE,

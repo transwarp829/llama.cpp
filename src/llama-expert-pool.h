@@ -48,29 +48,33 @@ inline int32_t llama_expert_pool_min_slots(int32_t n_expert) {
 // the pool starts from a csv seed (--expert-pool-init, debug) or
 // random; the marginal exchange refreshes the content per step and the
 // segment-end reallocation refits the slot widths (see the stage-3 design doc).
+
+// per-layer expert tensors that the pool copies and the swap moves. the kind
+// order is fixed: it is the array index used everywhere (extend here plus in
+// the per-layer source table of expert_pool_build when a tensor lands)
+enum llama_expert_pool_kind {
+    PK_GATE_UP = 0, // fused gate+up [n_ff*2, n_embd, n_expert]; pool [.., S]
+    PK_UP,          // separate up [n_ff, n_embd, n_expert]
+    PK_GATE,        // separate gate [n_ff, n_embd, n_expert]
+    PK_DOWN,        // down [n_embd, n_ff, n_expert]
+    PK_UP_B,        // per-expert bias [n_ff, n_expert]; pool [n_ff, S]
+    PK_GATE_B,      // per-expert bias [n_ff, n_expert]
+    PK_DOWN_B,      // per-expert bias [n_embd, n_expert]
+    PK_N,
+};
+
+struct llama_expert_pool_layer {
+    ggml_tensor * orig[PK_N] = {}; // model weight tensor (host); null = not present
+    ggml_tensor * pool[PK_N] = {}; // pool copy (pool device); null = not pooled
+};
+
 struct llama_expert_pool_state {
     bool enabled = false;
 
-    // the original weight tensors, indexed by layer (null = not present); used by
-    // the graph to pair a mul_mat_id weight with its pool copy
-    std::vector<ggml_tensor *> orig_gate_up;
-    std::vector<ggml_tensor *> orig_up;
-    std::vector<ggml_tensor *> orig_gate;
-    std::vector<ggml_tensor *> orig_down;
-    std::vector<ggml_tensor *> orig_up_b;   // per-expert bias sources (host)
-    std::vector<ggml_tensor *> orig_gate_b;
-    std::vector<ggml_tensor *> orig_down_b;
-
-    // pool weight tensors, indexed by layer; null = not pooled / not present.
-    // compact layout: slot s holds the s-th resident expert (S slots per
-    // layer, ne2 = S, no zero padding)
-    std::vector<ggml_tensor *> w_pool_gate_up; // fused [n_ff*2, n_embd, S]
-    std::vector<ggml_tensor *> w_pool_up;      // separate [n_ff, n_embd, S]
-    std::vector<ggml_tensor *> w_pool_gate;    // separate [n_ff, n_embd, S]
-    std::vector<ggml_tensor *> w_pool_down;    // [n_embd, n_ff, S]
-    std::vector<ggml_tensor *> w_pool_up_b;    // compact bias [n_ff, S]
-    std::vector<ggml_tensor *> w_pool_gate_b;  // compact bias [n_ff, S]
-    std::vector<ggml_tensor *> w_pool_down_b;  // compact bias [n_embd, S]
+    // per-layer expert tensors, indexed by layer id (entries stay empty for
+    // layers the pool does not own). compact layout: pool slot s holds the
+    // s-th resident expert (S slots, ne2 = S, no zero padding)
+    std::vector<llama_expert_pool_layer> layers;
 
     // resident expert lists, indexed by layer (for diagnostics/serialization)
     std::vector<std::vector<int32_t>> resident;
