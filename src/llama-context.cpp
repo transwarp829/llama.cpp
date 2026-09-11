@@ -150,6 +150,7 @@ llama_context::llama_context(
     cparams.expert_pool_swap = params.expert_pool_swap;
     cparams.expert_pool_swap_window = params.expert_pool_swap_window;
     cparams.expert_pool_swap_per_step = params.expert_pool_swap_per_step;
+    cparams.expert_pool_layers = params.expert_pool_layers;
 
     cparams.ctx_other = nullptr;
 
@@ -704,15 +705,6 @@ void llama_context::expert_pool_init() {
                        "pool disabled (pure -cmoe)\n", __func__);
         return;
     }
-    // the pool now runs only in direct-mount mode (in-graph GPU chain); the
-    // legacy mini-graph delegate path was removed with the -1-ids refactor
-    {
-        const char * mount_env0 = getenv("GGML_EXPPOOL_MOUNT");
-        if (mount_env0 != nullptr && mount_env0[0] == '0') {
-            LLAMA_LOG_INFO("%s: expert pool mount disabled by GGML_EXPPOOL_MOUNT=0\n", __func__);
-            return;
-        }
-    }
     const int32_t n_layer = model.hparams.n_layer();
     const int32_t n_expert = model.hparams.n_expert;
     if (n_expert <= 0) {
@@ -726,18 +718,14 @@ void llama_context::expert_pool_init() {
     if (swap_env != nullptr && swap_env[0] == '0') {
         st.swap_auto = false;
     }
-    const char * swap_w_env = getenv("GGML_EXPPOOL_SWAP_WINDOW");
+    // window length and per-step pair limit are CLI params only
+    // (--expert-pool-swap-window / --expert-pool-swap-per-step); the state
+    // defaults (512 steps, 10 pairs/step) apply when unset
     if (cparams.expert_pool_swap_window > 0) {
         st.swap_W = cparams.expert_pool_swap_window;
-    } else if (swap_w_env != nullptr && std::atoi(swap_w_env) > 0) {
-        st.swap_W = std::atoi(swap_w_env);
     }
-    // per-step swap limit: 0 = default 10 pairs, negative = unlimited
-    const char * swap_per_step_env = getenv("GGML_EXPPOOL_SWAP_PER_STEP");
     if (cparams.expert_pool_swap_per_step != 0) {
         st.swap_per_step = cparams.expert_pool_swap_per_step;
-    } else if (swap_per_step_env != nullptr && std::atoi(swap_per_step_env) != 0) {
-        st.swap_per_step = std::atoi(swap_per_step_env);
     }
 
     // --- find the pooled layers (ALL expert matrices of the layer on CPU) ---
@@ -815,28 +803,41 @@ void llama_context::expert_pool_init() {
     }
 
     int32_t n_pooled = (int32_t) pooled_ils.size();
+    // explicit deep-first layer set (--pooled-layers N): pool the N deepest
+    // eligible layers; -nep still sets the budget width over that set
+    if (cparams.expert_pool_layers > 0 && n_pooled > cparams.expert_pool_layers) {
+        const int32_t n_eligible = n_pooled;
+        pooled_ils.erase(pooled_ils.begin(), pooled_ils.end() - cparams.expert_pool_layers);
+        n_pooled = (int32_t) pooled_ils.size();
+        LLAMA_LOG_INFO("%s: --pooled-layers %d: pooling the deepest %d of %d eligible MoE layers (layer %d..%d)\n",
+                __func__, cparams.expert_pool_layers, n_pooled, n_eligible, pooled_ils.front(), pooled_ils.back());
+    }
     // uniform width from the budget. the desert rule (same as the realloc:
-    // fewer than 3 slots per layer is not worth the mount roundtrip) trims
-    // the pooled set instead of spreading the budget thin, and the total
-    // slot count stays exactly at the budget (remainder to the first layers)
+    // a layer narrower than the minimum width is not worth the mount
+    // roundtrip - llama_expert_pool_min_slots, default 1% of the expert
+    // count) trims the pooled set instead of spreading the budget thin, from
+    // the deep end (deep layers carry the stronger activation locality); the
+    // total slot count stays exactly at the budget (remainder to the first
+    // kept layers)
+    const int32_t min_slots = llama_expert_pool_min_slots(n_expert);
     int32_t n_slot = cparams.expert_pool / n_pooled;
     int32_t rem    = cparams.expert_pool % n_pooled;
-    if (n_slot > 0 && n_slot < 3) {
+    if (n_slot < min_slots) {
         const int32_t n_pooled_all = n_pooled;
-        const int32_t n_keep = std::min(n_pooled, cparams.expert_pool / 3);
+        const int32_t n_keep = std::min(n_pooled, cparams.expert_pool / min_slots);
         if (n_keep <= 0) {
-            LLAMA_LOG_WARN("%s: expert pool budget %d too small for %d pooled layers (min 3 slots each), pool disabled\n",
-                    __func__, cparams.expert_pool, n_pooled_all);
+            LLAMA_LOG_WARN("%s: expert pool budget %d too small for %d pooled layers (min %d slots each), pool disabled\n",
+                    __func__, cparams.expert_pool, n_pooled_all, min_slots);
             return;
         }
-        // keep the first n_keep pooled layers (layer order); the segment-end
-        // realloc re-ranks from the cumulative counts anyway
-        pooled_ils.resize(n_keep);
+        // keep the deepest n_keep pooled layers (loader order, il ascending);
+        // the segment-end realloc re-ranks from the cumulative counts anyway
+        pooled_ils.erase(pooled_ils.begin(), pooled_ils.end() - n_keep);
         n_slot = cparams.expert_pool / n_keep;
         rem    = cparams.expert_pool % n_keep;
         n_pooled = n_keep;
-        LLAMA_LOG_WARN("%s: budget %d < 3 slots x %d pooled layers: pooled %d layers x ~%d slots (desert rule)\n",
-                __func__, cparams.expert_pool, n_pooled_all, n_keep, n_slot);
+        LLAMA_LOG_WARN("%s: budget %d < %d slots x %d pooled layers: pooled the deepest %d layers (layer %d..%d) x ~%d slots (desert rule)\n",
+                __func__, cparams.expert_pool, min_slots, n_pooled_all, n_keep, pooled_ils.front(), pooled_ils.back(), n_slot);
     }
 
     st.enabled = true;
@@ -857,13 +858,9 @@ void llama_context::expert_pool_init() {
     st.resident.resize(n_layer);
     st.pooled_layers = pooled_ils;
 
-    // DEBUG override: seed the pool from a csv file via env (debug only; the
-    // default flow builds a uniform-width random-content pool and refines
-    // the widths at the generation-segment end from the cumulative counts)
-    const char * csv_env = getenv("GGML_EXPPOOL_INIT_CSV");
-    if (csv_env != nullptr && csv_env[0] != '\0') {
-        cparams.expert_pool_init = csv_env;
-    }
+    // the default flow builds a uniform-width random-content pool and refines
+    // the widths at the generation-segment end from the cumulative counts;
+    // --expert-pool-init overrides the content with a csv seed (debug)
     st.budget_slots = cparams.expert_pool;
     if (n_slot > n_expert) {
         LLAMA_LOG_WARN("%s: expert pool request of %d slots exceeds capacity (%d pooled layers x %d experts), "
@@ -882,7 +879,7 @@ void llama_context::expert_pool_init() {
         // --- resident sets: csv seed or random ---
         bool ok = llama_expert_pool_parse_init(cparams.expert_pool_init, n_layer, n_expert, st.resident);
         if (!ok) {
-            LLAMA_LOG_WARN("%s: failed to read GGML_EXPPOOL_INIT_CSV '%s', falling back to random\n",
+            LLAMA_LOG_WARN("%s: failed to read expert pool csv '%s', falling back to random\n",
                     __func__, cparams.expert_pool_init);
             llama_expert_pool_random(n_layer, n_expert, widths, st.resident);
         }
@@ -981,9 +978,8 @@ void llama_context::expert_pool_build() {
     // plain pool-buffer tensors (created before the alloc below so they land
     // in pool_buf); their CONTENT is written by expert_pool_fill(), which
     // fills every element (sentinel default + resident override).
-    // NOTE: the gate only skips REGISTRATION - never the allocation below.
-    // GGML_EXPPOOL_MOUNT=0 is handled in expert_pool_init (whole-pool
-    // disable); only the gated layers below skip registration.
+    // NOTE: the per-layer gates below only skip REGISTRATION - never the
+    // allocation above (a skipped layer keeps its pool tensors, unmounted).
     llama_expert_pool_clear_mount();
     st.direct_mount = true;
     for (int32_t il : pooled_ils) {
@@ -1181,25 +1177,6 @@ void llama_context::expert_pool_build() {
     // zero the whole pool buffer ONCE: fresh backend buffers are not
     // guaranteed zeroed, and the sentinel slices must read exactly zero
     ggml_backend_buffer_clear(pool_buf.get(), 0);
-
-    // --- fill the mount routing tables HERE, not in expert_pool_fill ---
-    // their content depends only on the resident lists (known at this point),
-    // and sched_reserve() builds its probe graph right after this function
-    // returns: the tables must already hold their FINAL values before the
-    // first graph is built (a graph may latch the initial state; the observed
-    // corruption was consistent with the merge reading mask == 0 forever).
-    if (st.direct_mount) {
-        for (int32_t il : pooled_ils) {
-            llama_expert_pool_mount & m = llama_expert_pool_get_mount(il);
-            if (!m.active || m.remap == nullptr || m.remap_inv_host == nullptr) {
-                continue;
-            }
-            const std::vector<int32_t> & res = st.resident[il];
-            // (table contents are written once by expert_pool_fill() via the
-            // merged tab_build/tab_publish: remap -> tab_all, inv -> tab_cpu in one set)
-            (void) res;
-        }
-    }
 
     int32_t tot_slots = 0;
     for (int32_t il : pooled_ils) {
@@ -4405,6 +4382,7 @@ llama_context_params llama_context_default_params() {
         /*.expert_pool_swap            =*/ true,
         /*.expert_pool_swap_window     =*/ 0,
         /*.expert_pool_swap_per_step   =*/ 0,
+        /*.expert_pool_layers         =*/ 0,
         /*.samplers                    =*/ nullptr,
         /*.n_samplers                  =*/ 0,
         /*.ctx_other                   =*/ nullptr,

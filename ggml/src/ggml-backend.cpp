@@ -906,6 +906,14 @@ struct ggml_backend_sched {
     // (the mount split is submitted ahead of the CPU miss chain).
     bool layer_parallel = false;
 
+    // timeline probe (GGML_SCHED_TIMELINE_CSV): anchor-end event for the
+    // true-wait split. recorded stream-ordered after the anchor split's
+    // compute; the ids-fetch path syncs it to timestamp topk-ready.
+    // lazily created on the first anchor, freed with the sched.
+    ggml_backend_event_t tl_anchor_event = nullptr;
+    ggml_backend_t tl_anchor_be = nullptr;
+    bool tl_anchor_valid = false;
+
     int debug;
 
     // used for debugging graph reallocations [GGML_SCHED_DEBUG_REALLOC]
@@ -1891,11 +1899,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     if (tl_on && tl_fp == nullptr) {
         tl_fp = fopen(getenv("GGML_SCHED_TIMELINE_CSV"), "w");
         if (tl_fp) {
-            fprintf(tl_fp, "step,split,backend,enter_us,inputs_us,submit_us\n");
+            fprintf(tl_fp, "step,split,backend,enter_us,inputs_us,submit_us,idsready_us,anchorend_us\n");
         }
     }
     if (tl_on && tl_fp != nullptr) {
         tl_step++;
+        // a new graph compute: the previous step's anchor mark is stale
+        sched->tl_anchor_valid = false;
     }
 
     ggml_tensor * prev_ids_tensor = nullptr;
@@ -1909,12 +1919,18 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
         const int64_t tl_t0 = tl_on && tl_fp ? ggml_time_us() : 0;
+        // true-wait probe stamps, captured at the ids fetch below (0 =
+        // no fetch on this split: not a wait sample, drop it offline)
+        int64_t tl_idsready_us = 0;
+        int64_t tl_anchorend_us = 0;
 
         // ensure the previous split's async work has completed before we start
         // this split, the allocator may have reused buffer regions across splits
         if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
+            // device-side wait where possible (host stays free to submit ahead);
+            // the recorded event marks the previous split's completion point.
             if (sched->events[prev_backend_id][sched->cur_copy] != NULL) {
-                ggml_backend_event_synchronize(sched->events[prev_backend_id][sched->cur_copy]);
+                ggml_backend_event_wait(split_backend, sched->events[prev_backend_id][sched->cur_copy]);
             } else {
                 ggml_backend_synchronize(sched->backends[prev_backend_id]);
             }
@@ -1985,7 +2001,18 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     if (ids_tensor != prev_ids_tensor) {
                         ids.resize(ggml_nbytes(ids_tensor) / sizeof(int32_t));
                         ggml_backend_tensor_get_async(ids_backend, ids_tensor, ids.data(), 0, ggml_nbytes(ids_tensor));
+                        // true-wait probe: the host's real dependency point is
+                        // here (topk ids in hand). the anchor precedes on the
+                        // same stream, so syncing its end mark first returns no
+                        // later than the full sync below - no behavior change.
+                        if (tl_on && tl_fp && sched->tl_anchor_valid && ids_backend == sched->tl_anchor_be) {
+                            ggml_backend_event_synchronize(sched->tl_anchor_event);
+                            tl_anchorend_us = ggml_time_us();
+                        }
                         ggml_backend_synchronize(ids_backend);
+                        if (tl_on && tl_fp && ids_backend->iface.synchronize != NULL) {
+                            tl_idsready_us = ggml_time_us();
+                        }
 
                         // find the used experts
                         used_ids.clear();
@@ -2070,7 +2097,18 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         }
                     }
                     if (!cpy_async_ok) {
+                        // true-wait probe: this is the host-blocking drain of
+                        // the producer stream (e.g. every GPU->CPU input of a
+                        // miss split - the CPU backend has no cpy_tensor_async).
+                        // stamp only real syncs; host->host no-ops carry no signal.
+                        if (tl_on && tl_fp && sched->tl_anchor_valid && input_backend == sched->tl_anchor_be) {
+                            ggml_backend_event_synchronize(sched->tl_anchor_event);
+                            tl_anchorend_us = ggml_time_us();
+                        }
                         ggml_backend_synchronize(input_backend);
+                        if (tl_on && tl_fp && input_backend->iface.synchronize != NULL) {
+                            tl_idsready_us = ggml_time_us();
+                        }
                         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                             ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
                         } else {
@@ -2095,10 +2133,16 @@ compute_this_split:;
                 return ec;
             }
             if (tl_on && tl_fp) {
-                fprintf(tl_fp, "%lld,%d,%s,%lld,%lld,%lld\n",
+                fprintf(tl_fp, "%lld,%d,%s,%lld,%lld,%lld,%lld,%lld\n",
                         (long long) tl_step, split_id, ggml_backend_name(split_backend),
-                        (long long) tl_t0, (long long) t1, (long long) ggml_time_us());
+                        (long long) tl_t0, (long long) t1, (long long) ggml_time_us(),
+                        (long long) tl_idsready_us, (long long) tl_anchorend_us);
                 fflush(tl_fp);
+            }
+            // record this split's completion point on the backend's stream; the
+            // host does not block - other splits wait on it device-side.
+            if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+                ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
             }
             if (sched->debug >= 2) {
                 // sync to get the real duration of async backends (GPU)
@@ -2148,6 +2192,21 @@ compute_this_split:;
                     }
                 }
                 if (has_gate) {
+                    // timeline probe: mark the anchor's completion point on
+                    // this stream (async record, the host does not block).
+                    // the ids-fetch path syncs this mark to timestamp
+                    // topk-ready for the true-wait split.
+                    if (tl_on && tl_fp && split_backend->iface.event_record != NULL &&
+                        ggml_backend_get_device(split_backend)->iface.event_synchronize != NULL) {
+                        if (sched->tl_anchor_event == NULL) {
+                            sched->tl_anchor_event = ggml_backend_event_new(ggml_backend_get_device(split_backend));
+                        }
+                        if (sched->tl_anchor_event != NULL) {
+                            ggml_backend_event_record(sched->tl_anchor_event, split_backend);
+                            sched->tl_anchor_be = split_backend;
+                            sched->tl_anchor_valid = true;
+                        }
+                    }
                     // find the next pure mount split (ffn_moe_mount_cur head +
                     // ffn_moe_mount nodes) and submit it ahead while the CPU
                     // miss chain computes.
@@ -2235,6 +2294,9 @@ compute_this_split:;
             enum ggml_status ec = ggml_backend_graph_compute_async(sched->backends[nxt->backend_id], &nxt->graph);
                             if (ec != GGML_STATUS_SUCCESS) {
                                 return ec;
+                            }
+                            if (sched->events[nxt->backend_id][sched->cur_copy] != NULL) {
+                                ggml_backend_event_record(sched->events[nxt->backend_id][sched->cur_copy], sched->backends[nxt->backend_id]);
                             }
                             // optional event record+wait around the early submit
                             // (diagnostics only): both the early mount and the
@@ -2357,7 +2419,7 @@ ggml_backend_sched_t ggml_backend_sched_new(
         sched->bufts[b] = bufts ? bufts[b] : ggml_backend_get_default_buffer_type(backends[b]);
         GGML_ASSERT(ggml_backend_supports_buft(backends[b], sched->bufts[b]));
 
-        if (sched->n_copies > 1) {
+        if (sched->n_copies > 1 || backends[b]->device->iface.event_new != NULL) {
             for (int c = 0; c < sched->n_copies; c++) {
                 sched->events[b][c] = ggml_backend_event_new(backends[b]->device);
             }
@@ -2386,6 +2448,7 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
             ggml_backend_event_free(sched->events[b][c]);
         }
     }
+    ggml_backend_event_free(sched->tl_anchor_event);
     ggml_gallocr_free(sched->galloc);
     ggml_free(sched->ctx);
     ggml_hash_set_free(&sched->hash_set);

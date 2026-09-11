@@ -26,13 +26,26 @@ inline int32_t llama_expert_pool_offload_min_batch() {
     return v;
 }
 
+// single source for the minimum slots per pooled layer (desert rule): below
+// this width a mounted layer pays the per-layer roundtrip tax for near-zero
+// hits, so the pool trims the layer set instead of spreading the budget thin.
+// default = 1% of the layer's expert count, rounded up (128 -> 2, 256 -> 3,
+// 512 -> 6), which brackets the measured net-zero widths on all four models;
+// GGML_EXPPOOL_MIN_SLOTS overrides with an absolute slot count (1 = no
+// minimum). used by the init allocation and the segment-end realloc.
+inline int32_t llama_expert_pool_min_slots(int32_t n_expert) {
+    static const int32_t v = getenv("GGML_EXPPOOL_MIN_SLOTS") != nullptr
+        ? atoi(getenv("GGML_EXPPOOL_MIN_SLOTS")) : 0;
+    return v > 0 ? v : (n_expert + 99) / 100;
+}
+
 // ---------------------------------------------------------------
 // model-level runtime state of the expert pool (direct-mount mode)
 //
 // holds, per pooled layer, GPU-resident pool weight tensors (compact
 // layout: slot s holds the s-th resident expert, no zero padding) plus
 // the routing tables that split the two chains of the direct mount.
-// the pool starts from a csv seed (GGML_EXPPOOL_INIT_CSV, debug) or
+// the pool starts from a csv seed (--expert-pool-init, debug) or
 // random; the marginal exchange refreshes the content per step and the
 // segment-end reallocation refits the slot widths (see the stage-3 design doc).
 struct llama_expert_pool_state {
@@ -68,7 +81,7 @@ struct llama_expert_pool_state {
     // set once the pool weights/tables have been copied (idempotent fill)
     bool fill_done = false;
 
-    // direct mount (GGML_EXPPOOL_MOUNT=0 disables it): a second GPU-resident
+    // direct mount: a second GPU-resident
     // expert chain runs inside the main graph; the -1 skip ids zero the
     // non-resident columns on the GPU chain (and the resident columns on the
     // CPU chain via the inverse table), so no delegate hook is needed

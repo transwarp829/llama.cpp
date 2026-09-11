@@ -412,6 +412,7 @@ extern "C" {
         bool expert_pool_swap;      // [EXPERIMENTAL] auto-swap the pool resident set (sliding window)
         int32_t expert_pool_swap_window; // [EXPERIMENTAL] swap window in decode steps (0 = default 512)
         int32_t expert_pool_swap_per_step; // [EXPERIMENTAL] max expert pairs swapped in per decode step (0 = default 10, negative = unlimited)
+        int32_t expert_pool_layers; // [EXPERIMENTAL] pool the N deepest MoE layers, deep-to-shallow (0 = all eligible)
 
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)

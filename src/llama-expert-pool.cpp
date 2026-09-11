@@ -254,12 +254,6 @@ bool llama_expert_pool_parse_init(const std::string & path, int32_t n_layer,
                 continue;
             }
             int32_t e = std::atoi(tok.c_str());
-            if (e == -1) {
-                // explicit empty slot: keeps a zero slice in the pool table
-                // (weight copy skips non-resident entries). maps nothing.
-                experts.push_back(e);
-                continue;
-            }
             if (e < 0 || e >= n_expert) {
                 continue;
             }
@@ -562,10 +556,11 @@ void llama_expert_pool_tab_publish(llama_expert_pool_state & st) {
 // (the infinite-window seg_cnt): the global top-N (layer, expert) pairs by
 // count (N = -nep budget) determine both the widths and the seed content.
 // two structural rules:
-// - desert: layers that would get 1-2 slots drop to 0 (a mounted layer with
-//   one or two slots pays the per-layer roundtrip tax for near-zero hits;
-//   s = 0 is the pure-CPU baseline, free); the freed slots go to the next
-//   ranked pairs.
+// - desert: layers below the minimum slots-per-layer width (1% of the layer's
+//   expert count, rounded up - llama_expert_pool_min_slots) drop to 0 (a
+//   mounted layer with too few slots pays the per-layer roundtrip tax for
+//   near-zero hits; s = 0 is the pure-CPU baseline, free); the freed slots
+//   go to the next ranked pairs.
 // - sparse guard: when the counts are too sparse to rank (fewer than two
 //   expected events per expert, or fewer observed pairs than half the
 //   budget), the caller keeps the current layout.
@@ -608,22 +603,31 @@ bool llama_expert_pool_alloc_from_counts(
         const int32_t ilx = pairs[i].second / n_expert;
         width[ilx] += 1;
     }
-    // desert pass: 1-2-slot layers drop to 0; the freed slots go to the next
-    // ranked pairs (the list is already sorted; the top-N just widens)
+    // desert pass: layers below the minimum width drop to 0; the freed slots
+    // go to the next ranked pairs (the list is already sorted; the top-N just
+    // widens)
+    const int32_t min_slots = llama_expert_pool_min_slots(n_expert);
     int32_t freed = 0;
     for (int32_t ilx = 0; ilx < P; ++ilx) {
-        if (width[ilx] == 1 || width[ilx] == 2) {
+        if (width[ilx] > 0 && width[ilx] < min_slots) {
             freed += width[ilx];
             width[ilx] = 0;
         }
     }
-    size_t take = take0 + (size_t) std::min<int32_t>(freed, (int32_t) pairs.size() - (int32_t) take0);
-    for (size_t i = take0; i < take; ++i) {
+    // refill: the freed slots widen the next ranked pairs; pairs of a layer
+    // the desert pass just zeroed are skipped without consuming a slot (a
+    // below-minimum layer is not re-created), the scan continues until the
+    // freed slots are used up - the total stays at the budget
+    size_t take = take0;
+    int32_t refill = freed;
+    for (size_t i = take0; i < pairs.size() && refill > 0; ++i) {
         const int32_t ilx = pairs[i].second / n_expert;
         if (width[ilx] == 0) {
-            continue; // do not re-create a 1-2 slot layer the desert pass just zeroed
+            continue;
         }
         width[ilx] += 1;
+        refill -= 1;
+        take = i + 1;
     }
     // build the resident vectors: slot s holds the s-th pair of the layer
     // (pairs are globally sorted, so the resident order = the layer's counts

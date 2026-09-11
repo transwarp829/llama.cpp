@@ -430,7 +430,7 @@ int main(int argc, char ** argv) {
         cur = common_sampler_sample(smpl, ctx, -1);
         printf("%s", common_token_to_piece(ctx, cur).c_str());
         fflush(stdout);
-        if (llama_vocab_is_eog(vocab, cur)) {
+        if (llama_vocab_is_eog(vocab, cur) && !params.sampling.ignore_eos) {
             break;
         }
         step++;

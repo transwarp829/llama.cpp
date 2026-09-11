@@ -1720,6 +1720,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ));
     add_opt(common_arg(
+        {"--pooled-layers"}, "N",
+        "pool the N deepest MoE layers, selected deep-to-shallow (0 = all CPU-resident MoE layers)",
+        [](common_params & params, int value) {
+            params.expert_pool_layers = value;
+        }
+    ));
+    add_opt(common_arg(
         {"-ctxcp", "--ctx-checkpoints", "--swa-checkpoints"}, "N",
         string_format("max number of context checkpoints to create per slot (default: %d)"
             "[(more info)](https://github.com/ggml-org/llama.cpp/pull/15293)", params.n_ctx_checkpoints),
