@@ -3,6 +3,7 @@
 #include "llama.h"
 #include "llama-ext.h"
 #include "llama-cparams.h"
+#include "llama-expert-pool.h"
 #include "llama-graph.h"
 #include "llama-adapter.h"
 #include "llama-impl.h"
@@ -373,8 +374,12 @@ private:
     std::vector<ggml_backend_buffer_type_t> backend_buft;
     std::vector<size_t>                     backend_buf_exp_size; // expected buffer sizes
 
-    // expert pool (stage 2): pooled weight context/buffer + mount-table ctx
-    // (kept alive as long as the context; pointers also stored in model.expert_pool_state)
+    // expert pool (per context): pool weights/tables/worker/stats all belong
+    // to this context; the pooled layer set is derived from the model at init
+    llama_expert_pool_state expert_pool_state;
+
+    // pooled weight context/buffer + mount-table ctx
+    // (kept alive as long as the context; pointers also stored in expert_pool_state)
     ggml_context * pool_ctx  = nullptr;
     ggml_context * pool_tab_ctx = nullptr; // direct-mount remap tables (pool device)
     ggml_context * pool_tab_cpu_ctx = nullptr; // direct-mount remap_inv table (CPU device)

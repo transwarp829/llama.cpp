@@ -9,47 +9,65 @@
 #include <random>
 #include <sstream>
 
-// ---- direct-mount registry (see llama-expert-pool.h) ----
-namespace {
-    std::vector<llama_expert_pool_mount> g_mount; // indexed by layer id
+// ---- per-context pool plumbing ----
+
+// the CPU moe delegate is a single process-wide hook and the model weight
+// tensors are shared across contexts of the same model, so the graph being
+// computed must identify its own pool: llama_context::graph_compute marks
+// the calling thread, the delegate resolves its state from here
+static thread_local llama_expert_pool_state * g_current_pool = nullptr;
+
+llama_expert_pool_state * llama_expert_pool_set_current(llama_expert_pool_state * st) {
+    llama_expert_pool_state * prev = g_current_pool;
+    g_current_pool = st;
+    return prev;
 }
 
-// draft-context flag: the CPU moe delegate is a global hook and cannot tell
-// graphs apart; a draft context (MTP shares the main model's tensors) must
-// not feed the pool's routing statistics, so llama_context::decode marks the
-// calling thread while it runs a draft graph
-static thread_local bool g_draft_decode = false;
+// the delegate is registered while at least one pool lives (one process-wide
+// slot, refcounted across contexts)
+static std::atomic<int32_t> g_delegate_users{0};
 
-void llama_expert_pool_set_draft_decode(bool on) {
-    g_draft_decode = on;
+void llama_expert_pool_delegate_register() {
+    if (g_delegate_users.fetch_add(1) == 0) {
+        ggml_cpu_set_moe_delegate(llama_expert_pool_delegate_begin, nullptr);
+    }
 }
 
-void llama_expert_pool_register_mount(int il, const llama_expert_pool_mount & mount) {
+void llama_expert_pool_delegate_unregister() {
+    if (g_delegate_users.fetch_sub(1) == 1) {
+        ggml_cpu_set_moe_delegate(nullptr, nullptr);
+    }
+}
+
+void llama_expert_pool_state::register_mount(int il, const llama_expert_pool_mount & m) {
     if (il < 0) {
         return;
     }
-    if ((size_t) il >= g_mount.size()) {
-        g_mount.resize(il + 1);
+    if ((size_t) il >= mounts.size()) {
+        mounts.resize(il + 1);
     }
-    g_mount[il] = mount;
+    mounts[il] = m;
 }
 
-llama_expert_pool_mount & llama_expert_pool_get_mount(int il) {
-    // auto-grow: a returned reference must be the real per-layer cell, not a
-    // shared static - callers write fields into it (expert_pool_init
-    // registration loop fills the mount in place)
+llama_expert_pool_mount & llama_expert_pool_state::mount(int il) {
+    // auto-grow: callers write fields into the returned cell (the setup
+    // registration loops fill the mount in place)
     static llama_expert_pool_mount none {};
     if (il < 0) {
         return none;
     }
-    if ((size_t) il >= g_mount.size()) {
-        g_mount.resize(il + 1);
+    if ((size_t) il >= mounts.size()) {
+        mounts.resize(il + 1);
     }
-    return g_mount[il];
+    return mounts[il];
 }
 
-void llama_expert_pool_clear_mount() {
-    g_mount.clear();
+const llama_expert_pool_mount & llama_expert_pool_state::mount(int il) const {
+    static const llama_expert_pool_mount none {};
+    if (il < 0 || (size_t) il >= mounts.size()) {
+        return none;
+    }
+    return mounts[il];
 }
 
 void llama_expert_pool_state::reset() {
@@ -57,6 +75,7 @@ void llama_expert_pool_state::reset() {
     direct_mount = false;
     rtlog_only = false;
     layers.clear();
+    mounts.clear();
     resident.clear();
     pooled_layers.clear();
 
@@ -296,11 +315,12 @@ void llama_expert_pool_random(int32_t n_layer, int32_t n_expert,
 void llama_expert_pool_delegate_begin(
         ggml_tensor * src0, ggml_tensor * src1, ggml_tensor * ids, ggml_tensor * dst,
         const int32_t ** skip_out, void * ud) {
-    llama_expert_pool_state & st = *(llama_expert_pool_state *) ud;
+    (void) ud; // the pool is resolved from the current thread (set_current)
     *skip_out = nullptr;
-    if (g_draft_decode) {
+    if (g_current_pool == nullptr) {
         return;
     }
+    llama_expert_pool_state & st = *g_current_pool;
     if (st.pooled_layers.empty()) {
         return;
     }
@@ -325,7 +345,7 @@ void llama_expert_pool_delegate_begin(
     // log only the layers that have an active mount (direct mount) or all
     // pooled layers in routing-log-only mode
     if (st.direct_mount) {
-        const llama_expert_pool_mount & mnt = llama_expert_pool_get_mount(il);
+        const llama_expert_pool_mount & mnt = st.mount(il);
         if (!mnt.active) {
             return;
         }
@@ -495,7 +515,7 @@ void llama_expert_pool_tab_build(llama_expert_pool_state & st) {
         mir.assign(2 * n_total, -1);
     }
     for (int32_t il : st.pooled_layers) {
-        const llama_expert_pool_mount & m = llama_expert_pool_get_mount(il);
+        const llama_expert_pool_mount & m = st.mount(il);
         if (!m.active) {
             continue;
         }
@@ -665,7 +685,7 @@ static int32_t worker_decide_and_copy(llama_expert_pool_state & st) {
         }
         // the refresh only affects layers with an active mount; others run
         // the plain CPU chain, so swapping their resident set is a no-op
-        const llama_expert_pool_mount & mnt = llama_expert_pool_get_mount(il);
+        const llama_expert_pool_mount & mnt = st.mount(il);
         if (!mnt.active) {
             continue;
         }

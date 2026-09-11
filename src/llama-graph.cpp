@@ -1490,6 +1490,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     loras            (params.loras),
     mctx             (params.mctx),
     cross            (params.cross),
+    expert_pool      (params.expert_pool),
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),
@@ -2197,9 +2198,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // miss col = cpu + 0.
     // direct mount serves every batch size: decode (T=1) and verify/parallel
     // batches (T>1) share the same graph.
-    // NOTE: draft contexts (ctx_other set) must never build the mount chain:
-    // the mount registry is global and keyed by layer index only, so a drafter
-    // graph would pick up the MAIN model's mounts (wrong tensors, wrong pool).
+    // the mounts come from THIS context's pool: every context owns its own
+    // registry, so a draft graph resolves its own mounts (or none)
     // small-batch gate: the mount chain is a small-batch-only feature (user
     // ruling: layer-parallel stays below the offload threshold). at/above the MoE offload threshold the miss
     // chain flips to the GPU and runs via the upstream selective-copy path;
@@ -2212,9 +2212,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // tensor dims are ambiguous (ids/cur can be 2D or 3D depending on the
     // graph form), so never derive T from a tensor here.
     const bool small_batch = n_tokens < moe_gate_min;
-    if (!chain_only && cparams.expert_pool > 0 && il >= 0 && cparams.ctx_other == nullptr &&
+    if (!chain_only && expert_pool != nullptr && cparams.expert_pool > 0 && il >= 0 &&
         small_batch) {
-        const llama_expert_pool_mount & mnt = llama_expert_pool_get_mount(il);
+        const llama_expert_pool_mount & mnt = expert_pool->mount(il);
         if (mnt.active) {
             // all tables live on the pool device, so every gather runs on the
             // GPU segment from the same topk ids. ids_cpu and the scale values

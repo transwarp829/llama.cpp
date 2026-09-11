@@ -6,7 +6,6 @@
 #include "llama-hparams.h"
 #include "llama-memory.h"
 #include "llama-vocab.h"
-#include "llama-expert-pool.h"
 
 #include <map>
 #include <memory>
@@ -618,9 +617,6 @@ struct llama_model {
 
     llama_hparams hparams = {};
     llama_vocab   vocab;
-
-    // expert pool runtime state (stage 2): GPU pool weights + mapping tables
-    mutable llama_expert_pool_state expert_pool_state;
 
     // for classifier models
     std::vector<std::string> classifier_labels;

@@ -40,6 +40,44 @@ inline int32_t llama_expert_pool_min_slots(int32_t n_expert) {
 }
 
 // ---------------------------------------------------------------
+// direct mount (main-graph execution): per-layer tensors that let
+// build_moe_ffn run a second, GPU-resident chain over the pool
+// weights inside the MAIN graph. the -1 skip ids zero the matching
+// column, so the two chains split the columns by construction:
+// remap (device, for the GPU chain) sends non-resident experts to -1,
+// remap_inv (host, for the CPU chain) sends resident experts to -1.
+// a single add merges both chains.
+// NOTE: remap/remap_inv are I32: ggml_get_rows supports I32 tables natively
+// (the output type follows the table, ggml.c) on every backend, so the ids
+// gathering needs no cast. the F32 REPEAT gate on CUDA only matters for the
+// scale tables, which are F32.
+struct llama_expert_pool_mount {
+    bool active = false;
+    ggml_tensor * w_gate_up = nullptr; // [n_ff*2, n_embd, S] or null (pool copy)
+    ggml_tensor * w_up      = nullptr; // [n_ff, n_embd, S] or null (pool copy)
+    ggml_tensor * w_gate    = nullptr;
+    ggml_tensor * w_down    = nullptr;
+    ggml_tensor * w_down_s  = nullptr; // per-expert down scale source (values
+                                       // are staged into `scale` at fill time)
+    ggml_tensor * w_up_b      = nullptr; // pool-compacted up bias [n_ff, S]
+    ggml_tensor * w_gate_b    = nullptr; // pool-compacted gate bias [n_ff, S]
+    ggml_tensor * w_down_b    = nullptr; // pool-compacted down bias [n_embd, S]
+                                         // (slot ids index it; the old full-size
+                                         // orig misindexed hits, only -1 was safe)
+    ggml_tensor * remap     = nullptr; // I32 [1, n_expert] on the pool device:
+                                       // resident -> pool slot, non-resident -> -1
+    ggml_tensor * remap_inv_host = nullptr; // I32 [1, n_expert] on the CPU device:
+                                           // resident -> -1, non-resident -> expert id
+                                           // (CPU-segment get_rows host mirror; the
+                                           // GPU side has NO inv table - only remap)
+    ggml_tensor * scale     = nullptr; // F32 [1, n_expert] on the pool device:
+                                       // per-expert down scale (null = no scale)
+    ggml_tensor * scale_up   = nullptr; // F32 [1, n_expert]: up scale, factored
+                                       // like scale (pre-activation mul)
+    ggml_tensor * scale_gate = nullptr; // F32 [1, n_expert]: gate scale, same
+};
+
+// ---------------------------------------------------------------
 // model-level runtime state of the expert pool (direct-mount mode)
 //
 // holds, per pooled layer, GPU-resident pool weight tensors (compact
@@ -83,6 +121,13 @@ struct llama_expert_pool_state {
     // s-th resident expert (S slots, ne2 = S, no zero padding)
     std::vector<llama_expert_pool_layer> layers;
 
+    // direct-mount registry, indexed by layer id (setup writes; the graph,
+    // the hook and the worker read)
+    std::vector<llama_expert_pool_mount> mounts;
+    void register_mount(int il, const llama_expert_pool_mount & m);
+    llama_expert_pool_mount & mount(int il);              // setup (auto-grows)
+    const llama_expert_pool_mount & mount(int il) const;  // read-only (no growth)
+
     // resident expert lists, indexed by layer (for diagnostics/serialization)
     std::vector<std::vector<int32_t>> resident;
 
@@ -91,6 +136,10 @@ struct llama_expert_pool_state {
 
     // set once the pool weights/tables have been copied (idempotent fill)
     bool fill_done = false;
+
+    // the CPU MoE delegate registration belongs to this state (one process-wide
+    // slot, refcounted: register once per pool, drop it in the ctx dtor)
+    bool delegate_registered = false;
 
     // direct mount: a second GPU-resident
     // expert chain runs inside the main graph; the -1 skip ids zero the
@@ -251,11 +300,6 @@ void llama_expert_pool_delegate_begin(
         ggml_tensor * src0, ggml_tensor * src1, ggml_tensor * ids, ggml_tensor * dst,
         const int32_t ** skip_out, void * ud);
 
-// mark the calling thread as running a draft-context graph: the CPU moe
-// delegate is global and cannot tell contexts apart, so draft rows (MTP
-// shares the main model's tensors) must not feed the pool statistics
-void llama_expert_pool_set_draft_decode(bool on);
-
 // stage 3 swap worker: the worker owns the window counters, the
 // marginal exchange decisions and the weight copies; the hook only pushes
 // routing rows and publishes ready mirrors at step boundaries.
@@ -288,44 +332,9 @@ bool llama_expert_pool_alloc_from_counts(
         const std::vector<int32_t> & counts, int32_t P, int32_t n_expert,
         int32_t budget, std::vector<std::vector<int32_t>> & resident);
 
-// ---------------------------------------------------------------
-// direct mount (main-graph execution): per-layer tensors that let
-// build_moe_ffn run a second, GPU-resident chain over the pool
-// weights inside the MAIN graph. the -1 skip ids zero the matching
-// column, so the two chains split the columns by construction:
-// remap (device, for the GPU chain) sends non-resident experts to -1,
-// remap_inv (host, for the CPU chain) sends resident experts to -1.
-// a single add merges both chains.
-// NOTE: remap/remap_inv are I32: ggml_get_rows supports I32 tables natively
-// (the output type follows the table, ggml.c) on every backend, so the ids
-// gathering needs no cast. the F32 REPEAT gate on CUDA only matters for the
-// scale tables, which are F32.
-struct llama_expert_pool_mount {
-    bool active = false;
-    ggml_tensor * w_gate_up = nullptr; // [n_ff*2, n_embd, S] or null (pool copy)
-    ggml_tensor * w_up      = nullptr; // [n_ff, n_embd, S] or null (pool copy)
-    ggml_tensor * w_gate    = nullptr;
-    ggml_tensor * w_down    = nullptr;
-    ggml_tensor * w_down_s  = nullptr; // per-expert down scale source (values
-                                       // are staged into `scale` at fill time)
-    ggml_tensor * w_up_b      = nullptr; // pool-compacted up bias [n_ff, S]
-    ggml_tensor * w_gate_b    = nullptr; // pool-compacted gate bias [n_ff, S]
-    ggml_tensor * w_down_b    = nullptr; // pool-compacted down bias [n_embd, S]
-                                         // (slot ids index it; the old full-size
-                                         // orig misindexed hits, only -1 was safe)
-    ggml_tensor * remap     = nullptr; // I32 [1, n_expert] on the pool device:
-                                       // resident -> pool slot, non-resident -> -1
-    ggml_tensor * remap_inv_host = nullptr; // I32 [1, n_expert] on the CPU device:
-                                           // resident -> -1, non-resident -> expert id
-                                           // (CPU-segment get_rows host mirror; the
-                                           // GPU side has NO inv table - only remap)
-    ggml_tensor * scale     = nullptr; // F32 [1, n_expert] on the pool device:
-                                       // per-expert down scale (null = no scale)
-    ggml_tensor * scale_up   = nullptr; // F32 [1, n_expert]: up scale, factored
-                                       // like scale (pre-activation mul)
-    ggml_tensor * scale_gate = nullptr; // F32 [1, n_expert]: gate scale, same
-};
-
-void llama_expert_pool_register_mount(int il, const llama_expert_pool_mount & mount);
-llama_expert_pool_mount & llama_expert_pool_get_mount(int il);
-void llama_expert_pool_clear_mount();
+// per-context pool plumbing: the CPU MoE delegate is one process-wide slot,
+// refcounted across pools; the active pool of the current thread is marked
+// around llama_context::graph_compute (the hook resolves its state from it)
+llama_expert_pool_state * llama_expert_pool_set_current(llama_expert_pool_state * st);
+void llama_expert_pool_delegate_register();
+void llama_expert_pool_delegate_unregister();

@@ -513,12 +513,11 @@ llama_context::~llama_context() {
     }
     ggml_opt_free(opt_ctx);
 
-    // moe routing-log hook: unregister (direct_mount and rtlog_only register
-    // it; a dangling ud must not survive destruction)
-    if (model.expert_pool_state.direct_mount || model.expert_pool_state.rtlog_only) {
-        ggml_cpu_set_moe_delegate(nullptr, nullptr);
-        model.expert_pool_state.direct_mount = false;
-        model.expert_pool_state.rtlog_only = false;
+    // moe delegate: drop this context's registration (the hook itself is a
+    // single process-wide slot, refcounted across pools)
+    if (expert_pool_state.delegate_registered) {
+        expert_pool_state.delegate_registered = false;
+        llama_expert_pool_delegate_unregister();
     }
 
     // release the scheduler BEFORE the pool buffers: its CUDA graph cache
@@ -530,7 +529,7 @@ llama_context::~llama_context() {
     // stop the swap worker BEFORE the pool buffers are freed: its sync
     // tensor_set calls reference the pool tensors; a live worker touching
     // them after the frees below is a use-after-free at exit
-    llama_expert_pool_state & st = model.expert_pool_state;
+    llama_expert_pool_state & st = expert_pool_state;
     {
         std::lock_guard<std::mutex> lk(st.route_mtx);
         st.route_stop = true;
@@ -641,27 +640,21 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
 // - seed the resident sets from --expert-pool-init csv, or at random
 // - copy the resident weights into the pool and fill the slot tables
 void llama_context::expert_pool_init() {
-    // speculative draft contexts (separate drafter model / MTP) must not touch
-    // the expert pool: its buffers, mount registry, and CPU MoE delegate belong
-    // to the MAIN context only. a draft ctx re-running this would re-allocate
-    // the pool (clobbering VRAM), overwrite the globally-registered delegate,
-    // and - with MTP sharing the main model's state - reset() a live pool.
-    if (cparams.ctx_other != nullptr) {
-        return;
-    }
     // the pool is already built (csv seed or a segment-end rebuild): the
     // sched_reserve() that follows expert_pool_build() re-enters here, and
     // a reset() would wipe the freshly built pool
-    if (model.expert_pool_state.pool_ready) {
+    if (expert_pool_state.pool_ready) {
         return;
     }
-    llama_expert_pool_state & st = model.expert_pool_state;
+    llama_expert_pool_state & st = expert_pool_state;
     st.reset();
     // routing-log-only mode: capture the native routing stream of a pool-free
     // run (e.g. pure -cmoe) to build a true native pool. register the delegate
     // hook here, before the early returns below can disable it.
     const char * rt_env = getenv("GGML_EXPPOOL_ROUTING_LOG");
-    if (cparams.expert_pool <= 0 && rt_env != nullptr && rt_env[0] != '\0') {
+    // draft contexts stay out of the routing-log mode: the log is a single
+    // file path, so two contexts would truncate each other's capture
+    if (cparams.expert_pool <= 0 && cparams.ctx_other == nullptr && rt_env != nullptr && rt_env[0] != '\0') {
         const int32_t n_layer = model.hparams.n_layer();
         st.rtlog_only = true;
         st.pooled_layers.clear();
@@ -675,7 +668,8 @@ void llama_context::expert_pool_init() {
                 st.pooled_layers.push_back(il);
             }
         }
-        ggml_cpu_set_moe_delegate(llama_expert_pool_delegate_begin, &st);
+        st.delegate_registered = true;
+        llama_expert_pool_delegate_register();
         // no mounts in this mode: every pooled layer is "active" for the
         // step-boundary anchors (the hook fires for all of them in order)
         st.first_active_ilx = 0;
@@ -697,10 +691,16 @@ void llama_context::expert_pool_init() {
         return;
     }
     const int32_t n_layer = model.hparams.n_layer();
+    const int32_t n_layer_all = (int32_t) model.hparams.n_layer_all;
     const int32_t n_expert = model.hparams.n_expert;
     if (n_expert <= 0) {
         return;
     }
+    // an MTP draft context executes only the appended NextN block(s): its
+    // pooled set is that block range instead of the trunk
+    const bool    mtp_ctx  = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP;
+    const int32_t il_begin = mtp_ctx ? n_layer : 0;
+    const int32_t il_end   = mtp_ctx ? n_layer_all : n_layer;
     st.n_expert = n_expert;
     st.swap_auto = cparams.expert_pool_swap;
     // experimental: GGML_EXPPOOL_SWAP=0 keeps the resident set static (A/B
@@ -755,7 +755,7 @@ void llama_context::expert_pool_init() {
             return false; // no override: default placement, never pooled
         };
         if (!pats.empty()) {
-            for (int32_t il = 0; il < n_layer; ++il) {
+            for (int32_t il = il_begin; il < il_end; ++il) {
                 const llama_layer & L = model.layers[il];
                 // CPU-attn layers are never pooled (see comment above)
                 if (ggml_backend_dev_type(model.dev_layer(il)) == GGML_BACKEND_DEVICE_TYPE_CPU) {
@@ -832,8 +832,8 @@ void llama_context::expert_pool_init() {
     }
 
     st.enabled = true;
-    st.layers.assign(n_layer, llama_expert_pool_layer{});
-    st.resident.resize(n_layer);
+    st.layers.assign(n_layer_all, llama_expert_pool_layer{});
+    st.resident.resize(n_layer_all);
     st.pooled_layers = pooled_ils;
 
     // the default flow builds a uniform-width random-content pool and refines
@@ -848,18 +848,18 @@ void llama_context::expert_pool_init() {
         rem    = 0;
     }
     // per-layer widths: uniform n_slot, the budget remainder to the first layers
-    std::vector<int32_t> widths(n_layer, 0);
+    std::vector<int32_t> widths(n_layer_all, 0);
     for (size_t i = 0; i < pooled_ils.size(); ++i) {
         widths[pooled_ils[i]] = n_slot + ((int32_t) i < rem ? 1 : 0);
     }
     st.seg_cnt.assign((size_t) n_pooled * n_expert, 0);
     if (cparams.expert_pool_init && cparams.expert_pool_init[0]) {
         // --- resident sets: csv seed or random ---
-        bool ok = llama_expert_pool_parse_init(cparams.expert_pool_init, n_layer, n_expert, st.resident);
+        bool ok = llama_expert_pool_parse_init(cparams.expert_pool_init, n_layer_all, n_expert, st.resident);
         if (!ok) {
             LLAMA_LOG_WARN("%s: failed to read expert pool csv '%s', falling back to random\n",
                     __func__, cparams.expert_pool_init);
-            llama_expert_pool_random(n_layer, n_expert, widths, st.resident);
+            llama_expert_pool_random(n_layer_all, n_expert, widths, st.resident);
         }
         st.pool_ready = true;
         expert_pool_build();
@@ -870,13 +870,13 @@ void llama_context::expert_pool_init() {
     // shape costs less than 7% vs the global top-N at the same budget, while
     // a random+swap pool beats a stale csv seed; the segment-end realloc
     // refines the widths once the cumulative counts accumulate)
-    llama_expert_pool_random(n_layer, n_expert, widths, st.resident);
+    llama_expert_pool_random(n_layer_all, n_expert, widths, st.resident);
     st.pool_ready = true;
     expert_pool_build();
 }
 
 void llama_context::expert_pool_build() {
-    llama_expert_pool_state & st = model.expert_pool_state;
+    llama_expert_pool_state & st = expert_pool_state;
     const int32_t n_expert = model.hparams.n_expert;
     const std::vector<int32_t> & pooled_ils = st.pooled_layers;
     const int32_t n_pooled = (int32_t) pooled_ils.size();
@@ -884,7 +884,7 @@ void llama_context::expert_pool_build() {
     // a rebuild (segment-end realloc) leaves stale pointers in layers that
     // lost all slots; reset the whole array so a zero-slot layer never
     // touches a freed pool (orig is re-derived below)
-    st.layers.assign(model.hparams.n_layer(), llama_expert_pool_layer{});
+    st.layers.assign(model.hparams.n_layer_all, llama_expert_pool_layer{});
 
     // --- create pool weight tensors ---
     pool_ctx = ggml_init({ 4u*1024u*1024u, nullptr, true }); // no_alloc = true (allocated via buft)
@@ -930,7 +930,7 @@ void llama_context::expert_pool_build() {
     // fills every element (sentinel default + resident override).
     // NOTE: the per-layer gates below only skip REGISTRATION - never the
     // allocation above (a skipped layer keeps its pool tensors, unmounted).
-    llama_expert_pool_clear_mount();
+    st.mounts.clear();
     st.direct_mount = true;
     for (int32_t il : pooled_ils) {
         const int32_t s_il = (int32_t) st.resident[il].size();
@@ -963,7 +963,7 @@ void llama_context::expert_pool_build() {
         m.w_up_b    = l.pool[PK_UP_B];
         m.w_gate_b  = l.pool[PK_GATE_B];
         m.w_down_b  = l.pool[PK_DOWN_B];
-        llama_expert_pool_register_mount(il, m);
+        st.register_mount(il, m);
     }
     // step-boundary anchors: the first/last shared layer that actually has a
     // mount (a 0-slot layer is not registered and its hook early-returns, so
@@ -972,7 +972,7 @@ void llama_context::expert_pool_build() {
     st.first_active_ilx = -1;
     st.last_active_ilx  = -1;
     for (int32_t ilx = 0; ilx < (int32_t) pooled_ils.size(); ++ilx) {
-        if (llama_expert_pool_get_mount(pooled_ils[ilx]).active) {
+        if (st.mount(pooled_ils[ilx]).active) {
             if (st.first_active_ilx < 0) {
                 st.first_active_ilx = ilx;
             }
@@ -992,14 +992,14 @@ void llama_context::expert_pool_build() {
         // filled in the same tab_build/tab_publish flush as tab_all.
         pool_tab_cpu_ctx = ggml_init({ 64u*1024u, nullptr, true });
         st.tab_cpu = ggml_new_tensor_2d(pool_tab_cpu_ctx, GGML_TYPE_I32, n_expert,
-                                        llama_model_n_layer(&model));
+                                        (int64_t) model.hparams.n_layer_all);
         ggml_set_name(st.tab_cpu, "mnt_tab_cpu");
     }
     for (int32_t il : pooled_ils) {
         if (!st.direct_mount) {
             break;
         }
-        llama_expert_pool_mount & m = llama_expert_pool_get_mount(il);
+        llama_expert_pool_mount & m = st.mount(il);
         if (!m.active) {
             continue;
         }
@@ -1009,7 +1009,7 @@ void llama_context::expert_pool_build() {
         // the CPU host mirror).
         if (st.tab_all == nullptr) {
             st.tab_all = ggml_new_tensor_2d(pool_tab_ctx, GGML_TYPE_I32, n_expert,
-                                            llama_model_n_layer(&model));
+                                            (int64_t) model.hparams.n_layer_all);
             ggml_set_name(st.tab_all, "mnt_tab_all");
         }
         const size_t i32sz = ggml_type_size(GGML_TYPE_I32);
@@ -1045,7 +1045,7 @@ void llama_context::expert_pool_build() {
             snprintf(nm, sizeof(nm), "mnt_scale_gate_%d", il);
             ggml_set_name(m.scale_gate, nm);
         }
-        llama_expert_pool_register_mount(il, m);
+        st.register_mount(il, m);
     }
     // --- allocate: device tables on the pool device, host tables on the CPU ---
     ggml_backend_buffer_type_t tab_buft = ggml_backend_cpu_buffer_type();
@@ -1077,7 +1077,7 @@ void llama_context::expert_pool_build() {
             // de-register the mounts of this run so the graph builder never
             // sees active=true with null tables
             for (int32_t il : pooled_ils) {
-                llama_expert_pool_get_mount(il).active = false;
+                st.mount(il).active = false;
             }
         }
     }
@@ -1154,7 +1154,7 @@ void llama_context::expert_pool_build() {
 }
 
 void llama_context::expert_pool_fill() {
-    llama_expert_pool_state & st = model.expert_pool_state;
+    llama_expert_pool_state & st = expert_pool_state;
     if (st.fill_done || !st.enabled || st.layers.empty()) {
         return;
     }
@@ -1169,7 +1169,7 @@ void llama_context::expert_pool_fill() {
         // direct-mount routing tables: write every element (sentinel default =
         // -1), then residents override (same content as expert_pool_init; this
         // second write keeps them correct if fill() ever refreshes the resident set)
-        llama_expert_pool_mount & m = llama_expert_pool_get_mount(il);
+        llama_expert_pool_mount & m = st.mount(il);
         const bool has_mount = st.direct_mount && m.active &&
                                m.remap != nullptr && m.remap_inv_host != nullptr;
         if (has_mount) {
@@ -1234,7 +1234,10 @@ void llama_context::expert_pool_fill() {
 
     // --- moe routing-log hook (feeds GGML_EXPPOOL_ROUTING_LOG) ---
     if (st.direct_mount) {
-        ggml_cpu_set_moe_delegate(llama_expert_pool_delegate_begin, &st);
+        if (!st.delegate_registered) {
+            st.delegate_registered = true;
+            llama_expert_pool_delegate_register();
+        }
         LLAMA_LOG_INFO("%s: direct mount active (%d layers), in-graph merge\n",
                 __func__, (int) st.pooled_layers.size());
     }
@@ -2493,11 +2496,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         ggml_status status;
 
-        // draft contexts must not feed the expert pool's routing statistics
-        // (the global CPU moe delegate cannot tell graphs apart)
-        llama_expert_pool_set_draft_decode(cparams.ctx_other != nullptr);
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
-        llama_expert_pool_set_draft_decode(false);
 
         if (!res) {
             // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
@@ -3155,6 +3154,7 @@ llm_graph_params llama_context::graph_params(
         /*.loras       =*/ loras.get(),
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
+        /*.expert_pool =*/ &expert_pool_state,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
@@ -3165,6 +3165,11 @@ llm_graph_params llama_context::graph_params(
 ggml_status llama_context::graph_compute(
             ggml_cgraph * gf,
                    bool   batched) {
+    // the CPU MoE delegate is one process-wide hook and the model tensors are
+    // shared across contexts: mark which pool this graph belongs to for the
+    // duration of the compute (the hook resolves its state from here)
+    llama_expert_pool_state * prev_pool = llama_expert_pool_set_current(&expert_pool_state);
+
     int n_threads        = batched ? cparams.n_threads_batch : cparams.n_threads;
     ggml_threadpool_t tp = batched ? threadpool_batch        : threadpool;
 
@@ -3187,6 +3192,8 @@ ggml_status llama_context::graph_compute(
     }
 
     // fprintf(stderr, "splits: %d\n", ggml_backend_sched_get_n_splits(sched));
+
+    llama_expert_pool_set_current(prev_pool);
 
     return status;
 }
@@ -5023,7 +5030,7 @@ extern "C" uint32_t llama_expert_pool_get_stats(struct llama_context * ctx,
 }
 
 uint32_t llama_context::expert_pool_stats_snapshot(llama_expert_pool_layer_stats * out, uint32_t max_layers) {
-    llama_expert_pool_state & st = model.expert_pool_state;
+    llama_expert_pool_state & st = expert_pool_state;
     if (st.stat.empty()) {
         return 0;
     }
@@ -5042,7 +5049,7 @@ uint32_t llama_context::expert_pool_stats_snapshot(llama_expert_pool_layer_stats
 }
 
 void llama_context::expert_pool_finalize() {
-    llama_expert_pool_state & st = model.expert_pool_state;
+    llama_expert_pool_state & st = expert_pool_state;
     if (st.win.hit + st.win.miss == 0) {
         return;
     }
@@ -5117,7 +5124,7 @@ void llama_context::expert_pool_finalize() {
         // async copies (the publish pipeline issues them per step):
         // synchronize before freeing.
         synchronize();
-        llama_expert_pool_clear_mount();
+        st.mounts.clear();
         pool_buf.reset();
         mount_tab_buf.reset();
         mount_tab_cpu_buf.reset();
@@ -5141,7 +5148,7 @@ void llama_context::expert_pool_finalize() {
         }
         st.mirror_ready.store(-1);
         st.mirror_pub.store(-1);
-        st.resident.assign(model.hparams.n_layer(), {});
+        st.resident.assign(model.hparams.n_layer_all, {});
         for (int32_t ilx = 0; ilx < n_pooled; ++ilx) {
             st.resident[st.pooled_layers[ilx]] = resident[ilx];
         }

@@ -683,8 +683,12 @@ struct server_slot {
         common_speculative_print_stats(spec);
 
         // expert pool: print-and-reset the generation-segment hit rate
-        // (swap-window stats accumulate since the previous segment end)
+        // (swap-window stats accumulate since the previous segment end);
+        // the draft context has its own pool when configured (-nepd)
         llama_expert_pool_finalize(ctx_tgt);
+        if (ctx_dft != nullptr) {
+            llama_expert_pool_finalize(ctx_dft);
+        }
     }
 
     json to_json(bool only_metrics = false) const {
