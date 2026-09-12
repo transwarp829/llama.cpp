@@ -334,6 +334,7 @@ int main(int argc, char ** argv) {
         LOG_ERR("%s: there are not input tokens to process - (try to provide a prompt with '-p')\n", __func__);
         return 1;
     }
+    LOG_INF("%s: prompt tokens = %d (n_batch = %d)\n", __func__, (int) tokens.size(), (int) params.n_batch);
 
     const int n_predict = params.n_predict >= 0 ? params.n_predict : 100;
 
@@ -368,9 +369,18 @@ int main(int argc, char ** argv) {
         data.steps.back().layer_cat[CAT_EXPERT].resize(data.n_layers, 0.0);
 
         const int64_t t0 = ggml_time_us();
-        if (llama_decode(ctx, llama_batch_get_one(tokens.data(), tokens.size()))) {
-            LOG_ERR("%s: failed to eval prompt\n", __func__);
-            return 1;
+        // long prompts: feed in n_batch-sized chunks (llama_decode rejects a
+        // batch larger than n_batch); the step-0 wall covers the whole prompt
+        const int32_t n_chunk = params.n_batch > 0 ? (int32_t) params.n_batch : (int32_t) tokens.size();
+        for (size_t off = 0; off < tokens.size(); off += (size_t) n_chunk) {
+            int32_t n = n_chunk;
+            if ((size_t) n > tokens.size() - off) {
+                n = (int32_t) (tokens.size() - off);
+            }
+            if (llama_decode(ctx, llama_batch_get_one(tokens.data() + off, n))) {
+                LOG_ERR("%s: failed to eval prompt\n", __func__);
+                return 1;
+            }
         }
         if (!no_sync) {
             llama_synchronize(ctx);
