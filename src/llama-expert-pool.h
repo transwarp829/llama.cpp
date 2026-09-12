@@ -32,7 +32,7 @@ inline int32_t llama_expert_pool_offload_min_batch() {
 // default = 1% of the layer's expert count, rounded up (128 -> 2, 256 -> 3,
 // 512 -> 6), which brackets the measured net-zero widths on all four models;
 // GGML_EXPPOOL_MIN_SLOTS overrides with an absolute slot count (1 = no
-// minimum). used by the init allocation and the segment-end realloc.
+// minimum). used by the init allocation (desert trim).
 inline int32_t llama_expert_pool_min_slots(int32_t n_expert) {
     static const int32_t v = getenv("GGML_EXPPOOL_MIN_SLOTS") != nullptr
         ? atoi(getenv("GGML_EXPPOOL_MIN_SLOTS")) : 0;
@@ -84,8 +84,7 @@ struct llama_expert_pool_mount {
 // layout: slot s holds the s-th resident expert, no zero padding) plus
 // the routing tables that split the two chains of the direct mount.
 // the pool starts from a csv seed (--expert-pool-init, debug) or
-// random; the marginal exchange refreshes the content per step and the
-// segment-end reallocation refits the slot widths (see the stage-3 design doc).
+// random; the marginal exchange refreshes the content per step.
 
 // per-layer expert tensors that the pool copies and the swap moves. the kind
 // order is fixed: it is the array index used everywhere (extend here plus in
@@ -236,17 +235,12 @@ struct llama_expert_pool_state {
     // expert_pool_init after a rebuild, and a reset() would wipe the fresh
     // pool)
     bool pool_ready = false;               // pool allocation finished
-    int32_t budget_slots = 0;              // -nep total slot budget
     int32_t last_active_ilx = -1;          // pooled index of the last layer with an active
                                            // mount (the step-boundary anchor - not always
                                            // the last pooled layer: a 0-slot layer has no
                                            // mount and its hook early-returns)
     int32_t first_active_ilx = -1;         // pooled index of the first layer with an active
                                            // mount (start boundary anchor; symmetric)
-    // cumulative routing counter (infinite window): the segment-end width
-    // reallocation reads the global top-N pairs from this table; never
-    // decayed, so the prefill's small under-count is negligible noise.
-    std::vector<int32_t> seg_cnt;          // [pooled layers * n_expert]
     // per-pooled-layer hit/miss counters (direct mount: the CPU segment
     // receives remap_inv ids, so e < 0 means the GPU pool chain computed the
     // row and e >= 0 is a CPU miss); read (and cleared) via
@@ -322,15 +316,6 @@ void llama_expert_pool_tab_build(llama_expert_pool_state & st);
 // set_async to tab_all and one sync set to tab_cpu. the single place the
 // table tensors are written, so the old stream/CPU ordering is preserved.
 void llama_expert_pool_tab_publish(llama_expert_pool_state & st);
-
-// segment-end width allocation: the global top-N (layer, expert) pairs of
-// the cumulative activation counts (N = budget slots) decide the per-layer
-// slot widths (1-2-slot layers fall back to 0: the desert rule). returns
-// false when the counts are too sparse to rank (the caller keeps the
-// current layout).
-bool llama_expert_pool_alloc_from_counts(
-        const std::vector<int32_t> & counts, int32_t P, int32_t n_expert,
-        int32_t budget, std::vector<std::vector<int32_t>> & resident);
 
 // per-context pool plumbing: the CPU MoE delegate is one process-wide slot,
 // refcounted across pools; the active pool of the current thread is marked
