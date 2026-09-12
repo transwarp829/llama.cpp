@@ -526,35 +526,10 @@ llama_context::~llama_context() {
     // after this body, touching freed pool tensors -> use-after-free at exit)
     sched.reset();
 
-    // stop the swap worker BEFORE the pool buffers are freed: its sync
-    // tensor_set calls reference the pool tensors; a live worker touching
-    // them after the frees below is a use-after-free at exit
-    llama_expert_pool_state & st = expert_pool_state;
-    {
-        std::lock_guard<std::mutex> lk(st.route_mtx);
-        st.route_stop = true;
-        st.route_q.clear();
-    }
-    st.route_cv.notify_all();
-    if (st.cp_worker.joinable()) {
-        st.cp_worker.join();
-    }
-
-    pool_buf.reset(); // release the pool buffer before freeing the ctx metadata
-    if (pool_ctx) {
-        ggml_free(pool_ctx);
-        pool_ctx = nullptr;
-    }
-    mount_tab_buf.reset();
-    if (pool_tab_ctx) {
-        ggml_free(pool_tab_ctx);
-        pool_tab_ctx = nullptr;
-    }
-    mount_tab_cpu_buf.reset();
-    if (pool_tab_cpu_ctx) {
-        ggml_free(pool_tab_cpu_ctx);
-        pool_tab_cpu_ctx = nullptr;
-    }
+    // stop the swap worker and free the pool resources (single teardown owner;
+    // the worker must be stopped before the pool buffers are freed: its sync
+    // tensor_set calls reference the pool tensors)
+    expert_pool_release();
 }
 
 void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint32_t n_seqs) {
@@ -1097,6 +1072,7 @@ void llama_context::expert_pool_build() {
     }
     if (!pool_buf) {
         LLAMA_LOG_ERROR("%s: expert pool allocation failed, pool disabled\n", __func__);
+        expert_pool_release(); // free the partial allocations (pool ctx / tables)
         st.reset();
         return;
     }
@@ -5098,4 +5074,37 @@ extern "C" void llama_expert_pool_finalize(struct llama_context * ctx) {
         return;
     }
     ctx->expert_pool_finalize();
+}
+
+void llama_context::expert_pool_release() {
+    llama_expert_pool_state & st = expert_pool_state;
+
+    // stop the swap worker first: its sync tensor_set calls reference the pool
+    // tensors that the frees below would invalidate
+    st.stop_worker();
+
+    pool_buf.reset(); // release the pool buffer before freeing the ctx metadata
+    if (pool_ctx != nullptr) {
+        ggml_free(pool_ctx);
+        pool_ctx = nullptr;
+    }
+    mount_tab_buf.reset();
+    if (pool_tab_ctx != nullptr) {
+        ggml_free(pool_tab_ctx);
+        pool_tab_ctx = nullptr;
+    }
+    mount_tab_cpu_buf.reset();
+    if (pool_tab_cpu_ctx != nullptr) {
+        ggml_free(pool_tab_cpu_ctx);
+        pool_tab_cpu_ctx = nullptr;
+    }
+
+    // the merged tables lived in those contexts
+    st.tab_all = nullptr;
+    st.tab_cpu = nullptr;
+    for (auto & m : st.tab_mirror) {
+        m.clear();
+    }
+    st.mirror_ready.store(-1);
+    st.mirror_pub.store(-1);
 }

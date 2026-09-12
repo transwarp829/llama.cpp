@@ -58,6 +58,7 @@ struct llama_context {
     void expert_pool_init();
     void expert_pool_build();
     void expert_pool_fill();
+    void expert_pool_release();            // free the ctx-owned pool resources + stop the worker
 
     void synchronize();
 

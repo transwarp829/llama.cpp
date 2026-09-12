@@ -270,6 +270,9 @@ struct llama_expert_pool_state {
     std::vector<int32_t> tab_mirror[3];
 
     void reset();
+    // signal + drain the route queue + join the swap worker (also safe when
+    // no worker is running); shared by reset() and the ctx teardown
+    void stop_worker();
 };
 
 // seed the pool from a csv file, one line per layer: "il,e1,e2,...". the

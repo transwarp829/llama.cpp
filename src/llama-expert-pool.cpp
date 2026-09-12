@@ -106,7 +106,12 @@ void llama_expert_pool_state::reset() {
     mirror_ready.store(-1);
     mirror_pub.store(-1);
 
-    // stop the swap worker (if running): signal, join, drain the route queue
+    // stop the swap worker (if running)
+    stop_worker();
+}
+
+void llama_expert_pool_state::stop_worker() {
+    // signal + drain the route queue + join; also safe when no worker runs
     {
         std::lock_guard<std::mutex> lk(route_mtx);
         route_stop = true;
