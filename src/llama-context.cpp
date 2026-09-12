@@ -623,36 +623,7 @@ void llama_context::expert_pool_init() {
     }
     llama_expert_pool_state & st = expert_pool_state;
     st.reset();
-    // routing-log-only mode: capture the native routing stream of a pool-free
-    // run (e.g. pure -cmoe) to build a true native pool. register the delegate
-    // hook here, before the early returns below can disable it.
-    const char * rt_env = getenv("GGML_EXPPOOL_ROUTING_LOG");
-    // draft contexts stay out of the routing-log mode: the log is a single
-    // file path, so two contexts would truncate each other's capture
-    if (cparams.expert_pool <= 0 && cparams.ctx_other == nullptr && rt_env != nullptr && rt_env[0] != '\0') {
-        const int32_t n_layer = model.hparams.n_layer();
-        st.rtlog_only = true;
-        st.pooled_layers.clear();
-        st.layers.assign(n_layer, llama_expert_pool_layer{});
-        for (int32_t il = 0; il < n_layer; ++il) {
-            const llama_layer & L = model.layers[il];
-            if (L.ffn_gate_up_exps || L.ffn_up_exps || L.ffn_gate_exps) {
-                st.layers[il].orig[PK_GATE_UP] = L.ffn_gate_up_exps;
-                st.layers[il].orig[PK_UP]      = L.ffn_up_exps;
-                st.layers[il].orig[PK_GATE]    = L.ffn_gate_exps;
-                st.pooled_layers.push_back(il);
-            }
-        }
-        st.delegate_registered = true;
-        llama_expert_pool_delegate_register();
-        // no mounts in this mode: every pooled layer is "active" for the
-        // step-boundary anchors (the hook fires for all of them in order)
-        st.first_active_ilx = 0;
-        st.last_active_ilx  = (int32_t) st.pooled_layers.size() - 1;
-        LLAMA_LOG_INFO("%s: routing-log-only mode (%d MoE layers, no delegation)\n",
-                __func__, (int) st.pooled_layers.size());
-        return;
-    }
+
     if (cparams.expert_pool <= 0) {
         return;
     }
@@ -1202,7 +1173,7 @@ void llama_context::expert_pool_fill() {
     llama_expert_pool_tab_build(st);
     llama_expert_pool_tab_publish(st);
 
-    // --- moe routing-log hook (feeds GGML_EXPPOOL_ROUTING_LOG) ---
+    // --- moe delegate hook (feeds the route observer, llama-ext.h) ---
     if (st.direct_mount) {
         if (!st.delegate_registered) {
             st.delegate_registered = true;

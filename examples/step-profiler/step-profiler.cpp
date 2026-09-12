@@ -17,6 +17,36 @@
 #include <string>
 #include <vector>
 
+#include "../../src/llama-ext.h" // fork-private ext API (expert-pool route observer)
+
+// --- expert-pool routing capture (GGML_EXPPOOL_ROUTING_LOG) -----------------
+// the library no longer writes routing files; the route observer fans out the
+// ids served by the CPU MoE delegate (decode rows) and this tool owns the CSV.
+struct route_capture {
+    FILE *   fp = nullptr;
+    uint64_t step = 0;
+    int32_t  last_il = -1;
+};
+
+static route_capture g_route;
+
+static void route_cb(void * ud, int32_t il, const int32_t * ids, int32_t n_ids, int32_t first_of_step) {
+    route_capture & c = *(route_capture *) ud;
+    if (first_of_step) {
+        c.step += 1;
+        c.last_il = -1;
+    }
+    if (c.last_il == il) {
+        return; // one call per node (up/gate/down) for the same layer
+    }
+    c.last_il = il;
+    fprintf(c.fp, "%llu,%d", (unsigned long long) c.step, il);
+    for (int32_t i = 0; i < n_ids; ++i) {
+        fprintf(c.fp, ",%d", ids[i]);
+    }
+    fputc('\n', c.fp);
+}
+
 // llama-step-profiler
 //
 // measures per-step (per-token) decode timing using the scheduler eval callback
@@ -355,6 +385,18 @@ int main(int argc, char ** argv) {
 
     auto * smpl = common_sampler_init(model, params.sampling);
 
+    // routing capture (the library-side writer is retired; see llama-ext.h):
+    // capture the ids the CPU MoE delegate serves into the env-named CSV,
+    // one line per (step, layer): "step,layer,expert_ids"
+    const char * route_path = getenv("GGML_EXPPOOL_ROUTING_LOG");
+    if (route_path != nullptr && route_path[0] != '\0') {
+        g_route.fp = fopen(route_path, "w");
+        if (g_route.fp != nullptr) {
+            fprintf(g_route.fp, "step,layer,expert_ids\n");
+            llama_expert_pool_set_route_observer(route_cb, &g_route);
+        }
+    }
+
     // sync-after-decode (default on): llama_decode is async; the wall clock is
     // read after a device sync so it measures real execution, not submission.
     const bool no_sync = getenv("STEP_PROFILE_NO_SYNC") != nullptr;
@@ -448,6 +490,13 @@ int main(int argc, char ** argv) {
 
     // end of the generation segment: print the accumulated pool hit rate
     llama_expert_pool_finalize(ctx);
+
+    // routing capture teardown (see llama-ext.h)
+    if (g_route.fp != nullptr) {
+        llama_expert_pool_set_route_observer(nullptr, nullptr);
+        fclose(g_route.fp);
+        g_route.fp = nullptr;
+    }
 
     // aggregate view: run totals + per-layer means (decode steps only)
     if (data.steps.size() > 1) {

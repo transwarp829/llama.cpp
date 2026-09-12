@@ -132,3 +132,22 @@ LLAMA_API uint32_t        llama_model_target_layer_ids_n(const struct llama_mode
 // if out is nullptr, returns the number of tokens without writing to out
 // caller must allocate enough memory for out before calling
 LLAMA_API uint32_t llama_model_get_tok_embd(const struct llama_model * model, float * out);
+
+//
+// expert pool: routing observer (fork-private experimental API)
+//
+
+// The CPU MoE delegate fans out the expert ids it serves, one call per kernel
+// invocation (decode-scale batches only; prefill runs the copied GPU path).
+// Used by tools (e.g. step-profiler) to capture the routing stream - the
+// library no longer writes routing files itself. Registering also installs
+// the delegate hook, so pool-free runs can be captured. Pass cb = nullptr
+// to unregister.
+//   il            - layer number the kernel belongs to
+//   ids           - ids the kernel received (direct mount: resident = -1)
+//   n_ids         - ids per token (ids->ne[0])
+//   first_of_step - 1 when this call begins a new decode step
+typedef void (*llama_expert_pool_route_fn)(
+        void * user_data, int32_t il, const int32_t * ids, int32_t n_ids, int32_t first_of_step);
+
+LLAMA_API void llama_expert_pool_set_route_observer(llama_expert_pool_route_fn cb, void * user_data);

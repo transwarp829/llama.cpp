@@ -145,21 +145,13 @@ struct llama_expert_pool_state {
     // non-resident columns on the GPU chain (and the resident columns on the
     // CPU chain via the inverse table), so no delegate hook is needed
     bool direct_mount = false;
-    bool rtlog_only = false;     // GGML_EXPPOOL_ROUTING_LOG with no pool: the
-                                 // hook only feeds the routing log (no slots,
-                                 // no delegation); set in expert_pool_init()
     ggml_backend_buffer_type_t pool_buft = nullptr;        // pool buft (device)
 
-    // runtime routing log (GGML_EXPPOOL_ROUTING_LOG=<path>; ONLY for analysis,
-    // writes the ids seen by the CPU mul_mat_id kernel: "step,layer,id0,id1,..".
-    // with direct mount the ids are the inverse-remap values (resident = -1,
-    // non-resident = expert id), so hit ratio = share of -1 entries.
-    FILE * rt_log = nullptr;               // opened lazily on first begin
-    bool   rt_log_tried = false;           // env already checked (avoid re-getenv)
-    uint64_t log_step = 0;                 // current decode step (incremented at ilx==0)
-    int32_t logged_il = -1;                // last logged layer id (dedup per step)
-    bool   rt_step_done = false;           // last pooled layer logged since the last
-                                           // step advance (single-layer-safe step detect)
+    // decode-step boundary detector (single-layer-safe): set when the last
+    // active-mount layer of a step is served, consumed at the first
+    // active-mount layer of the next step; anchors the swap publish and the
+    // step flag forwarded to the route observer (llama-ext.h)
+    bool   step_done = false;
 
     // stage 3 swap (on by default with -nep): sliding decode window count of
     // expert activations, one entry per (pooled layer, expert); the rate-
@@ -290,9 +282,10 @@ void llama_expert_pool_random(int32_t n_layer, int32_t n_expert,
                               const std::vector<int32_t> & widths,
                               std::vector<std::vector<int32_t>> & resident);
 
-// moe routing-log hook: called by the CPU MUL_MAT_ID kernel (ith==0), feeds
-// GGML_EXPPOOL_ROUTING_LOG (see llama-expert-pool.h). returns a null skip
-// table: no rows are skipped, column zeroing is done by the -1 ids natively.
+// moe delegate hook: called by the CPU MUL_MAT_ID kernel (ith==0); feeds the
+// swap window / hit-miss counters and fans the served ids out to the route
+// observer (llama-ext.h). returns a null skip table: no rows are skipped,
+// column zeroing is done by the -1 ids natively.
 void llama_expert_pool_delegate_begin(
         ggml_tensor * src0, ggml_tensor * src1, ggml_tensor * ids, ggml_tensor * dst,
         const int32_t ** skip_out, void * ud);

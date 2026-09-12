@@ -1,5 +1,6 @@
 #include "llama-expert-pool.h"
 #include "llama-impl.h"
+#include "llama-ext.h"
 
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -39,6 +40,28 @@ void llama_expert_pool_delegate_unregister() {
     }
 }
 
+// route observer (llama-ext.h, fork-private): the ids served by the CPU MoE
+// delegate fan out to one observer; tools write their own routing files and
+// the library keeps no routing-log state. set once at tool init, read from
+// compute threads.
+static llama_expert_pool_route_fn g_route_cb = nullptr;
+static void *                     g_route_ud = nullptr;
+// capture-mode step detection (no direct-mount pool on the thread's context):
+// a layer index that does not advance begins a new decode step
+static thread_local int32_t       g_cap_prev_il = -1;
+
+void llama_expert_pool_set_route_observer(llama_expert_pool_route_fn cb, void * user_data) {
+    const bool had  = g_route_cb != nullptr;
+    const bool want = cb != nullptr;
+    g_route_cb = cb;
+    g_route_ud = user_data;
+    if (want && !had) {
+        llama_expert_pool_delegate_register();
+    } else if (!want && had) {
+        llama_expert_pool_delegate_unregister();
+    }
+}
+
 void llama_expert_pool_state::register_mount(int il, const llama_expert_pool_mount & m) {
     if (il < 0) {
         return;
@@ -73,21 +96,12 @@ const llama_expert_pool_mount & llama_expert_pool_state::mount(int il) const {
 void llama_expert_pool_state::reset() {
     enabled = false;
     direct_mount = false;
-    rtlog_only = false;
     layers.clear();
     mounts.clear();
     resident.clear();
     pooled_layers.clear();
 
-    // runtime routing log cleanup (GGML_EXPPOOL_ROUTING_LOG)
-    if (rt_log != nullptr) {
-        fclose(rt_log);
-    }
-    rt_log = nullptr;
-    rt_log_tried = false;
-    log_step = 0;
-    logged_il = -1;
-    rt_step_done = false;
+    step_done = false;
 
     swap_auto = false;
     fill_done = false;
@@ -309,10 +323,11 @@ void llama_expert_pool_random(int32_t n_layer, int32_t n_expert,
     }
 }
 // -----------------------------------------------------------------------------
-// moe routing-log hook: called by the CPU MUL_MAT_ID kernel (ith==0) before
-// row grouping. collects NO rows (nothing is skipped: the -1 skip ids zero
-// the columns natively, both chains merge in the main graph);
-// it only feeds GGML_EXPPOOL_ROUTING_LOG.
+// moe delegate hook: called by the CPU MUL_MAT_ID kernel (ith==0) before row
+// grouping. collects NO rows (nothing is skipped: the -1 skip ids zero the
+// columns natively, both chains merge in the main graph); it feeds the swap
+// window / hit-miss counters and fans the served ids out to the route
+// observer (llama-ext.h).
 // -----------------------------------------------------------------------------
 
 void llama_expert_pool_delegate_begin(
@@ -320,14 +335,30 @@ void llama_expert_pool_delegate_begin(
         const int32_t ** skip_out, void * ud) {
     (void) ud; // the pool is resolved from the current thread (set_current)
     *skip_out = nullptr;
+
+    // route observer capture path (llama-ext.h): without a direct-mount pool
+    // on this thread's context the ids are the native top-k values. forward
+    // one-token decode rows; a layer index that moves BACKWARDS begins a new
+    // step (the CPU kernel runs only below the MoE offload threshold, so the
+    // stream is decode-only and every step visits the layers in ascending
+    // order; repeats of the same layer are the per-node calls of one layer)
+    if (g_route_cb != nullptr && (g_current_pool == nullptr || !g_current_pool->direct_mount)) {
+        if (ids->ne[1] == 1) {
+            int32_t il = -1;
+            if (sscanf(src0->name, "blk.%d.", &il) == 1 && il >= 0) {
+                const int32_t prev = g_cap_prev_il;
+                g_cap_prev_il = il;
+                g_route_cb(g_route_ud, il, (const int32_t *) ids->data, (int32_t) ids->ne[0],
+                        prev >= 0 && il < prev ? 1 : 0);
+            }
+        }
+        return;
+    }
     if (g_current_pool == nullptr) {
         return;
     }
     llama_expert_pool_state & st = *g_current_pool;
     if (st.pooled_layers.empty()) {
-        return;
-    }
-    if (!st.rtlog_only && !st.direct_mount) {
         return;
     }
 
@@ -363,42 +394,23 @@ void llama_expert_pool_delegate_begin(
     // and speculative verify batches (T = 1 + n_draft) both arrive with
     // ids->ne[1] > 1, and dropping them silently disables the swap under
     // -np N or speculative decoding (the window is a global mix of all
-    // sequences routed in this decode). only the routing log below keeps the
-    // one-token-per-line format.
-    // --- runtime routing log (env-gated, B=1 decode rows only): write the
-    // expert ids that reached this kernel, one line per (step, pooled layer).
-    // step counting: the first begin of each step is the first pooled layer
-    // (up fires before gate/down in build order), so ilx==0 starts a new step.
-    if (!st.rt_log_tried) {
-        st.rt_log_tried = true;
-        const char * lp = getenv("GGML_EXPPOOL_ROUTING_LOG");
-        if (lp != nullptr && lp[0] != '\0') {
-            st.rt_log = fopen(lp, "w");
-            if (st.rt_log != nullptr) {
-                fprintf(st.rt_log, "step,layer,expert_ids\n");
-            }
-        }
-    }
+    // sequences routed in this decode). only the route observer below keeps
+    // the one-token-per-line format.
     // lazy window allocation is gone from the hook: the swap worker owns
     // win_cnt/win_hist and allocates them at its first settlement.
     if (st.stat.empty() && !st.pooled_layers.empty()) {
         st.stat.assign(st.pooled_layers.size(), llama_expert_pool_counts{});
     }
-    // step-advance detection, independent of the routing log: the first
-    // layer with an active mount of a step begins after the last one of the
-    // previous step (rt_step_done is set at the end of this hook)
-    if (ilx == st.first_active_ilx && st.rt_step_done) {
-        st.rt_step_done = false;
+    // step-advance detection: the first layer with an active mount of a step
+    // begins after the last one of the previous step (step_done is set at the
+    // end of this hook); the same condition is the step flag forwarded to the
+    // route observer below
+    const bool first_of_step = ilx == st.first_active_ilx && st.step_done;
+    if (first_of_step) {
+        st.step_done = false;
         // new step: re-arm the per-layer gate (a single active layer would
         // otherwise be skipped forever after its first count)
         st.last_ilx = -1;
-        if (st.rt_log != nullptr) {
-            // advance the log's step counter and flush the previous step's
-            // lines (the swap never lives in this block anymore)
-            st.log_step += 1;
-            st.logged_il = -1;
-            fflush(st.rt_log);
-        }
         if (st.swap_auto && small_batch) {
             // publish the worker's latest ready mirror: the only table write
             // point. if the worker is still copying (no new ready mirror),
@@ -412,18 +424,12 @@ void llama_expert_pool_delegate_begin(
             st.hook_step += 1;
         }
     }
-    // routing log: keep the one-token-per-line format (B=1 decode rows only);
-    // the step advance happens in the main advance block above
-    if (ids->ne[1] == 1 && st.rt_log != nullptr) {
-        if (st.logged_il != il) {
-            st.logged_il = il;
-            fprintf(st.rt_log, "%llu,%d", (unsigned long long) st.log_step, il);
-            for (int id = 0; id < (int) ids->ne[0]; ++id) {
-                const int32_t e = *((const int32_t *) ((const char *) ids->data + id*ids->nb[0]));
-                fprintf(st.rt_log, ",%d", e);
-            }
-            fputc('\n', st.rt_log);
-        }
+    // route observer (llama-ext.h): forward the ids of one-token decode rows;
+    // the consumer dedups repeats and owns the file. the first_of_step flag is
+    // the same wrap condition that anchors the swap publish above.
+    if (g_route_cb != nullptr && ids->ne[1] == 1) {
+        g_route_cb(g_route_ud, il, (const int32_t *) ids->data, (int32_t) ids->ne[0],
+                first_of_step ? 1 : 0);
     }
 
     // --- stage 3 swap window: push the FULL activation row of this layer
@@ -461,7 +467,7 @@ void llama_expert_pool_delegate_begin(
     // so the anchor is not always the last pooled index - using the last
     // ACTIVE index keeps the step-boundary alive under the desert rule)
     if (ilx == st.last_active_ilx) {
-        st.rt_step_done = true;
+        st.step_done = true;
     }
 }
 
