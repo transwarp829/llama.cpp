@@ -2292,16 +2292,16 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 cb(mount_scale_gate, "ffn_moe_scale_gate", il);
             }
 
-            // keep the 2D cur for the mounted chain below: the miss chain
-            // reshapes cur to 3d in place (see build_expert_chain), but the
-            // mount chain (built later, on purpose: the whole GPU-side chain
-            // runs AFTER the CPU miss chain) must receive the original shape.
+            // keep the 2D cur for the mount block below: the miss chain
+            // reshapes cur to 3d in place (see build_expert_chain), so the
+            // mount block must receive the original shape.
             cur_mount_in = cur;
             mount_p = &mnt;
 
-            // the mounted chain itself is built at the END of this function
-            // (after the miss chain and its aggregation), so the graph order
-            // is: gate/ids/gather -> CPU miss chain -> GPU mount chain -> merge
+            // the mount block is expanded below, BEFORE the miss chain, so the
+            // graph order is gate/ids/gather -> GPU mount -> CPU miss -> merge.
+            // the miss chain tensors are built above but enter the graph at the
+            // expand that follows the mount block - build order is not graph order.
 
         }
     }
@@ -2329,10 +2329,10 @@ build_expert_chain:
     }
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
     if (chain_only) {
-        // the mount chain block head mark: the scheduler splits the GPU
-        // segment at this node so the self-contained mount block (cur prep
-        // + ids lookup + chain) becomes one split that can be submitted
-        // ahead of the CPU miss chain.
+        // the mount chain block head marker: the scheduler splits the GPU
+        // segment at this node so the self-contained mount block (cur prep +
+        // chain) becomes its own split, submitted right after the layer front
+        // and therefore running while the CPU miss chain computes.
         cb(cur, "ffn_moe_mount_cur", il);
     }
 
@@ -2524,18 +2524,22 @@ build_expert_chain:
         return experts;
     }
 
-    // mounted chain, built BEFORE the miss aggregation on purpose: the mount
-    // block is SELF-CONTAINED (A1-final inputs only), and the layer-parallel
-    // early submit runs it ahead of the CPU miss chain. the block computes
-    // ONLY the (unweighted) expert outputs. graph order: gate/ids/gather ->
-    // CPU miss -> GPU mount chain (expanded first) -> shared/merge.
+    // mounted chain, expanded BEFORE the miss chain on purpose: the graph
+    // order must equal the window's execution order, i.e. gate/ids/gather ->
+    // GPU mount -> CPU miss -> shared/merge. the early submit runs this block
+    // right after the layer front, while the CPU miss chain still computes,
+    // and the sequential galloc model reads the same graph order - a GPU block
+    // left between the front and the mount would get its addresses reused
+    // while the window still reads them. the block is SELF-CONTAINED (A1-final
+    // inputs only) and computes ONLY the (unweighted) expert outputs.
     if (mount_out == nullptr && mount_p != nullptr) {
         ggml_tensor * mnt_cur = cur_mount_in;
-        // the mount block must be SELF-CONTAINED for the layer-parallel
-        // early submit: its only in-graph inputs are A1-final (cur, ids,
-        // tables) - the cur prep (chain_only reshape, named inside
-        // build_expert_chain) and the ids lookup ride inside, so the whole
-        // block can run ahead of the CPU miss chain.
+        // the mount block must be SELF-CONTAINED for the layer-parallel early
+        // submit: its in-graph inputs are A1-final (cur, ids, tables), the cur
+        // prep (chain_only reshape, named inside build_expert_chain) and the
+        // gate/up/down chain ride inside, and its id gather lands in the anchor
+        // split just before the head marker - so the whole block can run right
+        // after the layer front.
         mount_out = build_moe_ffn(mnt_cur, gate_inp, gate_inp_b,
             mount_p->w_up, mount_p->w_up_b, mount_p->w_gate, mount_p->w_gate_b, mount_p->w_down, mount_p->w_down_b, exp_probs_b,
             n_expert, n_expert_used, type_op, norm_w, w_scale, gating_op, il,

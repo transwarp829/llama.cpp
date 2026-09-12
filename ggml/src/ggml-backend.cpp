@@ -1433,13 +1433,13 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             // check if we should start a new split based on the sources of the current node
             bool need_new_split = false;
             // split the layer's GPU segment so the mounted chain
-            // forms its own split that can be submitted ahead of the CPU miss
-            // chain. only the mount block head (ffn_moe_mount_cur, the cur
-            // prep - the block is self-contained: its ids lookup and gate
-            // mmid ride inside) and its tail (ffn_moe_out) force boundaries:
-            // the gate section rides inside the layer's GPU segment (attn +
-            // gate + ids as one split), the boundary check runs on VIEW ops
-            // too (the prep head is a reshape).
+            // forms its own split that can be submitted right after the layer
+            // front. only the mount block head (ffn_moe_mount_cur, the cur
+            // prep - the block is self-contained: the id gather lands just
+            // before this head, the matmuls ride inside) and its tail
+            // (ffn_moe_out) force boundaries: the gate section rides inside the
+            // layer's GPU segment (attn + gate + ids as one split), the
+            // boundary check runs on VIEW ops too (the prep head is a reshape).
             // GPU segments only - the CPU miss chain must stay one split.
             // the layer-parallel split/submit is a SMALL-BATCH
             // feature only: for batches >= the offload threshold the native
@@ -1680,12 +1680,13 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 jf = j;
                 break;
             }
-            // the splits BETWEEN the front and the mount in graph order (e.g.
-            // the weighted miss-agg split of the same layer): the window runs
-            // the mount BEFORE them, so the mount's tensors must not reuse
-            // their addresses - keep them allocated until the mount tail,
-            // otherwise the mount's writes land on addresses these later-run
-            // splits still read/write.
+            // any GPU split BETWEEN the front and the mount in graph order:
+            // the window runs the mount BEFORE it, so the mount's tensors must
+            // not reuse its addresses - keep them allocated until the mount
+            // tail, otherwise the mount's writes land on addresses the later
+            // run split still reads/writes. no such split exists today (the
+            // mount is the front's immediate successor in the graph); CPU
+            // splits are skipped - a different pool.
             for (int j = jf + 1; j < i; j++) {
                 ggml_backend_sched_split & mp = sched->splits[j];
                 if (mp.graph.n_nodes == 0 || mp.backend_id == sched->n_backends - 1) {
@@ -2157,17 +2158,18 @@ compute_this_split:;
             }
             }
 
-            // layer-parallel with the mounted chain AFTER the miss
-            // chain. the anchor is the layer's GPU expert-front split: attn +
-            // gate + ids live in ONE split (the former gate boundary is gone),
-            // so the anchor is identified by CONTAINING a ffn_moe_gate node.
-            // find the next pure mounted chain split (GPU-only inputs, split
-            // at the mount head) and submit it NOW on the same stream - the
-            // GPU runs it while the CPU miss chain computes. the submit comes
-            // AFTER the anchor split's own compute: the mount block reads ids
-            // that only the anchor produces (A1-final), the stream order is
-            // anchor -> mount. the miss split in between is skipped by the
-            // scan; submitting from the GPU split keeps the copies+launch OFF
+            // layer-parallel: the mount chain is its own split right after the
+            // layer front (graph order: gate/ids/gather -> GPU mount -> CPU
+            // miss -> shared/merge), so submit it NOW on the same stream - the
+            // GPU runs it while the CPU miss chain computes. the anchor is the
+            // layer's GPU expert-front split: attn + gate + ids live in ONE
+            // split (the former gate boundary is gone), identified by
+            // CONTAINING a node named ffn_moe_logits (the router A1 output; the
+            // ffn_moe_gate prefix only occurs inside the chain sections, so it
+            // would anchor the mount split itself). the submit comes AFTER the
+            // anchor split's own compute: the mount block reads ids that only
+            // the anchor produces (A1-final), the stream order is anchor ->
+            // mount. submitting from the GPU split keeps the copies+launch OFF
             // the CPU miss split's critical path.
             if (sched->layer_parallel && !sched->callback_eval &&
                 !split_early_off() &&
@@ -2207,14 +2209,16 @@ compute_this_split:;
                             sched->tl_anchor_valid = true;
                         }
                     }
-                    // find the next pure mount split (ffn_moe_mount_cur head +
+                    // find the mount split (ffn_moe_mount_cur head +
                     // ffn_moe_mount nodes) and submit it ahead while the CPU
-                    // miss chain computes.
+                    // miss chain computes. today it IS the anchor's next split;
+                    // the scan skips CPU splits so the lookup also holds if a
+                    // CPU split ever sits in between.
                     ggml_backend_sched_split * nxt = nullptr;
                     for (int j = split_id + 1; j < sched->n_splits; j++) {
                         ggml_backend_sched_split * cand = &splits[j];
                         if (cand->backend_id == sched->n_backends - 1) {
-                            continue; // the CPU miss split of this layer - skip it
+                            continue; // CPU split (the miss chain) - not a mount candidate
                         }
                         if (cand->graph.n_nodes == 0 || cand->graph.nodes[0]->name == NULL) {
                             break;
