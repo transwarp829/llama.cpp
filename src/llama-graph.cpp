@@ -2275,6 +2275,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 mount_scale = ggml_get_rows(ctx0, sc3, ids_flat);
                 mount_scale = ggml_reshape_3d(ctx0, mount_scale, 1, n_expert_used, n_tokens);
                 cb(mount_scale, "ffn_moe_scale", il);
+                // call early so the scale lookup precedes the weighted mul:
+                // the CUDA MoE weighted-reduction matcher needs the two muls
+                // adjacent (upstream does the same for the router weights above)
+                ggml_build_forward_expand(gf, mount_scale);
             }
             // factored up/gate scales: same clean-ids gather; consumed
             // pre-activation on both chains (activation is nonlinear, so the
