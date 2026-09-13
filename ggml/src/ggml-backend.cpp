@@ -814,7 +814,6 @@ static bool ggml_is_view_op(enum ggml_op op) {
 static const char * const SPLIT_MARK_MOUNT_CUR = "ffn_moe_mount_cur";
 static const char * const SPLIT_MARK_GATE      = "ffn_moe_gate";
 static const char * const SPLIT_MARK_LOGITS    = "ffn_moe_logits";
-static const char * const SPLIT_MARK_OUT       = "ffn_moe_out";
 static const char * const SPLIT_MARK_MOUNT     = "ffn_moe_mount";
 
 static bool split_name_is(const struct ggml_tensor * t, const char * prefix, size_t len) {
@@ -1402,9 +1401,6 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     {
         int i_split = 0;
         struct ggml_backend_sched_split * split = &sched->splits[0];
-        // inside a mount block (between ffn_moe_mount_cur and
-        // ffn_moe_out): the block-internal gate never forces a boundary.
-        bool mount_block = false;
         // batch size of the current layer's moe section (ne[2] of
         // the gate mmid / the mount block head), for the small-batch gate.
         int64_t layer_T = -1;
@@ -1459,15 +1455,16 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 }
                 const bool small_batch = layer_T >= 0 && layer_T < split_op_min_batch();
                 if (sched->layer_parallel && small_batch) {
-                    // only the mount block head and its tail force boundaries:
-                    // the gate section rides INSIDE the layer's GPU segment
-                    // (attn + gate + ids are one split), the mount block is
+                    // only the mount block head forces a boundary: the gate
+                    // section rides INSIDE the layer's GPU segment (attn +
+                    // gate + ids are one split) and the mount block is
                     // submitted right after the layer front computed.
+                    // ffn_moe_out must NOT break it: that marker names the
+                    // last aggregation add, and the CUDA MoE weighted-reduction
+                    // matcher needs the whole views/adds chain inside one split.
+                    // the agg block starts at the merge anyway (the CPU -> GPU
+                    // backend change forces that boundary).
                     if (split_name_is(node, SPLIT_MARK_MOUNT_CUR, 17)) {
-                        mount_block = true;
-                        need_new_split = true;
-                    } else if (split_name_is(node, SPLIT_MARK_OUT, 11)) {
-                        mount_block = false;
                         need_new_split = true;
                     }
                 }
