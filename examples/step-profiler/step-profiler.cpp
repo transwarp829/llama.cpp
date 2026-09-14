@@ -175,15 +175,45 @@ static bool cb_eval(ggml_tensor * t, bool ask, void * user_data) {
 
         // capture activated expert ids from MUL_MAT_ID inputs (once per step/layer)
         // ggml_mul_mat_id(ctx, as, b, ids) -> src[2] = selected expert indices
+        //
+        // never read a ggml view linearly: the graph feeds ggml_argsort_top_k(),
+        // which is a strided VIEW over the argsort buffer (nb[1] = n_expert*4).
+        // a flat get() of ne[0]*ne[1] elements then reads the buffer head - one
+        // n_expert-long argsort row per token instead of the ids. that went
+        // unnoticed for as long as the capture existed because single-token rows
+        // (ne[1] == 1) are contiguous and read correctly by accident, so only
+        // prefill rows were corrupted (they came out as exact permutations of
+        // 0..n_expert, i.e. "all experts").
         if (t->op == GGML_OP_MUL_MAT_ID && data->f_routing != nullptr && t->src[2] != nullptr) {
             const int cur_step = (int) data->steps.size() - 1;
             if (layer >= 0 && layer < (int) data->n_layers &&
                 (cur_step != data->last_routing_step || layer != data->last_routing_layer)) {
                 const ggml_tensor * ids = t->src[2];
                 GGML_ASSERT(ids->type == GGML_TYPE_I32); // routing ids are always I32
-                const int64_t n = ids->ne[0] * ids->ne[1]; // [n_expert_used, n_tokens]
+                const int64_t k  = ids->ne[0];           // ids per token
+                const int64_t nt = ids->ne[1];           // token columns
+                const int64_t n  = k * nt;               // [n_expert_used, n_tokens]
                 std::vector<int32_t> buf(n > 0 ? n : 1, 0);
-                ggml_backend_tensor_get(ids, buf.data(), 0, n * sizeof(int32_t));
+                if (ggml_is_contiguous(ids)) {
+                    ggml_backend_tensor_get(ids, buf.data(), 0, n * sizeof(int32_t));
+                } else if (ids->src[0] != nullptr && ggml_is_contiguous(ids->src[0]) &&
+                           ids->nb[0] == ids->src[0]->nb[0] && ids->nb[1] == ids->src[0]->nb[1]) {
+                    // read the contiguous source once, then pick each token's column
+                    const ggml_tensor * src = ids->src[0];
+                    const int64_t ne = src->ne[0];
+                    std::vector<int32_t> all((size_t) ne * nt);
+                    ggml_backend_tensor_get(src, all.data(), 0, (size_t) ne * nt * sizeof(int32_t));
+                    for (int64_t j = 0; j < nt; ++j) {
+                        for (int64_t i = 0; i < k; ++i) {
+                            buf[i + j*k] = all[i + j*ne];
+                        }
+                    }
+                } else {
+                    GGML_ASSERT(ids->nb[0] == sizeof(int32_t));
+                    for (int64_t j = 0; j < nt; ++j) {
+                        ggml_backend_tensor_get(ids, buf.data() + j*k, j * ids->nb[1], k * sizeof(int32_t));
+                    }
+                }
                 auto & fout = *data->f_routing;
                 fout << cur_step << "," << layer;
                 for (int64_t i = 0; i < n; ++i) {
