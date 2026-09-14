@@ -409,10 +409,10 @@ extern "C" {
 
         int32_t expert_pool;        // [EXPERIMENTAL] total expert-pool slots (0 = disabled)
         const char * expert_pool_init; // [EXPERIMENTAL] csv file to seed the pool ("il,e1,e2,..."), null = random
-        bool expert_pool_swap;      // [EXPERIMENTAL] auto-swap the pool resident set (sliding window)
-        int32_t expert_pool_swap_window; // [EXPERIMENTAL] swap window in decode steps (0 = default 512)
-        int32_t expert_pool_swap_per_step; // [EXPERIMENTAL] max expert pairs swapped in per decode step (0 = default 10, negative = unlimited)
+        bool expert_pool_swap;      // [EXPERIMENTAL] auto-swap the pool resident set
+        int32_t expert_pool_swap_per_step; // [EXPERIMENTAL] max expert pairs swapped in per decode step (0 = default 40, negative = unlimited)
         int32_t expert_pool_layers; // [EXPERIMENTAL] pool the N deepest MoE layers, deep-to-shallow (0 = all eligible)
+        int32_t expert_pool_decay;  // [EXPERIMENTAL] decaying activation counter: half-life in decode steps (default 96)
 
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)

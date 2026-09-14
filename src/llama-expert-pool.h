@@ -153,20 +153,15 @@ struct llama_expert_pool_state {
     // step flag forwarded to the route observer (llama-ext.h)
     bool   step_done = false;
 
-    // stage 3 swap (on by default with -nep): sliding decode window count of
-    // expert activations, one entry per (pooled layer, expert); the rate-
-    // gated top-k refresh converges the resident set to the window's k most
-    // used experts (k = slot count), at most swap_per_step expert pairs per
-    // settled step
+    // swap (on by default with -nep): decaying activation count of expert
+    // activations, one entry per (pooled layer, expert); the top-k refresh
+    // converges the resident set to the k most used experts (k = slot count),
+    // at most swap_per_step expert pairs per settled step (a burst fuse - with
+    // the default half-life the steady-state rate sits well below it)
     bool swap_auto = false;
-    int32_t swap_W = 512;                  // window length in decode steps
-    int32_t swap_per_step = 10;            // max expert pairs swapped in per
+    int32_t swap_per_step = 40;            // max expert pairs swapped in per
                                            // settled step, across all pooled
-                                           // layers (negative = unlimited);
-                                           // the swap rate control of the
-                                           // window top-k refresh (the window
-                                           // warm-up fill is fast by design;
-                                           // this caps the tail)
+                                           // layers (negative = unlimited)
     int32_t n_expert = 0;                  // experts per layer (set at init)
     // hook-side step counter (the hook only pushes routing rows; the swap
     // worker owns the window below)
@@ -186,6 +181,7 @@ struct llama_expert_pool_state {
     struct route_block {
         int32_t step = 0;                  // decode step this row belongs to
         int32_t ilx  = -1;                 // pooled layer index (-1 = step marker)
+        int32_t n_tok = 1;                 // token columns of the batch (decay mode: increments are 1/n_tok)
         std::vector<int32_t> ids;          // FULL activation expert ids (pool hits recovered from the original top-k row)
     };
     std::mutex      route_mtx;
@@ -197,9 +193,15 @@ struct llama_expert_pool_state {
     // window counts, history, and the marginal exchange decisions. the hook
     // NEVER reads them - it only pushes route rows and, at each step
     // boundary, publishes the mirror the worker hands over.
-    int32_t win_step = 0;                  // decode steps accounted in the window
-    std::vector<int32_t> win_cnt;          // [pooled layers * n_expert] FULL counts
-    std::vector<std::vector<int32_t>> win_hist; // [W] flat (ilx, e) pairs per step
+    int32_t win_step = 0;                  // decode steps accounted so far
+    // decaying activation counter (--expert-pool-decay H): per settled step
+    // every count is multiplied by swap_lambda and the step's rows land with
+    // per-token normalized increments (1 / n_tok per activation), so a batch of
+    // n token columns contributes one step's worth of evidence instead of n.
+    // float by design: the value is a weight, not a count.
+    float   swap_lambda   = 0.0f;          // per-step decay factor, lambda = 2^(-1/H)
+    int32_t swap_decay_hl = 96;            // decay half-life in decode steps (default 96)
+    std::vector<float> win_cnt;            // [pooled layers * n_expert] FULL counts
     int32_t swap_sum = 0;                  // exchanges accumulated this period
 
     // segment totals of the inference-side counters; independent of the

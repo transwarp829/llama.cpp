@@ -1706,17 +1706,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ));
     add_opt(common_arg(
-        {"--expert-pool-swap-window"}, "N",
-        "swap window length in decode steps (stage 3; default 512)",
+        {"--expert-pool-swap-per-step"}, "N",
+        "max expert pairs swapped in per decode step (0 = default 40, negative = unlimited)",
         [](common_params & params, int value) {
-            params.expert_pool_swap_window = value;
+            params.expert_pool_swap_per_step = value;
         }
     ));
     add_opt(common_arg(
-        {"--expert-pool-swap-per-step"}, "N",
-        "max expert pairs swapped in per decode step (0 = default 10, negative = unlimited)",
+        {"--expert-pool-decay"}, "H",
+        "activation counter half-life in decode steps for the swap refresh (default 96; lambda = 2^(-1/H) is derived). "
+        "The increment of a step is its activation count divided by its token columns",
         [](common_params & params, int value) {
-            params.expert_pool_swap_per_step = value;
+            params.expert_pool_decay = value;
         }
     ));
     add_opt(common_arg(

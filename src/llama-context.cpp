@@ -148,9 +148,9 @@ llama_context::llama_context(
     cparams.expert_pool      = params.expert_pool;
     cparams.expert_pool_init = params.expert_pool_init;
     cparams.expert_pool_swap = params.expert_pool_swap;
-    cparams.expert_pool_swap_window = params.expert_pool_swap_window;
     cparams.expert_pool_swap_per_step = params.expert_pool_swap_per_step;
     cparams.expert_pool_layers = params.expert_pool_layers;
+    cparams.expert_pool_decay  = params.expert_pool_decay;
 
     cparams.ctx_other = nullptr;
 
@@ -655,15 +655,19 @@ void llama_context::expert_pool_init() {
     if (swap_env != nullptr && swap_env[0] == '0') {
         st.swap_auto = false;
     }
-    // window length and per-step pair limit are CLI params only
-    // (--expert-pool-swap-window / --expert-pool-swap-per-step); the state
-    // defaults (512 steps, 10 pairs/step) apply when unset
-    if (cparams.expert_pool_swap_window > 0) {
-        st.swap_W = cparams.expert_pool_swap_window;
-    }
+    // per-step pair limit is a CLI param (--expert-pool-swap-per-step); the
+    // state default (40 pairs/step, a burst fuse) applies when unset
     if (cparams.expert_pool_swap_per_step != 0) {
         st.swap_per_step = cparams.expert_pool_swap_per_step;
     }
+    // decaying activation counter (--expert-pool-decay H, state default 96):
+    // lambda = 2^(-1/H) per settled step; the increment of a step is its
+    // activation count divided by its token columns, so a batch of n token
+    // columns contributes one step's worth of evidence instead of n.
+    st.swap_decay_hl = cparams.expert_pool_decay > 0 ? cparams.expert_pool_decay : st.swap_decay_hl;
+    st.swap_lambda   = std::pow(2.0f, -1.0f / (float) st.swap_decay_hl);
+    LLAMA_LOG_INFO("%s: expert pool: decaying counter, half-life %d steps (lambda %.6f)\n",
+            __func__, st.swap_decay_hl, st.swap_lambda);
 
     // --- find the pooled layers (ALL expert matrices of the layer on CPU) ---
     // a layer pools only when every present expert matrix resolves to a host
@@ -4276,9 +4280,9 @@ llama_context_params llama_context_default_params() {
         /*.expert_pool                 =*/ 0,
         /*.expert_pool_init            =*/ nullptr,
         /*.expert_pool_swap            =*/ true,
-        /*.expert_pool_swap_window     =*/ 0,
         /*.expert_pool_swap_per_step   =*/ 0,
         /*.expert_pool_layers         =*/ 0,
+        /*.expert_pool_decay          =*/ 96,
         /*.samplers                    =*/ nullptr,
         /*.n_samplers                  =*/ 0,
         /*.ctx_other                   =*/ nullptr,

@@ -1758,9 +1758,9 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.expert_pool       = params.expert_pool;
     cparams.expert_pool_init  = params.expert_pool_init.empty() ? nullptr : params.expert_pool_init.c_str();
     cparams.expert_pool_swap  = params.expert_pool_swap;
-    cparams.expert_pool_swap_window = params.expert_pool_swap_window;
     cparams.expert_pool_swap_per_step = params.expert_pool_swap_per_step;
     cparams.expert_pool_layers = params.expert_pool_layers;
+    cparams.expert_pool_decay  = params.expert_pool_decay;
 
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;

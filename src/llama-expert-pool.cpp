@@ -109,7 +109,7 @@ void llama_expert_pool_state::reset() {
     last_ilx = -1;
     win_step = 0;
     win_cnt.clear();
-    win_hist.clear();
+    win_cnt.clear();
     swap_sum = 0;
     stat.clear();
     win = {};
@@ -187,8 +187,9 @@ static void route_push_row(llama_expert_pool_state & st, int32_t step, int32_t i
     }
 
     llama_expert_pool_state::route_block rb;
-    rb.step = step;
-    rb.ilx  = ilx;
+    rb.step  = step;
+    rb.ilx   = ilx;
+    rb.n_tok = (int32_t) n_tok;
     rb.ids.reserve((size_t) n_used * (size_t) n_tok);
     for (int64_t t = 0; t < n_tok; ++t) {
         for (int64_t j = 0; j < n_used; ++j) {
@@ -396,8 +397,8 @@ void llama_expert_pool_delegate_begin(
     // -np N or speculative decoding (the window is a global mix of all
     // sequences routed in this decode). only the route observer below keeps
     // the one-token-per-line format.
-    // lazy window allocation is gone from the hook: the swap worker owns
-    // win_cnt/win_hist and allocates them at its first settlement.
+    // lazy counter allocation is gone from the hook: the swap worker owns
+    // win_cnt and allocates it at its first settlement.
     if (st.stat.empty() && !st.pooled_layers.empty()) {
         st.stat.assign(st.pooled_layers.size(), llama_expert_pool_counts{});
     }
@@ -591,7 +592,7 @@ static int32_t worker_decide_and_copy(llama_expert_pool_state & st) {
         int32_t ilx;
         int32_t e;    // expert to swap in
         int32_t slot; // slot to fill
-        int32_t cnt;  // window count of the incoming expert
+        float   cnt;  // activation count (window count or decayed weight) of the incoming expert
     };
     std::vector<pair_t> queue;
     queue.reserve(P);
@@ -608,11 +609,11 @@ static int32_t worker_decide_and_copy(llama_expert_pool_state & st) {
             continue;
         }
         const int32_t K = (int32_t) res.size();
-        // positive-count experts, (count, id) descending = the top-k pool
-        std::vector<std::pair<int32_t, int32_t>> hot; // (cnt, e)
+        // positive-count experts, (weight, id) descending = the top-k pool
+        std::vector<std::pair<float, int32_t>> hot; // (cnt, e)
         hot.reserve((size_t) n_expert);
         for (int32_t e = 0; e < n_expert; ++e) {
-            const int32_t c = st.win_cnt[ilx * n_expert + e];
+            const float c = st.win_cnt[ilx * n_expert + e];
             if (c > 0) {
                 hot.emplace_back(c, e);
             }
@@ -626,7 +627,7 @@ static int32_t worker_decide_and_copy(llama_expert_pool_state & st) {
             in_topk[hot[i].second] = true;
         }
         // incoming: hot experts of the new top-k that are not resident
-        std::vector<std::pair<int32_t, int32_t>> in; // (cnt, e)
+        std::vector<std::pair<float, int32_t>> in; // (cnt, e)
         for (int32_t i = 0; i < n_new; ++i) {
             const int32_t e = hot[i].second;
             bool resident = false;
@@ -645,7 +646,7 @@ static int32_t worker_decide_and_copy(llama_expert_pool_state & st) {
         // first; when the top-k is smaller than K, slots beyond it keep
         // their content - the pool only fills, it never shrinks
         std::vector<int32_t> empty;
-        std::vector<std::pair<int32_t, int32_t>> out; // (cnt, slot)
+        std::vector<std::pair<float, int32_t>> out; // (cnt, slot)
         for (int32_t s = 0; s < K; ++s) {
             const int32_t e = res[s];
             if (e < 0) {
@@ -713,9 +714,9 @@ static int32_t worker_decide_and_copy(llama_expert_pool_state & st) {
 }
 
 // settle one queued step marker: drain the route rows pushed before it (the
-// previous step's FULL activation counts), count them into the window
-// window, run the marginal exchange, and rebuild the mirror. worker thread
-// only; the hook never touches win_cnt/win_hist/resident.
+// previous step's FULL activation counts), decay the counters and count the
+// rows in, run the top-k refresh decisions, and rebuild the mirror. worker
+// thread only; the hook never touches win_cnt/resident.
 bool llama_expert_pool_worker_settle(llama_expert_pool_state & st) {
     std::vector<llama_expert_pool_state::route_block> rows;
     {
@@ -740,10 +741,10 @@ bool llama_expert_pool_worker_settle(llama_expert_pool_state & st) {
         // a marker with no rows (the first step marker): nothing settled.
         return true;
     }
-    // lazy window allocation (the rows are the first thing the worker sees)
+    // lazy allocation of the counters (the rows are the first thing the worker
+    // sees)
     if (st.win_cnt.empty() && !st.pooled_layers.empty()) {
-        st.win_cnt.assign((size_t) st.pooled_layers.size() * st.n_expert, 0);
-        st.win_hist.resize(st.swap_W);
+        st.win_cnt.assign((size_t) st.pooled_layers.size() * st.n_expert, 0.0f);
     }
     // count the rows by their own step id. a lagging worker may drain rows
     // of several old steps at once (multiple markers queued), so group by
@@ -751,24 +752,19 @@ bool llama_expert_pool_worker_settle(llama_expert_pool_state & st) {
     size_t i = 0;
     while (i < rows.size()) {
         const int32_t t = rows[i].step;
-        // WRITE-TIME eviction, per step: the slot t % W still holds the rows
-        // of step t - W (or of the previous incarnation of this slot);
-        // decrement them before this step's rows land in the same slot.
-        std::vector<int32_t> & old = st.win_hist[t % st.swap_W];
-        if (!old.empty()) {
-            for (size_t j = 0; j + 1 < old.size(); j += 2) {
-                st.win_cnt[old[j] * st.n_expert + old[j+1]] --;
-            }
-            old.clear();
+        // one decay tick per settled step, then the step's rows land with
+        // per-token normalized increments, so a batch of n token columns
+        // contributes one step's worth of evidence instead of n
+        const float lam = st.swap_lambda;
+        for (float & c : st.win_cnt) {
+            c *= lam;
         }
         size_t j = i;
         for (; j < rows.size() && rows[j].step == t; ++j) {
             const llama_expert_pool_state::route_block & rb = rows[j];
-            std::vector<int32_t> & hist = st.win_hist[t % st.swap_W];
+            const float inc = 1.0f / (float) (rb.n_tok > 0 ? rb.n_tok : 1);
             for (const int32_t e : rb.ids) {
-                st.win_cnt[rb.ilx * st.n_expert + e] ++;
-                hist.push_back(rb.ilx);
-                hist.push_back(e);
+                st.win_cnt[rb.ilx * st.n_expert + e] += inc;
             }
         }
         i = j;

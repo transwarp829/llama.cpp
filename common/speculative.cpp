@@ -2547,9 +2547,9 @@ common_speculative_init_result::common_speculative_init_result(
     // it (mirroring how -cmoed/-ngld live in params.speculative.draft.*)
     cparams.expert_pool               = params.speculative.draft.expert_pool;
     cparams.expert_pool_swap          = cparams.expert_pool > 0;
-    cparams.expert_pool_swap_window   = 0;
     cparams.expert_pool_swap_per_step = 0;
     cparams.expert_pool_layers        = 0;
+    cparams.expert_pool_decay         = 0;
     cparams.expert_pool_init          = nullptr;
 
     if (spec_mtp) {
