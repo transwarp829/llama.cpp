@@ -147,7 +147,6 @@ llama_context::llama_context(
 
     cparams.expert_pool      = params.expert_pool;
     cparams.expert_pool_init = params.expert_pool_init;
-    cparams.expert_pool_swap = params.expert_pool_swap;
     cparams.expert_pool_swap_per_step = params.expert_pool_swap_per_step;
     cparams.expert_pool_layers = params.expert_pool_layers;
     cparams.expert_pool_decay  = params.expert_pool_decay;
@@ -648,18 +647,9 @@ void llama_context::expert_pool_init() {
     const int32_t il_begin = mtp_ctx ? n_layer : 0;
     const int32_t il_end   = mtp_ctx ? n_layer_all : n_layer;
     st.n_expert = n_expert;
-    st.swap_auto = cparams.expert_pool_swap;
-    // experimental: GGML_EXPPOOL_SWAP=0 keeps the resident set static (A/B
-    // comparisons without swap); otherwise swap is on by default with -nep
-    const char * swap_env = getenv("GGML_EXPPOOL_SWAP");
-    if (swap_env != nullptr && swap_env[0] == '0') {
-        st.swap_auto = false;
-    }
-    // per-step pair limit is a CLI param (--expert-pool-swap-per-step); the
-    // state default (40 pairs/step, a burst fuse) applies when unset
-    if (cparams.expert_pool_swap_per_step != 0) {
-        st.swap_per_step = cparams.expert_pool_swap_per_step;
-    }
+    // 0 pairs/step freezes the resident set (the static A/B control arm)
+    st.swap_per_step = cparams.expert_pool_swap_per_step;
+    st.swap_auto     = st.swap_per_step != 0;
     // decaying activation counter (--expert-pool-decay H, state default 96):
     // lambda = 2^(-1/H) per settled step; the increment of a step is its
     // activation count divided by its token columns, so a batch of n token
@@ -4283,12 +4273,11 @@ llama_context_params llama_context_default_params() {
         /*.kv_unified                  =*/ false,
         /*.expert_pool                 =*/ 0,
         /*.expert_pool_init            =*/ nullptr,
-        /*.expert_pool_swap            =*/ true,
-        /*.expert_pool_swap_per_step   =*/ 0,
-        /*.expert_pool_layers         =*/ 0,
-        /*.expert_pool_decay          =*/ 96,
-        /*.samplers                    =*/ nullptr,
-        /*.n_samplers                  =*/ 0,
+        /*.expert_pool_swap_per_step   =*/ 40,
+        /*.expert_pool_layers          =*/ 0,
+        /*.expert_pool_decay           =*/ 96,
+        /*.sampler                     =*/ nullptr,
+        /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,
     };
 
@@ -4970,7 +4959,7 @@ llama_context * llama_get_ctx_other(struct llama_context * ctx) {
     return ctx->get_cparams().ctx_other;
 }
 
-extern "C" uint32_t llama_expert_pool_get_stats(struct llama_context * ctx,
+uint32_t llama_expert_pool_get_stats(struct llama_context * ctx,
         struct llama_expert_pool_layer_stats * out, uint32_t max_layers) {
     if (ctx == nullptr || (max_layers > 0 && out == nullptr)) {
         return 0;
@@ -4999,25 +4988,25 @@ uint32_t llama_context::expert_pool_stats_snapshot(llama_expert_pool_layer_stats
 
 void llama_context::expert_pool_finalize() {
     llama_expert_pool_state & st = expert_pool_state;
-    if (st.win.hit + st.win.miss == 0) {
+    if (st.seg.hit + st.seg.miss == 0) {
         return;
     }
     // generation-segment hit rate, printed once at segment end
-    // (win accumulates across swaps)
+    // (the segment counters accumulate across swaps)
     LLAMA_LOG_INFV(LLAMA_LOG_VERBOSITY_INFO, "%s: pool hit rate %.1f%% (%llu/%llu rows, generation segment)\n", __func__,
-            100.0 * st.win.hit / (double) (st.win.hit + st.win.miss),
-            (unsigned long long) st.win.hit,
-            (unsigned long long) (st.win.hit + st.win.miss));
-    st.win = {};
+            100.0 * st.seg.hit / (double) (st.seg.hit + st.seg.miss),
+            (unsigned long long) st.seg.hit,
+            (unsigned long long) (st.seg.hit + st.seg.miss));
+    st.seg = {};
 
-    // the segment-end accounting below reads worker-owned state (win_step,
+    // the segment-end accounting below reads worker-owned state (settled_steps,
     // swap_sum): settle the tail first, then stop the worker (the join is
     // the barrier); it is restarted below.
     const bool had_worker = st.swap_auto && st.cp_worker.joinable();
     if (had_worker) {
         // tail drain: rows queued since the last step boundary have no marker
         // yet - push one so the worker settles them before the join instead
-        // of dropping the segment tail from the window
+        // of dropping the segment tail from the count
         llama_expert_pool_push_marker(st);
         {
             std::lock_guard<std::mutex> lk(st.route_mtx);
@@ -5029,13 +5018,13 @@ void llama_context::expert_pool_finalize() {
     }
 
     // segment-end flush: if the segment ended between two 64-step report
-    // boundaries, print the partial-window average (a short second round
+    // boundaries, print the partial-segment average (a short second round
     // would otherwise never reach the next boundary and stay silent)
     if (st.swap_sum > 0) {
-        const int32_t steps_in = st.win_step % 64;
+        const int32_t steps_in = st.settled_steps % 64;
         if (steps_in > 0) {
             LLAMA_LOG_INFV(LLAMA_LOG_VERBOSITY_INFO,
-                    "%s: marginal swap avg %.1f expert slots/step (partial %d steps, segment end)\n",
+                    "%s: swap avg %.1f expert slots/step (partial %d steps, segment end)\n",
                     __func__, (float) st.swap_sum / (float) steps_in, steps_in);
         }
         st.swap_sum = 0;
@@ -5048,7 +5037,7 @@ void llama_context::expert_pool_finalize() {
     }
 }
 
-extern "C" void llama_expert_pool_finalize(struct llama_context * ctx) {
+void llama_expert_pool_finalize(struct llama_context * ctx) {
     if (ctx == nullptr) {
         return;
     }

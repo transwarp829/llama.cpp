@@ -320,7 +320,7 @@ void llama_expert_pool_random(int32_t n_layer, int32_t n_expert,
 // moe delegate hook: called by the CPU MUL_MAT_ID kernel (ith==0) before row
 // grouping. collects NO rows (nothing is skipped: the -1 skip ids zero the
 // columns natively, both chains merge in the main graph); it feeds the swap
-// window / hit-miss counters and fans the served ids out to the route
+// activation counter and the hit/miss counters, and fans the served ids out to the route
 // observer (llama-ext.h).
 // -----------------------------------------------------------------------------
 
@@ -711,7 +711,7 @@ static int32_t worker_decide_and_copy(llama_expert_pool_state & st) {
             queue.push_back({ilx, in[i].second, slot, in[i].first});
         }
     }
-    // execute the queue in window-count order, descending, until the
+    // execute the queue in count order, descending, until the
     // per-step pair limit: the first pair over the limit stops the batch
     const int32_t limit = st.swap_per_step < 0 ? -1 : st.swap_per_step;
     std::sort(queue.begin(), queue.end(), [](const pair_t & a, const pair_t & b) {
@@ -810,33 +810,32 @@ bool llama_expert_pool_worker_settle(llama_expert_pool_state & st) {
             const llama_expert_pool_state::route_block & rb = rows[j];
             const float inc = 1.0f / (float) (rb.n_tok > 0 ? rb.n_tok : 1);
             for (const int32_t e : rb.ids) {
-                st.win_cnt[rb.ilx * st.n_expert + e] += inc;
+                st.act_cnt[rb.ilx * st.n_expert + e] += inc;
             }
         }
         i = j;
-        // the marginal exchange runs after this step's rows are counted: the
-        // decision window now ends at this step, mirroring the old boundary
-        // semantics (run_swap at the next step boundary with the window
-        // including the settled step).
+        // the refresh runs after this step's rows are counted: the decision
+        // sees the settled step and reaches the graph 1-2 steps later (the
+        // tables are published by the hook at a step boundary).
         const int32_t delta = worker_decide_and_copy(st);
-        st.win_step = t + 1;
+        st.settled_steps = t + 1;
         // per-exchange lines: the pair detail (TRACE) and the per-step count
         // (DEBUG). the INFO level gets a PERIODIC average instead of per-step
         // noise. print_timings-style: every 64 steps, one average line.
         if (delta > 0) {
             LLAMA_LOG_INFV(LLAMA_LOG_VERBOSITY_DEBUG,
-                    "%s: marginal step %d: swapped %d\n",
-                    __func__, st.win_step, delta);
+                    "%s: swap step %d: swapped %d\n",
+                    __func__, st.settled_steps, delta);
         }
-        if (st.win_step > 0 && st.win_step % 64 == 0) {
+        if (st.settled_steps > 0 && st.settled_steps % 64 == 0) {
             LLAMA_LOG_INFV(LLAMA_LOG_VERBOSITY_INFO,
-                    "%s: marginal swap avg %.1f expert slots/step (past 64 steps, step %d)\n",
-                    __func__, (float) st.swap_sum / 64.0f, st.win_step);
+                    "%s: swap avg %.1f expert slots/step (past 64 steps, step %d)\n",
+                    __func__, (float) st.swap_sum / 64.0f, st.settled_steps);
             st.swap_sum = 0;
         }
     }
     // the pool hit rate is printed once at the end of the generation segment
-    // by llama_expert_pool_finalize; the win counters accumulate across the
+    // by llama_expert_pool_finalize; the segment counters accumulate across the
     // segment (no per-swap reset here)
     return true;
 }

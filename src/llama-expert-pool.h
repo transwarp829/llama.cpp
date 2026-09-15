@@ -308,15 +308,15 @@ void llama_expert_pool_random(int32_t n_layer, int32_t n_expert,
                               std::vector<std::vector<int32_t>> & resident);
 
 // moe delegate hook: called by the CPU MUL_MAT_ID kernel (ith==0); feeds the
-// swap window / hit-miss counters and fans the served ids out to the route
+// activation counter and the hit/miss counters, and fans the served ids out to the route
 // observer (llama-ext.h). returns a null skip table: no rows are skipped,
 // column zeroing is done by the -1 ids natively.
 void llama_expert_pool_delegate_begin(
         ggml_tensor * src0, ggml_tensor * src1, ggml_tensor * ids, ggml_tensor * dst,
         const int32_t ** skip_out, void * ud);
 
-// stage 3 swap worker: the worker owns the window counters, the
-// marginal exchange decisions and the weight copies; the hook only pushes
+// swap worker: the worker owns the activation counters, the top-k refresh
+// decisions and the weight copies; the hook only pushes
 // routing rows and publishes ready mirrors at step boundaries.
 void llama_expert_pool_start_worker(llama_expert_pool_state & st);
 // push one step marker: the rows queued before it are now a complete step

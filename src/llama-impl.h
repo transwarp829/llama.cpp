@@ -24,7 +24,7 @@ LLAMA_ATTRIBUTE_FORMAT(2, 3)
 void llama_log_internal        (ggml_log_level level, const char * format, ...);
 void llama_log_callback_default(ggml_log_level level, const char * text, void * user_data);
 
-// verbosity-explicit logging (see llama_log_set_verbosity in llama.h). takes
+// verbosity-explicit logging (see llama_log_set_verbosity in llama-ext.h). takes
 // an explicit common LOG_LEVEL verbosity; bypasses the ggml-level remap when a
 // verbosity callback is registered, else falls back to llama_log_internal.
 LLAMA_ATTRIBUTE_FORMAT(3, 4)

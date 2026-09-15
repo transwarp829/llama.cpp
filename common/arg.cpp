@@ -1693,7 +1693,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_SWA_FULL"));
     add_opt(common_arg(
         {"-nep", "--expert-pool"}, "N",
-        "total number of expert slots across all pooled MoE layers (expert pool stage 2; 0 = disabled)",
+        "total number of expert slots across all pooled MoE layers (0 = disabled)",
         [](common_params & params, int value) {
             params.expert_pool = value;
         }
@@ -1707,7 +1707,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ));
     add_opt(common_arg(
         {"--expert-pool-swap-per-step"}, "N",
-        "max expert pairs swapped in per decode step (0 = default 40, negative = unlimited)",
+        "max expert pairs swapped in per decode step (0 = no swapping, negative = unlimited)",
         [](common_params & params, int value) {
             params.expert_pool_swap_per_step = value;
         }

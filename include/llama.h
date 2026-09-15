@@ -409,8 +409,7 @@ extern "C" {
 
         int32_t expert_pool;        // [EXPERIMENTAL] total expert-pool slots (0 = disabled)
         const char * expert_pool_init; // [EXPERIMENTAL] csv file to seed the pool ("il,e1,e2,..."), null = random
-        bool expert_pool_swap;      // [EXPERIMENTAL] auto-swap the pool resident set
-        int32_t expert_pool_swap_per_step; // [EXPERIMENTAL] max expert pairs swapped in per decode step (0 = default 40, negative = unlimited)
+        int32_t expert_pool_swap_per_step; // [EXPERIMENTAL] max expert pairs swapped in per decode step (0 = no swapping, negative = unlimited)
         int32_t expert_pool_layers; // [EXPERIMENTAL] pool the N deepest MoE layers, deep-to-shallow (0 = all eligible)
         int32_t expert_pool_decay;  // [EXPERIMENTAL] decaying activation counter: half-life in decode steps (default 96)
 
@@ -1572,26 +1571,6 @@ extern "C" {
     LLAMA_API void llama_log_get(ggml_log_callback * log_callback, void ** user_data);
     LLAMA_API void llama_log_set(ggml_log_callback   log_callback, void *  user_data);
 
-    // verbosity-explicit logging: bypasses the ggml-level -> verbosity remap in
-    // the common default callback. `verbosity` uses the same numbering as the
-    // common LOG_LEVEL_* (3 = info, shown at -lv 3). The common layer registers
-    // a verbosity callback that forwards to its own log (LOG_INF-equivalent);
-    // when none is registered, llama_log_verbose falls back to llama_log_internal.
-    typedef enum llama_log_verbosity {
-        LLAMA_LOG_VERBOSITY_ERROR = 1,
-        LLAMA_LOG_VERBOSITY_WARN  = 2,
-        LLAMA_LOG_VERBOSITY_INFO  = 3,
-        LLAMA_LOG_VERBOSITY_TRACE = 4,
-        LLAMA_LOG_VERBOSITY_DEBUG = 5,
-    } llama_log_verbosity;
-
-    // same signature as ggml_log_callback with an explicit verbosity prepended
-    typedef void (*llama_log_verbosity_callback)(int verbosity, enum ggml_log_level level, const char * text, void * user_data);
-
-    // register the verbosity-explicit callback (global, not thread safe, like
-    // llama_log_set)
-    LLAMA_API void llama_log_set_verbosity(llama_log_verbosity_callback callback, void * user_data);
-
     //
     // Performance utils
     //
@@ -1657,25 +1636,6 @@ extern "C" {
             int64_t                   idata_split,
             ggml_opt_epoch_callback   callback_train,
             ggml_opt_epoch_callback   callback_eval);
-
-    // expert-pool delegate statistics. the counters accumulate inside the CPU
-    // MUL_MAT_ID kernel hooks, per pooled layer; this call returns the totals
-    // since the previous call (per-decode-step usage: call once after each
-    // llama_decode), fills up to max_layers entries ordered by pooled-layer
-    // position, and resets them. returns the number of layers written.
-    struct llama_expert_pool_layer_stats {
-        int32_t  layer;          // actual model layer number
-        uint64_t hit_rows;       // rows computed by the GPU pool chain
-        uint64_t miss_rows;      // rows computed by the CPU kernel
-    };
-
-    LLAMA_API uint32_t llama_expert_pool_get_stats(struct llama_context * ctx,
-            struct llama_expert_pool_layer_stats * out, uint32_t max_layers);
-
-    // expert pool: end of a generation segment. prints the accumulated
-    // swap-window hit rate (since the last finalize) at info verbosity and
-    // resets the window counters. call once after the decode loop finishes.
-    LLAMA_API void llama_expert_pool_finalize(struct llama_context * ctx);
 
 #ifdef __cplusplus
 }

@@ -2543,14 +2543,12 @@ common_speculative_init_result::common_speculative_init_result(
     auto cparams = common_context_params_to_llama(params);
 
     // the expert pool is per context: the draft context gets its own pool only
-    // when explicitly configured (-nepd); the main parameters never leak into
-    // it (mirroring how -cmoed/-ngld live in params.speculative.draft.*)
-    cparams.expert_pool               = params.speculative.draft.expert_pool;
-    cparams.expert_pool_swap          = cparams.expert_pool > 0;
-    cparams.expert_pool_swap_per_step = 0;
-    cparams.expert_pool_layers        = 0;
-    cparams.expert_pool_decay         = 0;
-    cparams.expert_pool_init          = nullptr;
+    // when explicitly configured (-nepd); only the slot count is draft-scoped,
+    // the swap knobs keep the pool defaults
+    cparams.expert_pool        = params.speculative.draft.expert_pool;
+    cparams.expert_pool_layers = 0;
+    cparams.expert_pool_decay  = 0;
+    cparams.expert_pool_init   = nullptr;
 
     if (spec_mtp) {
         cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;

@@ -2,6 +2,7 @@
 
 #include "gguf.h"
 #include "llama.h"
+#include "llama-ext.h"
 
 #include <cinttypes>
 #include <climits>
