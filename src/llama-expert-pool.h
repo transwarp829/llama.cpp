@@ -100,6 +100,13 @@ enum llama_expert_pool_kind {
     PK_N,
 };
 
+// per-expert byte stride of a pool or source tensor: the expert dimension is
+// ne[2] for the 4D weight copies, ne[1] for the compact 2D bias copies (the
+// nb[2] of a 2D tensor is the whole tensor size, not the expert stride)
+inline size_t llama_expert_pool_stride(const ggml_tensor * t, int k) {
+    return k < PK_UP_B ? t->nb[2] : t->nb[1];
+}
+
 struct llama_expert_pool_layer {
     ggml_tensor * orig[PK_N] = {}; // model weight tensor (host); null = not present
     ggml_tensor * pool[PK_N] = {}; // pool copy (pool device); null = not pooled

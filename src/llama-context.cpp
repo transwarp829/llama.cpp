@@ -1129,6 +1129,7 @@ void llama_context::expert_pool_fill() {
                 if (tab == nullptr || src == nullptr) {
                     return;
                 }
+                GGML_ASSERT(src->type == GGML_TYPE_F32 && src->ne[0] == n_expert);
                 std::vector<float> vals(n_expert, 0.0f);
                 const float * src_s = (const float *) src->data;
                 for (int32_t e = 0; e < n_expert; ++e) {
@@ -1141,25 +1142,25 @@ void llama_context::expert_pool_fill() {
             fill_scale(m.scale_gate, L.ffn_gate_exps_s);
         }
 
-        auto copy_slots = [&](ggml_tensor * src, ggml_tensor * pw) {
+        auto copy_slots = [&](ggml_tensor * src, ggml_tensor * pw, int k) {
             if (src == nullptr || pw == nullptr) {
                 return;
             }
-            // per-expert size: for quantized types use the stride, not ne0*ne1*type_size
-            const size_t sz = src->nb[2];
+            // per-expert size: the kind decides (weights: ne[2], compact bias: ne[1])
+            const size_t sz = llama_expert_pool_stride(src, k);
             for (int32_t s = 0; s < (int32_t) res.size(); ++s) {
                 const int32_t e = res[s];
                 if (e < 0 || e >= n_expert) {
                     continue;
                 }
                 // compact layout: pool slot s holds expert res[s]
-                ggml_backend_tensor_set(pw, (const char *) src->data + e * src->nb[2],
-                        s * pw->nb[2], sz);
+                ggml_backend_tensor_set(pw, (const char *) src->data + e * llama_expert_pool_stride(src, k),
+                        s * llama_expert_pool_stride(pw, k), sz);
             }
         };
         const llama_expert_pool_layer & l = st.layers[il];
         for (int k = 0; k < PK_N; ++k) {
-            copy_slots(l.orig[k], l.pool[k]);
+            copy_slots(l.orig[k], l.pool[k], k);
         }
     }
     st.fill_done = true;

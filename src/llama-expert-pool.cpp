@@ -174,11 +174,11 @@ static void route_push_row(llama_expert_pool_state & st, int32_t step, int32_t i
     if (gr->op == GGML_OP_GET_ROWS && gr->src[1] != nullptr) {
         raw_t = gr->src[1];
     }
-    const int32_t * raw = raw_t != nullptr ? (const int32_t *) raw_t->data : nullptr;
-    if (raw == nullptr) {
-        // defensive: without the original row the -1 (resident) activations
-        // cannot be attributed. the swap is degraded to miss-side counting
-        // (the pre-9/6 behavior), but never crashes.
+    const bool have_raw = raw_t != nullptr && raw_t->data != nullptr;
+    if (!have_raw) {
+        // defensive: without the original row the resident activations cannot
+        // be attributed, so the counter degrades to miss-side counting; the
+        // swap keeps running and never crashes
         static bool warned = false;
         if (!warned) {
             warned = true;
@@ -196,9 +196,11 @@ static void route_push_row(llama_expert_pool_state & st, int32_t step, int32_t i
             const int32_t e = *((const int32_t *) ((const char *) ids->data + t*ids->nb[1] + j*ids->nb[0]));
             int32_t o = e;
             if (e < 0) {
-                // pool hit: recover the resident expert from the original row
-                // raw is the flat row-major [n_used, n_tok] top-k copy, so (j, t) = j + t*n_used
-                o = raw != nullptr ? raw[j + t*n_used] : -1;
+                // pool hit: recover the resident expert from the original top-k
+                // copy, read through its strides (a view is not row-major)
+                o = have_raw
+                    ? *(const int32_t *) ((const char *) raw_t->data + t*raw_t->nb[1] + j*raw_t->nb[0])
+                    : -1;
             }
             if (o >= 0 && o < st.n_expert) {
                 rb.ids.push_back(o);
@@ -473,18 +475,18 @@ void llama_expert_pool_delegate_begin(
 }
 
 // ---------------------------------------------------------------
-// stage 3: merged mount-table mirror and its publish point
+// merged mount-table mirror and its publish point
 
 namespace {
 
-// copy one expert weight slice into a pool slot (sync, worker's own thread)
-void swap_copy_one_sync(ggml_backend_t be, ggml_tensor * src, ggml_tensor * pw, int32_t e, int32_t slot) {
+// copy one expert slice (kind k) into a pool slot (sync, worker's own thread)
+void swap_copy_one_sync(ggml_backend_t be, ggml_tensor * src, ggml_tensor * pw, int32_t e, int32_t slot, int k) {
     if (src == nullptr || pw == nullptr) {
         return;
     }
-    const size_t sz = src->nb[2];
-    const char * data = (const char *) src->data + e * src->nb[2];
-    const size_t off  = slot * pw->nb[2];
+    const size_t sz = llama_expert_pool_stride(src, k);
+    const char * data = (const char *) src->data + e * llama_expert_pool_stride(src, k);
+    const size_t off  = slot * llama_expert_pool_stride(pw, k);
     // SYNC copy: the worker blocks only its own thread, and the settled step
     // publishes the result into the mirror (the tables change at the next
     // hook publish, so no torn slot is ever readable by a graph).
