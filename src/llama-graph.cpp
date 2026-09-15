@@ -2236,11 +2236,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             ggml_tensor * ids_flat = ggml_reshape_2d(ctx0, ids_cpy, n_expert_used * n_tokens, 1);
             // the pool remap gather (below, GPU segment) and the inverse remap
             // gather (CPU segment) share this one clean contiguous topk copy;
-            // each side produces its own -1 (pool skip / inverse) locally.
-            // (ablation B: ids_flat_priv removed - the alloc-deps added 9/4
-            // keep the mount block's tensors alive until the mount tail, so
-            // the shared-slot reuse the priv protected against is now ruled
-            // out by the scheduler dependency model)
+            // each side produces its own -1 (pool skip / inverse) locally
             ggml_tensor * remap_3d = ggml_reshape_3d(ctx0, mnt.remap, 1, n_expert, 1);
             ids_remap = ggml_get_rows(ctx0, remap_3d, ids_flat);
             ids_remap = ggml_reshape_2d(ctx0, ids_remap, n_expert_used, n_tokens);

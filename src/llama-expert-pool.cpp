@@ -216,11 +216,11 @@ static void route_push_row(llama_expert_pool_state & st, int32_t step, int32_t i
 }
 
 // start the swap worker thread (one per pool). the worker consumes the
-// route rows, owns the window counters and the marginal exchange, performs
+// route rows, owns the activation counters and the top-k refresh, performs
 // the H2D weight copies (sync tensor_set on its own thread - the inference
 // thread and the main graph stream never wait for it), and rebuilds the
 // table mirror for the hook to publish. runaway workers are drained on reset().
-namespace { void swap_copy_one_sync(ggml_backend_t, ggml_tensor *, ggml_tensor *, int32_t, int32_t); }
+namespace { void swap_copy_one_sync(ggml_backend_t, ggml_tensor *, ggml_tensor *, int32_t, int32_t, int); }
 
 void llama_expert_pool_start_worker(llama_expert_pool_state & st) {
     if (st.cp_worker.joinable()) {
@@ -387,18 +387,18 @@ void llama_expert_pool_delegate_begin(
     }
     // batch gate: prefill-scale batches (at/above the MoE offload threshold)
     // run the native path with the pool fully inert - no table publish, no
-    // window rows, no hit/miss counting. same threshold as the graph-side
+    // counter rows, no hit/miss counting. same threshold as the graph-side
     // small-batch gate, never a literal.
     const bool small_batch = ids->ne[1] < llama_expert_pool_offload_min_batch();
-    // NOTE: below the threshold the swap window and the hit/miss counters
+    // NOTE: below the threshold the activation counter and the hit/miss counters
     // must see EVERY token column of the batch: multi-sequence runs (-np N)
     // and speculative verify batches (T = 1 + n_draft) both arrive with
     // ids->ne[1] > 1, and dropping them silently disables the swap under
-    // -np N or speculative decoding (the window is a global mix of all
+    // -np N or speculative decoding (the counter is a global mix of all
     // sequences routed in this decode). only the route observer below keeps
     // the one-token-per-line format.
     // lazy counter allocation is gone from the hook: the swap worker owns
-    // win_cnt and allocates it at its first settlement.
+    // act_cnt and allocates it at its first settlement.
     if (st.stat.empty() && !st.pooled_layers.empty()) {
         st.stat.assign(st.pooled_layers.size(), llama_expert_pool_counts{});
     }
@@ -416,7 +416,7 @@ void llama_expert_pool_delegate_begin(
             // publish the worker's latest ready mirror: the only table write
             // point. if the worker is still copying (no new ready mirror),
             // the tables keep the old mapping - the swap decision takes
-            // effect one or more steps later, which is fine: the window
+            // effect one or more steps later, which is fine: the routing
             // drift it tracks moves far slower than the step rate.
             llama_expert_pool_tab_publish(st);
             // step marker: the rows queued before it are now a complete step
@@ -433,13 +433,13 @@ void llama_expert_pool_delegate_begin(
                 first_of_step ? 1 : 0);
     }
 
-    // --- stage 3 swap window: push the FULL activation row of this layer
+    // --- swap: push the FULL activation row of this layer
     // (resident + non-resident, every token column of the batch) to the swap
-    // worker. one decode step = one window step regardless of the token
+    // worker. one decode step = one counter tick regardless of the token
     // count; pushed once per (step, layer): the hook fires per MUL_MAT_ID
     // node (2-3 per layer) with the same ids, and the worker attributes the
     // row from the -1 positions against the original top-k ids.
-    // both the window row and the hit/miss counting run once per (step,
+    // both the counter row and the hit/miss counting run once per (step,
     // layer) - idle layers (active=false) are skipped by the mount gate
     // above. hit/miss: with direct mount the ids come from remap_inv, so
     // -1 is a GPU pool hit and a non-negative id is a CPU miss
@@ -454,10 +454,10 @@ void llama_expert_pool_delegate_begin(
                     const int32_t e = *((const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]));
                     if (e < 0) {
                         st.stat[ilx].hit ++;
-                        st.win.hit ++;
+                        st.seg.hit ++;
                     } else if (e < st.n_expert) {
                         st.stat[ilx].miss ++;
-                        st.win.miss ++;
+                        st.seg.miss ++;
                     }
                 }
             }
@@ -613,7 +613,7 @@ static int32_t worker_decide_and_copy(llama_expert_pool_state & st) {
         std::vector<std::pair<float, int32_t>> hot; // (cnt, e)
         hot.reserve((size_t) n_expert);
         for (int32_t e = 0; e < n_expert; ++e) {
-            const float c = st.win_cnt[ilx * n_expert + e];
+            const float c = st.act_cnt[ilx * n_expert + e];
             if (c > 0) {
                 hot.emplace_back(c, e);
             }
@@ -743,12 +743,12 @@ bool llama_expert_pool_worker_settle(llama_expert_pool_state & st) {
     }
     // lazy allocation of the counters (the rows are the first thing the worker
     // sees)
-    if (st.win_cnt.empty() && !st.pooled_layers.empty()) {
-        st.win_cnt.assign((size_t) st.pooled_layers.size() * st.n_expert, 0.0f);
+    if (st.act_cnt.empty() && !st.pooled_layers.empty()) {
+        st.act_cnt.assign((size_t) st.pooled_layers.size() * st.n_expert, 0.0f);
     }
     // count the rows by their own step id. a lagging worker may drain rows
     // of several old steps at once (multiple markers queued), so group by
-    // step: each step's slot is evicted exactly once, before its rows land.
+    // step: each step gets one decay tick, then its rows land.
     size_t i = 0;
     while (i < rows.size()) {
         const int32_t t = rows[i].step;
@@ -756,7 +756,7 @@ bool llama_expert_pool_worker_settle(llama_expert_pool_state & st) {
         // per-token normalized increments, so a batch of n token columns
         // contributes one step's worth of evidence instead of n
         const float lam = st.swap_lambda;
-        for (float & c : st.win_cnt) {
+        for (float & c : st.act_cnt) {
             c *= lam;
         }
         size_t j = i;

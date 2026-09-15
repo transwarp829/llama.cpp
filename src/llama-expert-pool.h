@@ -84,7 +84,7 @@ struct llama_expert_pool_mount {
 // layout: slot s holds the s-th resident expert, no zero padding) plus
 // the routing tables that split the two chains of the direct mount.
 // the pool starts from a csv seed (--expert-pool-init, debug) or
-// random; the marginal exchange refreshes the content per step.
+// random; the top-k refresh updates the content per step.
 
 // per-layer expert tensors that the pool copies and the swap moves. the kind
 // order is fixed: it is the array index used everywhere (extend here plus in
@@ -164,7 +164,7 @@ struct llama_expert_pool_state {
                                            // layers (negative = unlimited)
     int32_t n_expert = 0;                  // experts per layer (set at init)
     // hook-side step counter (the hook only pushes routing rows; the swap
-    // worker owns the window below)
+    // worker owns the counters below)
     int32_t hook_step = 0;
     // per-step per-layer gate: the hook fires once per MUL_MAT_ID node
     // (2-3 per layer per step) and the ids are identical across a layer's
@@ -175,7 +175,7 @@ struct llama_expert_pool_state {
     // block per (step, layer): the FULL activation list of the layer -
     // resident entries are recovered from the original top-k ids at the -1
     // positions of the inverse-remapped ids the CPU chain received, so the
-    // window counts BOTH sides (miss + hit) and the eviction side is no
+    // counter counts BOTH sides (miss + hit) and the eviction side is no
     // longer blind. the row carries its own mapping facts (the -1 pattern),
     // so the worker needs no table-version to attribute it.
     struct route_block {
@@ -190,10 +190,10 @@ struct llama_expert_pool_state {
     bool route_stop = false;
 
     // worker-owned swap state (only the swap worker thread touches these):
-    // window counts, history, and the marginal exchange decisions. the hook
+    // the activation counters and the refresh decisions. the hook
     // NEVER reads them - it only pushes route rows and, at each step
     // boundary, publishes the mirror the worker hands over.
-    int32_t win_step = 0;                  // decode steps accounted so far
+    int32_t settled_steps = 0;             // decode steps accounted so far
     // decaying activation counter (--expert-pool-decay H): per settled step
     // every count is multiplied by swap_lambda and the step's rows land with
     // per-token normalized increments (1 / n_tok per activation), so a batch of
@@ -201,16 +201,15 @@ struct llama_expert_pool_state {
     // float by design: the value is a weight, not a count.
     float   swap_lambda   = 0.0f;          // per-step decay factor, lambda = 2^(-1/H)
     int32_t swap_decay_hl = 96;            // decay half-life in decode steps (default 96)
-    std::vector<float> win_cnt;            // [pooled layers * n_expert] FULL counts
+    std::vector<float> act_cnt;            // [pooled layers * n_expert] decayed activation counts
     int32_t swap_sum = 0;                  // exchanges accumulated this period
 
     // segment totals of the inference-side counters; independent of the
     // per-layer stat array (which is cleared by each read)
-    llama_expert_pool_counts win;
+    llama_expert_pool_counts seg;
 
     // swap worker thread: consumes the route rows, attributes
-    // counts, runs the marginal exchange (one pair per pooled layer per step
-    // settled), performs the H2D weight copies synchronously (off the
+    // counts, runs the top-k refresh, performs the H2D weight copies synchronously (off the
     // inference thread, off the main graph stream), and rebuilds the merged
     // table mirror. the tables themselves are only written by the hook at a
     // step boundary (tab_publish) - the worker does not touch the table

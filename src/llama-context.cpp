@@ -609,7 +609,7 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
     }
 }
 
-// expert pool initialization (stage 2, static v1):
+// expert pool initialization:
 // - find the CPU-resident MoE layers (tensors matching a cpu buft override)
 // - allocate one pool weight copy per matrix (same type/layout, expert dim = S)
 // - seed the resident sets from --expert-pool-init csv, or at random
@@ -943,10 +943,11 @@ void llama_context::expert_pool_build() {
         if (!st.direct_mount) {
             break;
         }
-        llama_expert_pool_mount & m = st.mount(il);
-        if (!m.active) {
+        const llama_expert_pool_mount & mreg = st.mount(il);
+        if (!mreg.active) {
             continue;
         }
+        llama_expert_pool_mount m = mreg;
         const llama_layer & L = model.layers[il];
         // merged table: ONE contiguous [n_expert, n_layers] I32 tensor;
         // each layer gets a 1KB view for remap (the inv half lives only in
@@ -1051,7 +1052,7 @@ void llama_context::expert_pool_build() {
         st.reset();
         return;
     }
-    // the backend owning the pool buft: the marginal swap issues its weight
+    // the backend owning the pool buft: the swap worker issues its weight
     // copies async on this backend's main stream (the table commit at the
     // next step boundary is stream-ordered after them); sync fallback if
     // no matching backend is found (CPU pool etc.)
@@ -1114,7 +1115,7 @@ void llama_context::expert_pool_fill() {
         // direct-mount routing tables: write every element (sentinel default =
         // -1), then residents override (same content as expert_pool_init; this
         // second write keeps them correct if fill() ever refreshes the resident set)
-        llama_expert_pool_mount & m = st.mount(il);
+        const llama_expert_pool_mount & m = st.mount(il);
         const bool has_mount = st.direct_mount && m.active &&
                                m.remap != nullptr && m.remap_inv_host != nullptr;
         if (has_mount) {
