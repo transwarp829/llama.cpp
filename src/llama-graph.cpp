@@ -2549,7 +2549,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             // skipped columns zero on the CPU chain too, so 0*any_scale = 0 -
             // exact.
             experts = ggml_mul(ctx0, experts, mount_scale);
-            cb(experts, "ffn_moe_cpu_scaled", il);
+            cb(experts, "ffn_moe_scaled", il);
         }
     }
 
@@ -2568,13 +2568,17 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(shared, "ffn_moe_shared", il);
         ggml_backend_sched_set_tensor_backend(sched, shared,
                                               ggml_backend_sched_get_backend(sched, 0));
+        // scale first, weights second: the plain path scales the down output
+        // inside build_lora_mm_id and applies the router weights afterwards, so
+        // this order keeps the per-column arithmetic bit-equal to the no-pool
+        // path (same node count, only the order changes)
+        if (mount_scale != nullptr) {
+            shared = ggml_mul(ctx0, shared, mount_scale);
+            cb(shared, "ffn_moe_scaled", il);
+        }
         if (!weight_before_ffn) {
             shared = ggml_mul(ctx0, shared, weights);
             cb(shared, "ffn_moe_weighted", il);
-        }
-        if (mount_scale != nullptr) {
-            shared = ggml_mul(ctx0, shared, mount_scale);
-            cb(shared, "ffn_moe_cpu_scaled", il);
         }
         moe_out = shared;
     }
