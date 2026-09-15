@@ -227,9 +227,26 @@ struct llama_expert_pool_state {
     // set_async to tab_all + one sync set to tab_cpu) once per step boundary
     // and records pub=k. the worker only writes slots that are neither ready
     // nor pub, so an async set's source is never overwritten inside the
-    // two-step distance (see the old ping-pong comment below).
+    // two-step distance.
     std::atomic<int32_t> mirror_ready{-1};
     std::atomic<int32_t> mirror_pub{-1};
+
+    // sequence handshake of the two-phase swap: every built mirror carries a
+    // sequence number, and the hook records the sequence it published. a
+    // pending slot fill runs only once the mirror that unmapped its slot has
+    // reached the tables - a slot's content may not change while an expert is
+    // still mapped onto it.
+    int32_t seq_ctr = 0;                    // worker-owned mirror counter
+    int32_t mirror_seq[3] = { -1, -1, -1 }; // worker-owned, per mirror slot
+    std::atomic<int32_t> pub_seq{-1};       // hook-owned: sequence published
+    struct pending_fill {
+        int32_t il   = -1;
+        int32_t e    = -1; // expert the fill writes into the slot
+        int32_t slot = -1;
+        int32_t seq  = 0;  // mirror sequence that unmapped the slot (0 = not built yet)
+        float   cnt  = 0.0f;
+    };
+    std::vector<pending_fill> pend_fill;    // worker-owned fill queue
 
     // built flag: expert_pool_build() has run (sched_reserve() re-enters
     // expert_pool_init after a rebuild, and a reset() would wipe the fresh
@@ -307,15 +324,17 @@ void llama_expert_pool_start_worker(llama_expert_pool_state & st);
 // llama_context::expert_pool_finalize (which has no decode in flight).
 void llama_expert_pool_push_marker(llama_expert_pool_state & st);
 // settle one queued step marker: the rows pushed before it are the previous
-// step's FULL activation counts (resident + non-resident); they are counted
-// into the window, then the marginal exchange runs (one pair per pooled
-// layer per settled step, capped by the per-step swap limit), and the
+// step's FULL activation counts (resident + non-resident); the fills whose
+// unmap reached the tables are executed first, then the rows are counted into
+// the counter, then the top-k refresh runs (all layers' pairs in one global
+// queue, capped by the per-step swap limit, unmapping the victims) and the
 // ready mirror is rebuilt.
 // returns false when no marker is queued.
 bool llama_expert_pool_worker_settle(llama_expert_pool_state & st);
 // rebuild the merged table mirror from resident[] (worker thread only: picks
-// a free slot, writes it, sets mirror_ready). no tensor writes here.
-void llama_expert_pool_tab_build(llama_expert_pool_state & st);
+// a free slot, writes it, sets mirror_ready and returns the new sequence
+// number). no tensor writes here.
+int32_t llama_expert_pool_tab_build(llama_expert_pool_state & st);
 // publish the ready mirror (hook thread only, at a step boundary): one
 // set_async to tab_all and one sync set to tab_cpu. the single place the
 // table tensors are written, so the old stream/CPU ordering is preserved.
