@@ -1888,6 +1888,38 @@ size_t llama_model::n_tensors() const {
     return tensors_by_name.size();
 }
 
+ggml_tensor * llama_model::borrow_tensor(const ggml_tensor * src) const {
+    if (src == nullptr || src->buffer == nullptr || ggml_backend_buffer_is_host(src->buffer)) {
+        return const_cast<ggml_tensor *>(src);
+    }
+    // a device this model can route: the graph references the tensor directly
+    const ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(src->buffer));
+    for (const auto & d : devices) {
+        if (d.dev == dev) {
+            return const_cast<ggml_tensor *>(src);
+        }
+    }
+    // foreign device: keep a host copy (one per tensor, reused across graphs)
+    for (const auto & c : borrowed_copies) {
+        if (c.src == src) {
+            return c.tensor;
+        }
+    }
+    borrowed_copy c;
+    c.src = src;
+    c.ctx.reset(ggml_init({ ggml_nbytes(src) + ggml_tensor_overhead(), nullptr, true }));
+    c.tensor = ggml_new_tensor(c.ctx.get(), src->type, GGML_MAX_DIMS, src->ne);
+    c.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(c.ctx.get(), ggml_backend_cpu_buffer_type()));
+    if (c.buf == nullptr) {
+        GGML_ABORT("%s: failed to allocate host copy of %s\n", __func__, src->name);
+    }
+    ggml_backend_tensor_copy(src, c.tensor);
+    borrowed_copies.push_back(std::move(c));
+    LLAMA_LOG_INFO("%s: %s: borrowed from another model, host copy allocated (%.1f MiB)\n",
+            __func__, src->name, ggml_nbytes(src) / 1048576.0);
+    return borrowed_copies.back().tensor;
+}
+
 size_t llama_model::n_devices() const {
     return devices.size();
 }

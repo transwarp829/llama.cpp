@@ -677,7 +677,7 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         const auto * model_other = llama_get_model(cparams.ctx_other);
 
         GGML_ASSERT(model_other->tok_embd != nullptr && "DFlash decoder requires the target model's token embeddings");
-        tok_embd = model_other->tok_embd;
+        tok_embd = model.borrow_tensor(model_other->tok_embd);
     }
 
     auto inp = std::make_unique<llm_graph_input_embd>(n_embd);
@@ -777,37 +777,13 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         GGML_ASSERT(cparams.ctx_other != nullptr);
         const auto * model_other = llama_get_model(cparams.ctx_other);
         GGML_ASSERT(model_other->output != nullptr && "DFlash decoder requires the target model's output projection");
-        output   = model_other->output;
-        output_s = model_other->output_s;
-        // the target lm_head may live on a backend this draft context cannot
-        // route: -devd none (empty devices) or a main-model device that is
-        // not in the draft's device list. ggml_backend_sched_split_graph
-        // aborts on such a cross-backend pre-allocated reference
-        // (issue #26475). keep a lazy host copy and run the projection from
-        // that instead. with -ngld 0 (devices auto-picked, no -devd) the
-        // sched carries the GPU backend, the reference stays direct.
-        if (output != nullptr && output->buffer != nullptr && !ggml_backend_buffer_is_host(output->buffer)) {
-            const auto * dmodel = static_cast<const llama_model_dflash *>(&model);
-            ggml_backend_dev_t dev_out = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(output->buffer));
-            bool dev_known = false;
-            for (const auto & d : dmodel->devices) {
-                if (d.dev == dev_out) { dev_known = true; break; }
-            }
-            if (!dev_known) {
-                if (dmodel->out_host == nullptr) {
-                    dmodel->out_ctx = ggml_init({ ggml_nbytes(output) + ggml_tensor_overhead(), nullptr, true });
-                    dmodel->out_host = ggml_new_tensor_2d(dmodel->out_ctx, output->type, output->ne[0], output->ne[1]);
-                    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(dmodel->out_ctx, ggml_backend_cpu_buffer_type());
-                    if (buf == nullptr) {
-                        GGML_ABORT("DFlash: failed to allocate host copy of the target lm_head");
-                    }
-                    dmodel->out_buf.reset(buf);
-                    ggml_backend_tensor_copy(output, dmodel->out_host);
-                }
-                output    = dmodel->out_host;
-                output_s  = nullptr; // the target head's scale tensor is not copied; not carried by DFlash/DSpark paths
-            }
-        }
+        // the target's lm_head may live in a buffer this draft context cannot
+        // route (e.g. a CPU-only draft: -devd none); borrow_tensor then hands
+        // out a host copy. the per-expert scale is not copied - the borrow
+        // path does not carry it.
+        const ggml_tensor * output_ref = model_other->output;
+        output   = model.borrow_tensor(output_ref);
+        output_s = output == output_ref ? model_other->output_s : nullptr;
     }
 
     cur = build_lora_mm(output, cur, output_s);
@@ -919,7 +895,7 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llama_model & model, const llm_
         const auto * model_other = llama_get_model(cparams.ctx_other);
 
         GGML_ASSERT(model_other->tok_embd != nullptr && "DSpark decoder requires the target model's token embeddings");
-        tok_embd = model_other->tok_embd;
+        tok_embd = model.borrow_tensor(model_other->tok_embd);
     }
 
     auto inp = std::make_unique<llm_graph_input_embd>(n_embd);
@@ -1015,37 +991,11 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llama_model & model, const llm_
         GGML_ASSERT(cparams.ctx_other != nullptr);
         const auto * model_other = llama_get_model(cparams.ctx_other);
         GGML_ASSERT(model_other->output != nullptr && "DSpark decoder requires the target model's output projection");
-        output   = model_other->output;
-        output_s = model_other->output_s;
-        // the target lm_head may live on a backend this draft context cannot
-        // route: -devd none (empty devices) or a main-model device that is
-        // not in the draft's device list. ggml_backend_sched_split_graph
-        // aborts on such a cross-backend pre-allocated reference
-        // (issue #26475). keep a lazy host copy and run the projection from
-        // that instead. with -ngld 0 (devices auto-picked, no -devd) the
-        // sched carries the GPU backend, the reference stays direct.
-        if (output != nullptr && output->buffer != nullptr && !ggml_backend_buffer_is_host(output->buffer)) {
-            const auto * dmodel = static_cast<const llama_model_dflash *>(&model);
-            ggml_backend_dev_t dev_out = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(output->buffer));
-            bool dev_known = false;
-            for (const auto & d : dmodel->devices) {
-                if (d.dev == dev_out) { dev_known = true; break; }
-            }
-            if (!dev_known) {
-                if (dmodel->out_host == nullptr) {
-                    dmodel->out_ctx = ggml_init({ ggml_nbytes(output) + ggml_tensor_overhead(), nullptr, true });
-                    dmodel->out_host = ggml_new_tensor_2d(dmodel->out_ctx, output->type, output->ne[0], output->ne[1]);
-                    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(dmodel->out_ctx, ggml_backend_cpu_buffer_type());
-                    if (buf == nullptr) {
-                        GGML_ABORT("DSpark: failed to allocate host copy of the target lm_head");
-                    }
-                    dmodel->out_buf.reset(buf);
-                    ggml_backend_tensor_copy(output, dmodel->out_host);
-                }
-                output    = dmodel->out_host;
-                output_s  = nullptr; // the target head's scale tensor is not copied; not carried by DFlash/DSpark paths
-            }
-        }
+        // see the DFlash path above: host copy when this context cannot route
+        // the target's buffer
+        const ggml_tensor * output_ref = model_other->output;
+        output   = model.borrow_tensor(output_ref);
+        output_s = output == output_ref ? model_other->output_s : nullptr;
     }
 
     cur = build_lora_mm(output, cur, output_s);
