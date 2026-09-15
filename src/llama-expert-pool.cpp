@@ -62,7 +62,8 @@ void llama_expert_pool_set_route_observer(llama_expert_pool_route_fn cb, void * 
     }
 }
 
-void llama_expert_pool_state::register_mount(int il, const llama_expert_pool_mount & m) {
+void llama_expert_pool_state::set_mount(int il, const llama_expert_pool_mount & m) {
+    // auto-grow: setup writes mounts for the pooled layers only
     if (il < 0) {
         return;
     }
@@ -70,19 +71,6 @@ void llama_expert_pool_state::register_mount(int il, const llama_expert_pool_mou
         mounts.resize(il + 1);
     }
     mounts[il] = m;
-}
-
-llama_expert_pool_mount & llama_expert_pool_state::mount(int il) {
-    // auto-grow: callers write fields into the returned cell (the setup
-    // registration loops fill the mount in place)
-    static llama_expert_pool_mount none {};
-    if (il < 0) {
-        return none;
-    }
-    if ((size_t) il >= mounts.size()) {
-        mounts.resize(il + 1);
-    }
-    return mounts[il];
 }
 
 const llama_expert_pool_mount & llama_expert_pool_state::mount(int il) const {

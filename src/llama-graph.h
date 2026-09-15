@@ -1166,7 +1166,8 @@ struct llm_graph_context {
              ggml_tensor * selected_experts_in = nullptr,
              ggml_tensor * chain_weights_in = nullptr,
              ggml_tensor * chain_scale_up = nullptr,
-             ggml_tensor * chain_scale_gate = nullptr) const;
+             ggml_tensor * chain_scale_gate = nullptr,
+                     bool   chain_only = false) const;
 
     //
     // inputs

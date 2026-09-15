@@ -128,10 +128,10 @@ struct llama_expert_pool_state {
     std::vector<llama_expert_pool_layer> layers;
 
     // direct-mount registry, indexed by layer id (setup writes; the graph,
-    // the hook and the worker read)
+    // the hook and the worker read). setup passes whole mounts by value - the
+    // vector may reallocate while it grows, so never hold a reference into it
     std::vector<llama_expert_pool_mount> mounts;
-    void register_mount(int il, const llama_expert_pool_mount & m);
-    llama_expert_pool_mount & mount(int il);              // setup (auto-grows)
+    void set_mount(int il, const llama_expert_pool_mount & m);
     const llama_expert_pool_mount & mount(int il) const;  // read-only (no growth)
 
     // resident expert lists, indexed by layer (for diagnostics/serialization)

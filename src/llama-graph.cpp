@@ -2019,20 +2019,16 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * selected_experts_in,
          ggml_tensor * chain_weights_in,
          ggml_tensor * chain_scale_up,
-         ggml_tensor * chain_scale_gate) const {
+         ggml_tensor * chain_scale_gate,
+                 bool   chain_only) const {
     const int64_t n_embd   = cur->ne[0];
     const int64_t n_tokens = cur->ne[1];
     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
 
-    // expert-chain reuse mode (expert-pool mount chain): both the routing
-    // probs and the selected experts are supplied by the caller, so the whole
-    // routing section is skipped and `weights` is fixed to 1. the chain below
-    // (gate/up -> activation -> down) is then built EXACTLY as the main graph
-    // would, so every model variant is inherited automatically.
-    const bool chain_only = probs_in != nullptr && selected_experts_in != nullptr;
-
-    // hoisted out of the routing section: the chain could jump straight to
-    // build_expert_chain, so this must hold the caller's ids before that jump
+    // expert-pool mount mode (chain_only): the caller supplies the selected
+    // experts and the routing weights, so the routing section is skipped and
+    // the chain below (gate/up -> activation -> down) is built exactly as the
+    // main graph would - every model variant is inherited automatically
     ggml_tensor * selected_experts = selected_experts_in;
 
     ggml_tensor * logits = nullptr;
@@ -2047,14 +2043,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     ggml_tensor * mount_scale_up = nullptr;   // factored up scale, pre-activation
     ggml_tensor * mount_scale_gate = nullptr; // factored gate scale, same
 
-    if (chain_only) {
-        // weights are never read: the chain returns the raw down output
-        // before the weighted merge (and an unused placeholder tensor would
-        // have no backend assignment -> galloc "buffer_id -1" abort)
-        goto build_expert_chain;
-    }
-
-    {
+    if (!chain_only) {
         if (probs_in == nullptr) {
         logits = build_lora_mm(gate_inp, cur); // [n_expert, n_tokens]
         if (gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS) {
@@ -2212,8 +2201,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // tensor dims are ambiguous (ids/cur can be 2D or 3D depending on the
     // graph form), so never derive T from a tensor here.
     const bool small_batch = n_tokens < moe_gate_min;
-    if (!chain_only && expert_pool != nullptr && cparams.expert_pool > 0 && il >= 0 &&
-        small_batch) {
+    if (expert_pool != nullptr && cparams.expert_pool > 0 && il >= 0 && small_batch) {
         const llama_expert_pool_mount & mnt = expert_pool->mount(il);
         if (mnt.active) {
             // all tables live on the pool device, so every gather runs on the
@@ -2293,8 +2281,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             }
 
             // keep the 2D cur for the mount block below: the miss chain
-            // reshapes cur to 3d in place (see build_expert_chain), so the
-            // mount block must receive the original shape.
+            // reshapes cur to 3d before its matmuls, so the mount block must
+            // receive the original shape
             cur_mount_in = cur;
             mount_p = &mnt;
 
@@ -2308,7 +2296,6 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     }
 
-build_expert_chain:
     if (chain_weights_in != nullptr) {
         // the mounted chain (chain_only) skips the routing section, so the
         // routing weights were never gathered; take the miss chain's weights
@@ -2543,8 +2530,8 @@ build_expert_chain:
         mount_out = build_moe_ffn(mnt_cur, gate_inp, gate_inp_b,
             mount_p->w_up, mount_p->w_up_b, mount_p->w_gate, mount_p->w_gate_b, mount_p->w_down, mount_p->w_down_b, exp_probs_b,
             n_expert, n_expert_used, type_op, norm_w, w_scale, gating_op, il,
-            mnt_cur, mount_p->w_gate_up, nullptr, nullptr, nullptr, nullptr, ids_remap, weights,
-            mount_scale_up, mount_scale_gate);
+            nullptr, mount_p->w_gate_up, nullptr, nullptr, nullptr, nullptr, ids_remap, weights,
+            mount_scale_up, mount_scale_gate, true);
         cb(mount_out, "ffn_moe_mount", il);
     }
 

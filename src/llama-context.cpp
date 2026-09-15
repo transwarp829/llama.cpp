@@ -907,7 +907,7 @@ void llama_context::expert_pool_build() {
         m.w_up_b    = l.pool[PK_UP_B];
         m.w_gate_b  = l.pool[PK_GATE_B];
         m.w_down_b  = l.pool[PK_DOWN_B];
-        st.register_mount(il, m);
+        st.set_mount(il, m);
     }
     // step-boundary anchors: the first/last shared layer that actually has a
     // mount (a 0-slot layer is not registered and its hook early-returns, so
@@ -990,7 +990,7 @@ void llama_context::expert_pool_build() {
             snprintf(nm, sizeof(nm), "mnt_scale_gate_%d", il);
             ggml_set_name(m.scale_gate, nm);
         }
-        st.register_mount(il, m);
+        st.set_mount(il, m);
     }
     // --- allocate: device tables on the pool device, host tables on the CPU ---
     ggml_backend_buffer_type_t tab_buft = ggml_backend_cpu_buffer_type();
@@ -1022,7 +1022,9 @@ void llama_context::expert_pool_build() {
             // de-register the mounts of this run so the graph builder never
             // sees active=true with null tables
             for (int32_t il : pooled_ils) {
-                st.mount(il).active = false;
+                llama_expert_pool_mount m = st.mount(il);
+                m.active = false;
+                st.set_mount(il, m);
             }
         }
     }
