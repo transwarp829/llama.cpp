@@ -167,7 +167,7 @@ llama_model_eagle3::graph<false>::graph(const llama_model & model, const llm_gra
         const auto * model_other = llama_get_model(cparams.ctx_other);
 
         GGML_ASSERT(model_other->tok_embd != nullptr && "EAGLE3 decoder requires token embeddings (own or from target model)");
-        tok_embd = model_other->tok_embd;
+        tok_embd = model.borrow_tensor(model_other->tok_embd);
     }
 
     auto inp = std::make_unique<llm_graph_input_embd>(n_embd);
@@ -300,7 +300,7 @@ llama_model_eagle3::graph<false>::graph(const llama_model & model, const llm_gra
         const auto * model_other = llama_get_model(cparams.ctx_other);
 
         GGML_ASSERT(model_other->output != nullptr && "EAGLE3 decoder requires an output projection (own or from target model)");
-        output = model_other->output;
+        output = model.borrow_tensor(model_other->output);
     }
     cur = build_lora_mm(output, cur);
 

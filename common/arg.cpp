@@ -1692,6 +1692,42 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_SWA_FULL"));
     add_opt(common_arg(
+        {"-nep", "--expert-pool"}, "N",
+        "total number of expert slots across all pooled MoE layers (0 = disabled)",
+        [](common_params & params, int value) {
+            params.expert_pool = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--expert-pool-init"}, "FILE",
+        "csv file to seed the expert pool (\"il,e1,e2,...\"), default random",
+        [](common_params & params, const std::string & value) {
+            params.expert_pool_init = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--expert-pool-swap-per-step"}, "N",
+        "max expert pairs swapped in per decode step (0 = no swapping, negative = unlimited)",
+        [](common_params & params, int value) {
+            params.expert_pool_swap_per_step = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--expert-pool-decay"}, "H",
+        "activation counter half-life in decode steps for the swap refresh (default 96; lambda = 2^(-1/H) is derived). "
+        "The increment of a step is its activation count divided by its token columns",
+        [](common_params & params, int value) {
+            params.expert_pool_decay = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--pooled-layers"}, "N",
+        "pool the N deepest MoE layers, selected deep-to-shallow (0 = all CPU-resident MoE layers)",
+        [](common_params & params, int value) {
+            params.expert_pool_layers = value;
+        }
+    ));
+    add_opt(common_arg(
         {"-ctxcp", "--ctx-checkpoints", "--swa-checkpoints"}, "N",
         string_format("max number of context checkpoints to create per slot (default: %d)"
             "[(more info)](https://github.com/ggml-org/llama.cpp/pull/15293)", params.n_ctx_checkpoints),
@@ -4233,6 +4269,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_N_GPU_LAYERS_DRAFT"));
+    add_opt(common_arg(
+        {"--expert-pool-draft", "-nepd"}, "N",
+        "number of expert slots cached in VRAM for the draft context's offloaded MoE layers (0 = disabled)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.speculative.draft.expert_pool = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
         {"--spec-draft-model", "-md", "--model-draft"}, "FNAME",
         "draft model for speculative decoding (default: unused)",

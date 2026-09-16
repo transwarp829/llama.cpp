@@ -706,6 +706,22 @@ struct llama_model {
     // list of devices used in this model
     std::vector<llama_device> devices;
 
+    // borrowed tensors from another model: the dflash/eagle3 graphs fall back to
+    // the target model's lm_head / token embeddings when the draft has none of
+    // its own. a context that cannot route the borrowed buffer (e.g. a CPU-only
+    // draft context) gets a lazily created host copy instead, owned here.
+    struct borrowed_copy {
+        const ggml_tensor * src = nullptr;
+        ggml_tensor * tensor = nullptr;
+        std::unique_ptr<ggml_context, decltype(&ggml_free)> ctx{nullptr, &ggml_free};
+        std::unique_ptr<ggml_backend_buffer, decltype(&ggml_backend_buffer_free)> buf{nullptr, &ggml_backend_buffer_free};
+    };
+    mutable std::vector<borrowed_copy> borrowed_copies;
+
+    // returns src unchanged when it is host-resident or lives on one of this
+    // model's devices, else a host copy of it (built once per tensor)
+    ggml_tensor * borrow_tensor(const ggml_tensor * src) const;
+
     // for quantize-stats only
     std::vector<std::pair<std::string, struct ggml_tensor *>> tensors_by_name;
 
@@ -771,9 +787,9 @@ struct llama_model {
     virtual void load_arch_tensors(llama_model_loader & ml) = 0;
     virtual std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const = 0;
 
-protected:
     llama_model_params params;
 
+protected:
     struct impl;
     std::unique_ptr<impl> pimpl;
 };

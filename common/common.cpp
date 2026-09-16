@@ -8,6 +8,7 @@
 #include "llama.h"
 #include "sampling.h"
 #include "speculative.h"
+#include "../src/llama-ext.h" // fork-private ext API (verbosity-explicit logging)
 #include "unicode.h"
 
 #include <algorithm>
@@ -392,6 +393,14 @@ void common_init() {
     common_log_set_timestamps(common_log_main(), true);
 
     llama_log_set(common_log_default_callback, NULL);
+
+    // verbosity-explicit path (expert-pool swap summaries): bypasses the ggml
+    // level -> verbosity remap in common_log_default_callback, mirrors LOG_INF
+    llama_log_set_verbosity([](int verbosity, enum ggml_log_level level, const char * text, void * /*user_data*/) {
+        if (verbosity <= common_log_get_verbosity_thold()) {
+            common_log_add(common_log_main(), level, "%s", text);
+        }
+    }, NULL);
 }
 
 void common_params_print_info(const common_params & params, bool print_devices) {
@@ -1747,6 +1756,11 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.op_offload        = !params.no_op_offload;
     cparams.swa_full          = params.swa_full;
     cparams.kv_unified        = params.kv_unified;
+    cparams.expert_pool       = params.expert_pool;
+    cparams.expert_pool_init  = params.expert_pool_init.empty() ? nullptr : params.expert_pool_init.c_str();
+    cparams.expert_pool_swap_per_step = params.expert_pool_swap_per_step;
+    cparams.expert_pool_layers = params.expert_pool_layers;
+    cparams.expert_pool_decay  = params.expert_pool_decay;
 
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;

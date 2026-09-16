@@ -54,6 +54,12 @@ struct llama_cparams {
     bool kv_unified;
     bool pipeline_parallel;
 
+    int32_t expert_pool;       // total expert-pool slots (0 = disabled)
+    const char * expert_pool_init; // csv file to seed the pool, null = random
+    int32_t expert_pool_swap_per_step; // max expert pairs swapped in per decode step (0 = no swapping, negative = unlimited)
+    int32_t expert_pool_layers; // pool the N deepest MoE layers, deep-to-shallow (0 = all eligible)
+    int32_t expert_pool_decay;  // decaying activation counter: half-life in decode steps (default 96)
+
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
 
     enum llama_context_type ctx_type;

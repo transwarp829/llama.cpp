@@ -3,6 +3,7 @@
 #include "llama.h"
 #include "llama-ext.h"
 #include "llama-cparams.h"
+#include "llama-expert-pool.h"
 #include "llama-graph.h"
 #include "llama-adapter.h"
 #include "llama-impl.h"
@@ -55,6 +56,10 @@ struct llama_context {
     //   - changing attention type
     //   - etc.
     void sched_reserve();
+    void expert_pool_init();
+    void expert_pool_build();
+    void expert_pool_fill();
+    void expert_pool_release();            // free the ctx-owned pool resources + stop the worker
 
     void synchronize();
 
@@ -242,6 +247,12 @@ private:
 public:
     uint32_t graph_max_nodes(uint32_t n_tokens) const;
 
+    // snapshot-and-reset expert-pool delegate statistics (public API support)
+    uint32_t expert_pool_stats_snapshot(llama_expert_pool_layer_stats * out, uint32_t max_layers);
+
+    // print-and-reset the generation-segment swap-window hit rate (public API support)
+    void expert_pool_finalize();
+
     // can reuse the llm_graph_result instance of the context (for example to update a memory module)
     llm_graph_result * get_gf_res_reserve() const;
 
@@ -367,6 +378,20 @@ private:
     std::vector<ggml_backend_t>             backend_ptrs;
     std::vector<ggml_backend_buffer_type_t> backend_buft;
     std::vector<size_t>                     backend_buf_exp_size; // expected buffer sizes
+
+    // expert pool (per context): pool weights/tables/worker/stats all belong
+    // to this context; the pooled layer set is derived from the model at init
+    llama_expert_pool_state expert_pool_state;
+
+    // pooled weight context/buffer + mount-table ctx
+    // (kept alive as long as the context; pointers also stored in expert_pool_state)
+    ggml_context * pool_ctx  = nullptr;
+    ggml_context * pool_tab_ctx = nullptr; // direct-mount remap tables (pool device)
+    ggml_context * pool_tab_cpu_ctx = nullptr; // direct-mount remap_inv table (CPU device)
+    ggml_backend_buffer_ptr pool_buf;
+    ggml_backend_buffer_ptr mount_tab_buf; // device buffer holding the remap tables
+    ggml_backend_buffer_ptr mount_tab_cpu_buf; // CPU buffer holding the remap_inv mirror
+
 
     // Separate arenas give batches with and without outputs distinct CUDA graph cache keys.
     std::array<llm_graph_result_ptr, 2> gf_res_prev;

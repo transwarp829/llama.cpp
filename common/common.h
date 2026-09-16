@@ -338,6 +338,8 @@ struct common_params_speculative_draft {
 
     int32_t n_gpu_layers = -1; // number of layers to store in VRAM for the draft model (-1 - use default)
 
+    int32_t expert_pool = 0; // expert slots cached in VRAM for the draft context's offloaded MoE layers (0 = disabled)
+
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
 
@@ -571,6 +573,12 @@ struct common_params {
     bool ctx_shift         = false; // context shift on infinite text generation
     bool swa_full          = false; // use full-size SWA cache (https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055)
     bool kv_unified        = false; // enable unified KV cache
+
+    int32_t expert_pool        = 0;      // total expert-pool slots (0 = disabled)
+    std::string expert_pool_init;         // csv file to seed the pool (empty = random)
+    int32_t expert_pool_swap_per_step = 40; // max expert pairs swapped in per decode step (0 = no swapping, negative = unlimited)
+    int32_t expert_pool_layers = 0;       // pool the N deepest MoE layers, deep-to-shallow (0 = all eligible)
+    int32_t expert_pool_decay  = 96;      // decaying activation counter: half-life in decode steps
 
     bool input_prefix_bos  = false; // prefix BOS to user inputs, preceding input_prefix
     bool verbose_prompt    = false; // print prompt tokens before generation

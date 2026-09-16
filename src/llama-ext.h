@@ -132,3 +132,68 @@ LLAMA_API uint32_t        llama_model_target_layer_ids_n(const struct llama_mode
 // if out is nullptr, returns the number of tokens without writing to out
 // caller must allocate enough memory for out before calling
 LLAMA_API uint32_t llama_model_get_tok_embd(const struct llama_model * model, float * out);
+
+//
+// expert pool: routing observer (fork-private experimental API)
+//
+
+// The CPU MoE delegate fans out the expert ids it serves, one call per kernel
+// invocation (decode-scale batches only; prefill runs the copied GPU path).
+// Used by tools (e.g. step-profiler) to capture the routing stream - the
+// library no longer writes routing files itself. Registering also installs
+// the delegate hook, so pool-free runs can be captured. Pass cb = nullptr
+// to unregister.
+//   il            - layer number the kernel belongs to
+//   ids           - ids the kernel received (direct mount: resident = -1)
+//   n_ids         - ids per token (ids->ne[0])
+//   first_of_step - 1 when this call begins a new decode step
+typedef void (*llama_expert_pool_route_fn)(
+        void * user_data, int32_t il, const int32_t * ids, int32_t n_ids, int32_t first_of_step);
+
+LLAMA_API void llama_expert_pool_set_route_observer(llama_expert_pool_route_fn cb, void * user_data);
+
+//
+// expert pool: delegate statistics and segment accounting (fork-private)
+//
+
+// per pooled-layer counters fed by the CPU MUL_MAT_ID hook. the call returns
+// the totals since the previous call (per decode step: call once after each
+// llama_decode), fills up to max_layers entries in pooled-layer order and
+// resets them. returns the number of layers written.
+struct llama_expert_pool_layer_stats {
+    int32_t  layer;          // actual model layer number
+    uint64_t hit_rows;       // rows computed by the GPU pool chain
+    uint64_t miss_rows;      // rows computed by the CPU kernel
+};
+
+LLAMA_API uint32_t llama_expert_pool_get_stats(struct llama_context * ctx,
+        struct llama_expert_pool_layer_stats * out, uint32_t max_layers);
+
+// end of a generation segment: print the accumulated hit rate (since the last
+// finalize) at info verbosity and reset the segment counters. call once after
+// the decode loop finishes.
+LLAMA_API void llama_expert_pool_finalize(struct llama_context * ctx);
+
+//
+// verbosity-explicit logging (fork-private)
+//
+
+// bypasses the ggml-level -> verbosity remap in the common default callback.
+// `verbosity` uses the same numbering as the common LOG_LEVEL_* (3 = info,
+// shown at -lv 3). the common layer registers a verbosity callback that
+// forwards to its own log; with no callback registered, llama_log_verbose
+// falls back to llama_log_internal.
+typedef enum llama_log_verbosity {
+    LLAMA_LOG_VERBOSITY_ERROR = 1,
+    LLAMA_LOG_VERBOSITY_WARN  = 2,
+    LLAMA_LOG_VERBOSITY_INFO  = 3,
+    LLAMA_LOG_VERBOSITY_TRACE = 4,
+    LLAMA_LOG_VERBOSITY_DEBUG = 5,
+} llama_log_verbosity;
+
+// same signature as ggml_log_callback with an explicit verbosity prepended
+typedef void (*llama_log_verbosity_callback)(int verbosity, enum ggml_log_level level, const char * text, void * user_data);
+
+// register the verbosity-explicit callback (global, not thread safe, like
+// llama_log_set)
+LLAMA_API void llama_log_set_verbosity(llama_log_verbosity_callback callback, void * user_data);
