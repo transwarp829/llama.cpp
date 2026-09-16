@@ -1,0 +1,587 @@
+#include "arg.h"
+#include "chat.h"
+#include "common.h"
+#include "log.h"
+#include "llama.h"
+#include "sampling.h"
+
+#include <algorithm>
+#include <array>
+#include <clocale>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <fstream>
+#include <string>
+#include <vector>
+
+#include "../../src/llama-ext.h" // fork-private ext API (expert-pool route observer)
+
+// --- expert-pool routing capture (GGML_EXPPOOL_ROUTING_LOG) -----------------
+// the library no longer writes routing files; the route observer fans out the
+// ids served by the CPU MoE delegate (decode rows) and this tool owns the CSV.
+struct route_capture {
+    FILE *   fp = nullptr;
+    uint64_t step = 0;
+    int32_t  last_il = -1;
+};
+
+static route_capture g_route;
+
+static void route_cb(void * ud, int32_t il, const int32_t * ids, int32_t n_ids, int32_t first_of_step) {
+    route_capture & c = *(route_capture *) ud;
+    if (first_of_step) {
+        c.step += 1;
+        c.last_il = -1;
+    }
+    if (c.last_il == il) {
+        return; // one call per node (up/gate/down) for the same layer
+    }
+    c.last_il = il;
+    fprintf(c.fp, "%llu,%d", (unsigned long long) c.step, il);
+    for (int32_t i = 0; i < n_ids; ++i) {
+        fprintf(c.fp, ",%d", ids[i]);
+    }
+    fputc('\n', c.fp);
+}
+
+// llama-step-profiler
+//
+// measures per-step (per-token) decode timing using the scheduler eval callback
+// writes:
+//   <prefix>.timing.csv   raw view, one row per (step, layer): the 20-column
+//                         execution-order layout, plus a per-step summary row
+//                         (layer = -1) carrying wall/gap/cb and totals
+//   <prefix>.summary.csv  aggregate view: run totals row (step = -1, layer = -1)
+//                         and per-layer means across decode tokens
+//   <prefix>.routing.csv  per step x per layer: activated expert ids
+//   <prefix>.delegate.csv per step: delegate submits/hit_rows totals
+//
+// prefix: env STEP_PROFILE_OUT, default "step-profile"
+//
+// usage: llama-step-profiler -m model.gguf -p "prompt" -n 100 [-t N] [-ngl N] [--cpu-moe]
+//
+// note: by default the profiler SYNCHRONIZES after each llama_decode, so
+// wall_ms is the real per-step decode time (llama_decode is async - without
+// the sync the timestamp measures only the API submission cost). the old
+// async-only timing is kept behind STEP_PROFILE_NO_SYNC=1 (diagnostics:
+// compare submission vs execution).
+// note: the callback forces the per-node compute path, so timings are contaminated
+// (CUDA graphs disabled). routing data is timing-independent and still valid.
+
+enum step_cat {
+    CAT_ATTN,
+    CAT_EXPERT,
+    CAT_ROUTER,
+    CAT_SHARED,
+    CAT_NORM,
+    CAT_OTHER,
+    CAT_COUNT,
+};
+
+// column order matches one decode step's execution order (timing.csv + summary.csv)
+static const char * const csv_header =
+    "step,layer,wall_ms,attn_ms,router_ms,moe_ms,shared_ms,norm_ms,other_ms,"
+    "hit_rows,miss_rows,gap_ms,cb_ms\n";
+
+struct step_record {
+    double wall_ms = 0.0;       // total time of the llama_decode call
+    double sum_nodes_ms = 0.0;  // sum of all node durations
+    double cb_ms = 0.0;         // time spent inside the callback itself
+    double cat_ms[CAT_COUNT] = {0.0};
+    int64_t n_nodes = 0;
+    int64_t n_mm_id = 0;
+    // per-layer per-category node time: layer_cat[cat][layer]
+    std::array<std::vector<double>, CAT_COUNT> layer_cat;
+};
+
+struct profiler_data {
+    int64_t n_layers = 0;
+    std::vector<step_record> steps;
+    std::vector<std::vector<llama_expert_pool_layer_stats>> step_delegate; // per step, per pooled layer
+    int64_t t_node_start_us = 0;
+    std::ofstream * f_routing = nullptr;  // routing trace CSV (step,layer,expert_ids)
+    int last_routing_step = -1;           // dedupe: last captured (step, layer)
+    int last_routing_layer = -1;
+};
+
+// layer index from node name like "ffn_moe_up-3", -1 if none
+static int node_layer(const char * name) {
+    const char * p = strrchr(name, '-');
+    if (p == nullptr || p[1] == '\0') {
+        return -1;
+    }
+    for (const char * q = p + 1; *q != '\0'; ++q) {
+        if (*q < '0' || *q > '9') {
+            return -1;
+        }
+    }
+    return atoi(p + 1);
+}
+
+// classify a node into a timing bucket
+// - MUL_MAT_ID is always the routed expert matmul
+// - attention ops are named "attn_*"
+// - other MoE ops (router, top-k, weights) are named "ffn_moe_*"
+// - shared/dense FFN ops are named "ffn_*" (not "ffn_moe_*")
+static int classify(const ggml_tensor * t) {
+    const char * name = t->name;
+    if (t->op == GGML_OP_MUL_MAT_ID) {
+        return CAT_EXPERT;
+    }
+    if (strstr(name, "attn") != nullptr) {
+        return CAT_ATTN;
+    }
+    if (strncmp(name, "ffn_moe", 7) == 0) {
+        return CAT_ROUTER;
+    }
+    if (strstr(name, "norm") != nullptr) {
+        return CAT_NORM;
+    }
+    if (strncmp(name, "ffn_", 4) == 0) {
+        return CAT_SHARED;
+    }
+    return CAT_OTHER;
+}
+
+static bool cb_eval(ggml_tensor * t, bool ask, void * user_data) {
+    auto * data = (profiler_data *) user_data;
+    const int64_t t0 = ggml_time_us();
+
+    if (ask) {
+        data->t_node_start_us = t0;
+    } else {
+        step_record & s = data->steps.back();
+        const double dur_ms = (t0 - data->t_node_start_us) / 1000.0;
+
+        s.sum_nodes_ms += dur_ms;
+        s.n_nodes++;
+
+        const int cat = classify(t);
+        s.cat_ms[cat] += dur_ms;
+
+        const int layer = node_layer(t->name);
+        if (layer >= 0 && layer < (int) data->n_layers) {
+            if (s.layer_cat[cat].size() < (size_t) data->n_layers) {
+                s.layer_cat[cat].resize(data->n_layers, 0.0);
+            }
+            s.layer_cat[cat][layer] += dur_ms;
+            if (cat == CAT_EXPERT) {
+                s.n_mm_id++;
+            }
+        }
+
+        // capture activated expert ids from MUL_MAT_ID inputs (once per step/layer)
+        // ggml_mul_mat_id(ctx, as, b, ids) -> src[2] = selected expert indices
+        //
+        // never read a ggml view linearly: the graph feeds ggml_argsort_top_k(),
+        // which is a strided VIEW over the argsort buffer (nb[1] = n_expert*4).
+        // a flat get() of ne[0]*ne[1] elements then reads the buffer head - one
+        // n_expert-long argsort row per token instead of the ids. that went
+        // unnoticed for as long as the capture existed because single-token rows
+        // (ne[1] == 1) are contiguous and read correctly by accident, so only
+        // prefill rows were corrupted (they came out as exact permutations of
+        // 0..n_expert, i.e. "all experts").
+        if (t->op == GGML_OP_MUL_MAT_ID && data->f_routing != nullptr && t->src[2] != nullptr) {
+            const int cur_step = (int) data->steps.size() - 1;
+            if (layer >= 0 && layer < (int) data->n_layers &&
+                (cur_step != data->last_routing_step || layer != data->last_routing_layer)) {
+                const ggml_tensor * ids = t->src[2];
+                GGML_ASSERT(ids->type == GGML_TYPE_I32); // routing ids are always I32
+                const int64_t k  = ids->ne[0];           // ids per token
+                const int64_t nt = ids->ne[1];           // token columns
+                const int64_t n  = k * nt;               // [n_expert_used, n_tokens]
+                std::vector<int32_t> buf(n > 0 ? n : 1, 0);
+                if (ggml_is_contiguous(ids)) {
+                    ggml_backend_tensor_get(ids, buf.data(), 0, n * sizeof(int32_t));
+                } else if (ids->src[0] != nullptr && ggml_is_contiguous(ids->src[0]) &&
+                           ids->nb[0] == ids->src[0]->nb[0] && ids->nb[1] == ids->src[0]->nb[1]) {
+                    // read the contiguous source once, then pick each token's column
+                    const ggml_tensor * src = ids->src[0];
+                    const int64_t ne = src->ne[0];
+                    std::vector<int32_t> all((size_t) ne * nt);
+                    ggml_backend_tensor_get(src, all.data(), 0, (size_t) ne * nt * sizeof(int32_t));
+                    for (int64_t j = 0; j < nt; ++j) {
+                        for (int64_t i = 0; i < k; ++i) {
+                            buf[i + j*k] = all[i + j*ne];
+                        }
+                    }
+                } else {
+                    GGML_ASSERT(ids->nb[0] == sizeof(int32_t));
+                    for (int64_t j = 0; j < nt; ++j) {
+                        ggml_backend_tensor_get(ids, buf.data() + j*k, j * ids->nb[1], k * sizeof(int32_t));
+                    }
+                }
+                auto & fout = *data->f_routing;
+                fout << cur_step << "," << layer;
+                for (int64_t i = 0; i < n; ++i) {
+                    fout << "," << buf[i];
+                }
+                fout << "\n";
+                fout.flush();
+                data->last_routing_step = cur_step;
+                data->last_routing_layer = layer;
+            }
+        }
+    }
+
+    data->steps.back().cb_ms += (ggml_time_us() - t0) / 1000.0;
+    return true;
+}
+
+// open <prefix><suffix> for writing and emit the header row; false on failure
+static bool open_csv(std::ofstream & f, const std::string & path, const char * header) {
+    f.open(path);
+    if (!f) {
+        LOG_ERR("failed to open %s\n", path.c_str());
+        return false;
+    }
+    f << header;
+    return true;
+}
+
+// six category columns in csv order
+static void write_cat_cols(std::ofstream & f, const double cats[CAT_COUNT]) {
+    f << cats[CAT_ATTN] << "," << cats[CAT_ROUTER] << "," << cats[CAT_EXPERT] << ","
+      << cats[CAT_SHARED] << "," << cats[CAT_NORM] << "," << cats[CAT_OTHER];
+}
+
+// delegate hit/miss columns (zeros when no pool stats)
+static void write_hit_cols(std::ofstream & f, double hit, double miss) {
+    f << hit << "," << miss;
+}
+
+// per-layer category value, 0 when the layer never ran a node of that bucket
+static double layer_cat_at(const step_record & s, int cat, int layer) {
+    const auto & v = s.layer_cat[cat];
+    return layer < (int) v.size() ? v[layer] : 0.0;
+}
+
+static void write_timing_row(std::ofstream & fout, int step, int layer, const step_record & s,
+                             const llama_expert_pool_layer_stats * dl) {
+    // layer < 0 = step summary row (wall/gap/cb + totals), else per-layer row
+    const double gap_ms = std::max(0.0, s.wall_ms - s.sum_nodes_ms - s.cb_ms);
+    const double hit  = dl != nullptr ? (double) dl->hit_rows  : 0.0;
+    const double miss = dl != nullptr ? (double) dl->miss_rows : 0.0;
+    fout << step << "," << layer << ",";
+    if (layer < 0) {
+        fout << s.wall_ms << ",";
+        write_cat_cols(fout, s.cat_ms);
+        fout << ",";
+        write_hit_cols(fout, hit, miss);
+        fout << "," << gap_ms << "," << s.cb_ms << "\n";
+    } else {
+        double cats[CAT_COUNT];
+        for (int c = 0; c < CAT_COUNT; ++c) {
+            cats[c] = layer_cat_at(s, c, layer);
+        }
+        fout << ",";
+        write_cat_cols(fout, cats);
+        fout << ",";
+        write_hit_cols(fout, hit, miss);
+        fout << ",,\n"; // wall/gap/cb are step-level only
+    }
+    fout.flush();
+}
+
+// find the delegate stats for a model layer within this step's vector
+static const llama_expert_pool_layer_stats * find_layer_stats(const std::vector<llama_expert_pool_layer_stats> & v, int layer) {
+    for (const auto & d : v) {
+        if (d.layer == layer) {
+            return &d;
+        }
+    }
+    return nullptr;
+}
+
+static void print_summary(const profiler_data & data) {
+    // aggregate over decode steps (skip step 0 = prompt)
+    if (data.steps.size() < 2) {
+        return;
+    }
+    double wall = 0.0, gap = 0.0, attn = 0.0, expert = 0.0, cb = 0.0;
+    const size_t n = data.steps.size() - 1;
+    for (size_t i = 1; i < data.steps.size(); ++i) {
+        const step_record & s = data.steps[i];
+        wall   += s.wall_ms;
+        gap    += std::max(0.0, s.wall_ms - s.sum_nodes_ms - s.cb_ms);
+        attn   += s.cat_ms[CAT_ATTN];
+        expert += s.cat_ms[CAT_EXPERT];
+        cb     += s.cb_ms;
+    }
+    LOG_INF("profiler: decode steps: %zu\n", n);
+    LOG_INF("profiler: mean wall   = %.3f ms/step (%.2f t/s)\n", wall / n, 1000.0 * n / wall);
+    LOG_INF("profiler: mean attn   = %.3f ms/step\n", attn / n);
+    LOG_INF("profiler: mean expert = %.3f ms/step\n", expert / n);
+    LOG_INF("profiler: mean gap    = %.3f ms/step (sched/sync overhead)\n", gap / n);
+    LOG_INF("profiler: mean cb     = %.3f ms/step (instrumentation overhead)\n", cb / n);
+}
+
+int main(int argc, char ** argv) {
+    std::setlocale(LC_NUMERIC, "C");
+
+    common_params params;
+    common_init();
+
+    if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_COMMON)) {
+        return 1;
+    }
+
+    llama_backend_init();
+    llama_numa_init(params.numa);
+
+    profiler_data data;
+
+    const char * no_cb = getenv("STEP_PROFILE_NO_CB");
+    if (no_cb == nullptr) {
+        params.cb_eval = cb_eval;
+        params.cb_eval_user_data = &data;
+        LOG_INF("%s: cb profiling enabled (set STEP_PROFILE_NO_CB=1 for wall-only timing)\n", __func__);
+    } else {
+        LOG_INF("%s: cb profiling disabled (wall-only)\n", __func__);
+    }
+    params.warmup = false;
+
+    auto llama_init = common_init_from_params(params);
+
+    auto * model = llama_init->model();
+    auto * ctx   = llama_init->context();
+
+    if (model == nullptr || ctx == nullptr) {
+        LOG_ERR("%s: failed to init\n", __func__);
+        return 1;
+    }
+
+    data.n_layers = llama_model_n_layer(model);
+
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    const bool add_bos = llama_vocab_get_add_bos(vocab);
+    std::string prompt = params.prompt;
+    // -f/--file: read the prompt file (common's prompt_file field is parsed but
+    // not consumed by any common function in this tree; read it here). only
+    // used when -p/--prompt was not given on the command line.
+    if (prompt.empty() && !params.prompt_file.empty()) {
+        std::ifstream fin(params.prompt_file);
+        if (!fin) {
+            LOG_ERR("%s: failed to open prompt file %s\n", __func__, params.prompt_file.c_str());
+            return 1;
+        }
+        prompt.assign((std::istreambuf_iterator<char>(fin)), std::istreambuf_iterator<char>());
+        LOG_INF("%s: prompt file loaded (%zu chars)\n", __func__, prompt.size());
+    }
+    // chat-template mode (like llama-cli -cnv): STEP_PROFILE_CHAT_FILE
+    // = text file used as the user message; the model's own chat template
+    // (from GGUF metadata) is applied before tokenizing.
+    const char * chat_file = getenv("STEP_PROFILE_CHAT_FILE");
+    if (chat_file != nullptr && chat_file[0] != '\0') {
+        std::ifstream fin(chat_file);
+        if (!fin) {
+            LOG_ERR("%s: failed to open chat file %s\n", __func__, chat_file);
+            return 1;
+        }
+        std::string content((std::istreambuf_iterator<char>(fin)), std::istreambuf_iterator<char>());
+        common_chat_templates_ptr tmpls = common_chat_templates_init(model, "");
+        common_chat_templates_inputs inputs;
+        inputs.messages = {{"user", content}};
+        common_chat_params cp = common_chat_templates_apply(tmpls.get(), inputs);
+        prompt = cp.prompt;
+        LOG_INF("%s: chat template applied (%d chars), prompt %zu chars\n", __func__, (int) content.size(), prompt.size());
+    }
+    std::vector<llama_token> tokens = common_tokenize(ctx, prompt, false, true);
+    if (tokens.empty()) {
+        LOG_ERR("%s: there are not input tokens to process - (try to provide a prompt with '-p')\n", __func__);
+        return 1;
+    }
+    LOG_INF("%s: prompt tokens = %d (n_batch = %d)\n", __func__, (int) tokens.size(), (int) params.n_batch);
+
+    const int n_predict = params.n_predict >= 0 ? params.n_predict : 100;
+
+    const char * prefix = getenv("STEP_PROFILE_OUT");
+    if (prefix == nullptr || prefix[0] == '\0') {
+        prefix = "step-profile";
+    }
+
+    std::ofstream f_timing, f_summary, f_deleg, f_rout;
+    if (!open_csv(f_timing, std::string(prefix) + ".timing.csv", csv_header) ||
+        !open_csv(f_summary, std::string(prefix) + ".summary.csv", csv_header) ||
+        !open_csv(f_deleg, std::string(prefix) + ".delegate.csv", "step,hit_rows,miss_rows\n") ||
+        !open_csv(f_rout, std::string(prefix) + ".routing.csv", "step,layer,expert_ids\n")) {
+        return 1;
+    }
+    f_rout.flush();
+    data.f_routing = &f_rout;
+
+    auto * smpl = common_sampler_init(model, params.sampling);
+
+    // routing capture (the library-side writer is retired; see llama-ext.h):
+    // capture the ids the CPU MoE delegate serves into the env-named CSV,
+    // one line per (step, layer): "step,layer,expert_ids"
+    const char * route_path = getenv("GGML_EXPPOOL_ROUTING_LOG");
+    if (route_path != nullptr && route_path[0] != '\0') {
+        g_route.fp = fopen(route_path, "w");
+        if (g_route.fp != nullptr) {
+            fprintf(g_route.fp, "step,layer,expert_ids\n");
+            llama_expert_pool_set_route_observer(route_cb, &g_route);
+        }
+    }
+
+    // sync-after-decode (default on): llama_decode is async; the wall clock is
+    // read after a device sync so it measures real execution, not submission.
+    const bool no_sync = getenv("STEP_PROFILE_NO_SYNC") != nullptr;
+    if (no_sync) {
+        LOG_WRN("%s: STEP_PROFILE_NO_SYNC=1 - wall_ms is submission time, not execution\n", __func__);
+    }
+
+    // prompt step
+    {
+        data.steps.emplace_back();
+        data.steps.back().layer_cat[CAT_ATTN].resize(data.n_layers, 0.0);
+        data.steps.back().layer_cat[CAT_EXPERT].resize(data.n_layers, 0.0);
+
+        const int64_t t0 = ggml_time_us();
+        // long prompts: feed in n_batch-sized chunks (llama_decode rejects a
+        // batch larger than n_batch); the step-0 wall covers the whole prompt
+        const int32_t n_chunk = params.n_batch > 0 ? (int32_t) params.n_batch : (int32_t) tokens.size();
+        for (size_t off = 0; off < tokens.size(); off += (size_t) n_chunk) {
+            int32_t n = n_chunk;
+            if ((size_t) n > tokens.size() - off) {
+                n = (int32_t) (tokens.size() - off);
+            }
+            if (llama_decode(ctx, llama_batch_get_one(tokens.data() + off, n))) {
+                LOG_ERR("%s: failed to eval prompt\n", __func__);
+                return 1;
+            }
+        }
+        if (!no_sync) {
+            llama_synchronize(ctx);
+        }
+        data.steps.back().wall_ms = (ggml_time_us() - t0) / 1000.0;
+        data.step_delegate.emplace_back();
+        data.step_delegate.back().resize(data.n_layers);
+        const uint32_t n_dl = llama_expert_pool_get_stats(ctx, data.step_delegate.back().data(), (uint32_t) data.n_layers);
+        data.step_delegate.back().resize(n_dl);
+        write_timing_row(f_timing, 0, -1, data.steps.back(), nullptr);
+        for (int l = 0; l < (int) data.n_layers; ++l) {
+            write_timing_row(f_timing, 0, l, data.steps.back(),
+                    find_layer_stats(data.step_delegate.back(), l));
+        }
+        uint64_t sh = 0, sm = 0;
+        for (const auto & d : data.step_delegate.back()) {
+            sh += d.hit_rows; sm += d.miss_rows;
+        }
+        f_deleg << 0 << "," << sh << "," << sm << "\n";
+    }
+
+    // decode steps
+    int step = 1;
+    llama_token cur = tokens.back();
+    for (int i = 0; i < n_predict; ++i) {
+        data.steps.emplace_back();
+        data.steps.back().layer_cat[CAT_ATTN].resize(data.n_layers, 0.0);
+        data.steps.back().layer_cat[CAT_EXPERT].resize(data.n_layers, 0.0);
+
+        const int64_t t0 = ggml_time_us();
+        if (llama_decode(ctx, llama_batch_get_one(&cur, 1))) {
+            LOG_ERR("%s: failed to eval\n", __func__);
+            break;
+        }
+        if (!no_sync) {
+            llama_synchronize(ctx);
+        }
+        data.steps.back().wall_ms = (ggml_time_us() - t0) / 1000.0;
+
+        // expert-pool delegate statistics for this step (snapshot-and-reset)
+        data.step_delegate.emplace_back();
+        data.step_delegate.back().resize(data.n_layers);
+        const uint32_t n_dl = llama_expert_pool_get_stats(ctx, data.step_delegate.back().data(), (uint32_t) data.n_layers);
+        data.step_delegate.back().resize(n_dl);
+
+        write_timing_row(f_timing, step, -1, data.steps.back(), nullptr);
+        for (int l = 0; l < (int) data.n_layers; ++l) {
+            write_timing_row(f_timing, step, l, data.steps.back(),
+                    find_layer_stats(data.step_delegate.back(), l));
+        }
+        uint64_t sh = 0, sm = 0;
+        for (const auto & d : data.step_delegate.back()) {
+            sh += d.hit_rows; sm += d.miss_rows;
+        }
+        f_deleg << step << "," << sh << "," << sm << "\n";
+
+        cur = common_sampler_sample(smpl, ctx, -1);
+        printf("%s", common_token_to_piece(ctx, cur).c_str());
+        fflush(stdout);
+        if (llama_vocab_is_eog(vocab, cur) && !params.sampling.ignore_eos) {
+            break;
+        }
+        step++;
+    }
+
+    // end of the generation segment: print the accumulated pool hit rate
+    llama_expert_pool_finalize(ctx);
+
+    // routing capture teardown (see llama-ext.h)
+    if (g_route.fp != nullptr) {
+        llama_expert_pool_set_route_observer(nullptr, nullptr);
+        fclose(g_route.fp);
+        g_route.fp = nullptr;
+    }
+
+    // aggregate view: run totals + per-layer means (decode steps only)
+    if (data.steps.size() > 1) {
+        const double nd = (double) (data.steps.size() - 1);
+        step_record run;
+        for (size_t i = 1; i < data.steps.size(); ++i) {
+            const step_record & s = data.steps[i];
+            run.wall_ms += s.wall_ms;
+            run.sum_nodes_ms += s.sum_nodes_ms;
+            run.cb_ms += s.cb_ms;
+            for (int c = 0; c < CAT_COUNT; ++c) {
+                run.cat_ms[c] += s.cat_ms[c];
+            }
+        }
+        run.wall_ms /= nd; run.sum_nodes_ms /= nd; run.cb_ms /= nd;
+        for (int c = 0; c < CAT_COUNT; ++c) {
+            run.cat_ms[c] /= nd;
+        }
+        uint64_t r_hit = 0, r_miss = 0;
+        std::vector<uint64_t> l_hit(data.n_layers, 0), l_miss(data.n_layers, 0);
+        for (size_t i = 1; i < data.steps.size(); ++i) {
+            for (const auto & d : data.step_delegate[i]) {
+                r_hit += d.hit_rows; r_miss += d.miss_rows;
+                if (d.layer >= 0 && d.layer < (int) data.n_layers) {
+                    l_hit[d.layer] += d.hit_rows; l_miss[d.layer] += d.miss_rows;
+                }
+            }
+        }
+        {
+            const double hit = r_hit / nd, miss = r_miss / nd;
+            f_summary << "-1,-1," << run.wall_ms << ",";
+            write_cat_cols(f_summary, run.cat_ms);
+            f_summary << ",";
+            write_hit_cols(f_summary, hit, miss);
+            f_summary << "," << std::max(0.0, run.wall_ms - run.sum_nodes_ms - run.cb_ms) << "," << run.cb_ms << "\n";
+        }
+        for (int l = 0; l < (int) data.n_layers; ++l) {
+            f_summary << "-1," << l << ",";
+            write_cat_cols(f_summary, run.cat_ms);
+            f_summary << ",";
+            write_hit_cols(f_summary, l_hit[l] / nd, l_miss[l] / nd);
+            f_summary << ",,\n";
+        }
+        f_summary.flush();
+    }
+
+    f_timing.close();
+    f_summary.close();
+    f_deleg.close();
+    f_rout.close();
+    common_sampler_free(smpl);
+
+    print_summary(data);
+
+    llama_backend_free();
+
+    return 0;
+}
