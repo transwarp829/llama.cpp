@@ -834,13 +834,8 @@ static bool split_name_is_marked(const struct ggml_tensor * t, const char * mark
     return strncmp(t->name, marker, len) == 0 && t->name[len] == '-';
 }
 
-// env gates read once (they sit on the per-split hot path)
-static bool split_early_off() {
-    static const bool v = getenv("GGML_EXPPOOL_EARLY_OFF") != nullptr;
-    return v;
-}
-
-// same: the early-submit stream-ordering check bypass (diagnostics only)
+// env gates read once (they sit on the per-split hot path): the early-submit
+// stream-ordering check bypass (diagnostics only)
 static bool split_early_sync() {
     static const bool v = getenv("GGML_EXPPOOL_EARLY_SYNC") != nullptr;
     return v;
@@ -1467,7 +1462,8 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             // prep head is a reshape).
             // GPU segments only - the CPU miss chain must stay one split. the layer-parallel split/submit is a small-batch feature only: at or above the offload threshold the native path (mmid on GPU, upstream selective expert copy) must behave untouched.
             // the threshold is the same env the CUDA backend reads (GGML_OP_OFFLOAD_MIN_BATCH, default 32); the batch of a MUL_MAT_ID / the mount block head is its ne[2].
-            if (sched->layer_parallel && node->name != NULL) {
+            // the cut exists only to feed the early submit and is gated with it: callback mode keeps the serial shape (no cut, the mount runs inline).
+            if (sched->layer_parallel && !sched->callback_eval && node->name != NULL) {
                 const bool is_mount_head = split_name_is(node, SPLIT_MARK_MOUNT_CUR);
                 const bool is_mount_tail = split_name_is_marked(node, SPLIT_MARK_MOUNT);
                 saw_mount_tail = saw_mount_tail || is_mount_tail;
@@ -1659,7 +1655,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     // COMPLETE coverage: dep every tensor of the layer front and of the mount
     // block (no name-patterns - the window's read/write pairs are all inside
     // this set).
-    if (sched->layer_parallel) {
+    if (sched->layer_parallel && !sched->callback_eval) {
         for (int i = 0; i < sched->n_splits; i++) {
             ggml_backend_sched_split & sp = sched->splits[i];
             if (sp.graph.n_nodes == 0 || sp.graph.nodes[0]->name == NULL ||
@@ -2203,7 +2199,6 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             // mount. submitting from the GPU split keeps the copies+launch OFF
             // the CPU miss split's critical path.
             if (sched->layer_parallel && !sched->callback_eval &&
-                !split_early_off() &&
                 !split->submitted_early &&
                 split_backend_id != sched->n_backends - 1 &&
                 split->graph.n_nodes > 0 &&

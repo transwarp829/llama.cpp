@@ -2515,9 +2515,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         return experts;
     }
 
-    // the pool mount block: self-contained (A1-final inputs only) and computes only the unweighted expert outputs, so the scheduler can split it out and hand it to the device on its own. its graph position decides the delivery order: serial form = before the miss chain (rides inside the layer front's GPU split), layer-parallel form = after the miss chain (submitted right after the layer front).
-    // either way the graph order equals the execution order: the sequential galloc model reads the same order, and a GPU block left between the front and the mount would get its addresses reused while the window still reads them.
-    const bool mount_deferred = llama_expert_pool_layer_parallel();
+    // the pool mount block: self-contained (A1-final inputs only) and computes only the unweighted expert outputs, so the scheduler can split it out and hand it to the device on its own. it is built after the miss chain: the serial form runs it there in graph order (one split with the merge/tail), the layer-parallel form submits it right after the layer front (early submit) - one graph, one order for both forms.
+    // the graph order equals the execution order in the serial form: the sequential galloc model reads the same order, and a GPU block left between the front and the mount would get its addresses reused while the window still reads them.
 
     auto build_mount_block = [&]() {
         mount_out = build_moe_ffn(cur_mount_in, gate_inp, gate_inp_b,
@@ -2527,11 +2526,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             mount_scale_up, mount_scale_gate, true);
         cb(mount_out, "ffn_moe_mount", il);
     };
-    if (!mount_deferred && mount_p != nullptr) {
-        build_mount_block();
-    }
-
-    // the miss columns are weighted once, on the merge result; the miss chain weights here only when the graph carries no mount block at all - keyed on the plan (mount_p), not on the built tensor: in the layer-parallel form the mount is built later, and keying on mount_out would weight these columns twice.
+    // the miss columns are weighted once, on the merge result; the miss chain weights here only when the graph carries no mount block at all - keyed on the plan (mount_p), not on the built tensor: the mount is built after this point, and keying on mount_out would weight these columns twice.
     if (mount_p == nullptr) {
         if (!weight_before_ffn) {
             experts = ggml_mul(ctx0, experts, weights);
@@ -2550,7 +2545,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     ggml_build_forward_expand(gf, experts);
 
-    if (mount_deferred && mount_p != nullptr) {
+    if (mount_p != nullptr) {
         build_mount_block();
     }
 

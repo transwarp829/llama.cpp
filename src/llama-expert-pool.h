@@ -26,12 +26,6 @@ inline int32_t llama_expert_pool_offload_min_batch() {
     return v;
 }
 
-// single source for the layer-parallel delivery form: reads the same env the scheduler reads (GGML_EXPPOOL_LAYER_PARALLEL). on = the mount chain is built after the CPU miss chain so the scheduler can hand it to the device ahead of it; off = serial form.
-inline bool llama_expert_pool_layer_parallel() {
-    static const bool v = getenv("GGML_EXPPOOL_LAYER_PARALLEL") != nullptr;
-    return v;
-}
-
 // single source for the minimum slots per pooled layer (desert rule): below
 // this width a mounted layer pays the per-layer roundtrip tax for near-zero
 // hits, so the pool trims the layer set instead of spreading the budget thin.
