@@ -203,7 +203,7 @@ struct llama_expert_pool_state {
     // NEVER reads them - it only pushes route rows and, at each step
     // boundary, publishes the mirror the worker hands over.
     int32_t settled_steps = 0;             // decode steps accounted so far
-    // decaying activation counter (--expert-pool-decay H): per settled step
+    // decaying activation counter (--expert-pool-swap-decay H): per settled step
     // every count is multiplied by swap_lambda and the step's rows land with
     // per-token normalized increments (1 / n_tok per activation), so a batch of
     // n token columns contributes one step's worth of evidence instead of n.
