@@ -2072,13 +2072,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         id++;
                     }
                     if (id >= n_expert) {
-                        // all columns skipped (full-resident pool): the mmid
-                        // kernels zero the -1 columns natively without reading
-                        // any weight row, but the copy buffer must still hold
-                        // the full tensor for safety, so copy the whole tensor
-                        ggml_backend_synchronize(input_backend);
-                        ggml_backend_tensor_set_async(split_backend, input_cpy,
-                                input->data, 0, ggml_nbytes(input));
+                        // all columns skipped (fully resident used set): the
+                        // mmid kernels read no weight row, so skip the copy
                         prev_ids_tensor = ids_tensor;
                     } else {
                         int32_t first_id = id;
