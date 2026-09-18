@@ -147,6 +147,11 @@ llama-completion.exe -m models\gemma-1.1-7b-it.Q4_K_M.gguf --ignore-eos -n -1
 | `-cmoe, --cpu-moe` | keep all Mixture of Experts (MoE) weights in the CPU<br/>(env: LLAMA_ARG_CPU_MOE) |
 | `-ncmoe, --n-cpu-moe N` | keep the Mixture of Experts (MoE) weights of the first N layers in the CPU<br/>(env: LLAMA_ARG_N_CPU_MOE) |
 | `-ncffn, --n-cpu-ffn N` | keep the dense FFN weights of the first N layers in the CPU<br/>(dense models; for MoE expert weights use --n-cpu-moe)<br/>(env: LLAMA_ARG_N_CPU_FFN) |
+| `-nep, --expert-pool ARG` | keep the hottest MoE experts of the pooled layers in VRAM and compute a miss on the CPU (experimental)<br/>- N: total slots over all pooled MoE layers, deepest first<br/>- M,N: pool the M deepest MoE layers with N slots each<br/>- 0: disabled |
+| `--expert-pool-init FILE` | csv file to seed the pool content ("il,e1,e2,..."), default random |
+| `--expert-pool-swap-cap N` | max expert pairs swapped in per decode step (0 = freeze the resident set, negative = unlimited; default: 40) |
+| `--expert-pool-swap-decay H` | activation counter half-life in decode steps for the swap refresh (default: 96) |
+| `--expert-pool-miss-method METHOD` | how the pool runs a miss:<br/>- cpu-serial: the CPU miss chain stays one split (default)<br/>- cpu-parallel: the mount chain is handed to the device ahead of the CPU chain<br/>- gpu: compute the miss rows on the GPU (not implemented) |
 | `-ngl, --gpu-layers, --n-gpu-layers N` | max. number of layers to store in VRAM, either an exact number, 'auto', or 'all' (default: auto)<br/>(env: LLAMA_ARG_N_GPU_LAYERS) |
 | `-sm, --split-mode {none,layer,row,tensor}` | how to split the model across multiple GPUs, one of:<br/>- none: use one GPU only<br/>- layer (default): split layers and KV across GPUs (pipelined)<br/>- row: split weight across GPUs by rows (parallelized)<br/>- tensor: split weights and KV across GPUs (parallelized, EXPERIMENTAL)<br/>(env: LLAMA_ARG_SPLIT_MODE) |
 | `-ts, --tensor-split N0,N1,N2,...` | fraction of the model to offload to each GPU, comma-separated list of proportions, e.g. 3,1<br/>(env: LLAMA_ARG_TENSOR_SPLIT) |
