@@ -26,17 +26,14 @@ inline int32_t llama_expert_pool_offload_min_batch() {
     return v;
 }
 
-// single source for the minimum slots per pooled layer (desert rule): below
-// this width a mounted layer pays the per-layer roundtrip tax for near-zero
-// hits, so the pool trims the layer set instead of spreading the budget thin.
-// default = 1% of the layer's expert count, rounded up (128 -> 2, 256 -> 3,
-// 512 -> 6), which brackets the measured net-zero widths on all four models;
-// GGML_EXPPOOL_MIN_SLOTS overrides with an absolute slot count (1 = no
-// minimum). used by the init allocation (desert trim).
+// minimum slots per pooled layer (desert rule): below this width a mounted
+// layer pays the per-layer roundtrip tax for near-zero hits, so the single
+// value form trims the layer set instead of spreading the budget thin, and
+// the explicit-width form warns. 1% of the layer's expert count, rounded up
+// (128 -> 2, 256 -> 3, 512 -> 6), which brackets the measured net-zero
+// widths on all four models.
 inline int32_t llama_expert_pool_min_slots(int32_t n_expert) {
-    static const int32_t v = getenv("GGML_EXPPOOL_MIN_SLOTS") != nullptr
-        ? atoi(getenv("GGML_EXPPOOL_MIN_SLOTS")) : 0;
-    return v > 0 ? v : (n_expert + 99) / 100;
+    return (n_expert + 99) / 100;
 }
 
 // ---------------------------------------------------------------

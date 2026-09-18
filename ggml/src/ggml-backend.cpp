@@ -834,13 +834,7 @@ static bool split_name_is_marked(const struct ggml_tensor * t, const char * mark
     return strncmp(t->name, marker, len) == 0 && t->name[len] == '-';
 }
 
-// env gates read once (they sit on the per-split hot path): the early-submit
-// stream-ordering check bypass (diagnostics only)
-static bool split_early_sync() {
-    static const bool v = getenv("GGML_EXPPOOL_EARLY_SYNC") != nullptr;
-    return v;
-}
-
+// env gates read once (they sit on the per-split hot path)
 static int split_op_min_batch() {
     static const int v = getenv("GGML_OP_OFFLOAD_MIN_BATCH") ? atoi(getenv("GGML_OP_OFFLOAD_MIN_BATCH")) : 32;
     return v;
@@ -2316,14 +2310,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             if (sched->events[nxt->backend_id][sched->cur_copy] != NULL) {
                                 ggml_backend_event_record(sched->events[nxt->backend_id][sched->cur_copy], sched->backends[nxt->backend_id]);
                             }
-                            // optional event record+wait around the early submit
-                            // (diagnostics only): both the early mount and the
-                            // later main-loop splits go through the SAME single
-                            // stream of the CUDA backend, so stream order alone
-                            // orders them.
-                            if (split_early_sync()) {
-                                ggml_backend_synchronize(sched->backends[nxt->backend_id]);
-                            }
+                            // no event record+wait around the early submit: the
+                            // early mount and the later main-loop splits go
+                            // through the SAME single stream of the CUDA
+                            // backend, so stream order alone orders them.
                             nxt->submitted_early = true;
                             GGML_LOG_DEBUG("exppool: submitted_early split %d (mount chain) at split %d\n",
                                     (int) (nxt - splits), split_id);
