@@ -148,10 +148,11 @@ llama_context::llama_context(
 
     cparams.expert_pool      = params.expert_pool;
     cparams.expert_pool_init = params.expert_pool_init;
-    cparams.expert_pool_swap_per_step = params.expert_pool_swap_per_step;
+    cparams.expert_pool_swap_cap = params.expert_pool_swap_cap;
     cparams.expert_pool_layers = params.expert_pool_layers;
     cparams.expert_pool_width  = params.expert_pool_width;
-    cparams.expert_pool_decay  = params.expert_pool_decay;
+    cparams.expert_pool_swap_decay = params.expert_pool_swap_decay;
+    cparams.expert_pool_miss_method = params.expert_pool_miss_method;
 
     cparams.ctx_other = nullptr;
 
@@ -684,13 +685,13 @@ void llama_context::expert_pool_init() {
     const int32_t il_end   = mtp_ctx ? n_layer_all : n_layer;
     st.n_expert = n_expert;
     // 0 pairs/step freezes the resident set (the static A/B control arm)
-    st.swap_per_step = cparams.expert_pool_swap_per_step;
+    st.swap_per_step = cparams.expert_pool_swap_cap;
     st.swap_auto     = st.swap_per_step != 0;
-    // decaying activation counter (--expert-pool-decay H, state default 96):
+    // decaying activation counter (--expert-pool-swap-decay H, state default 96):
     // lambda = 2^(-1/H) per settled step; the increment of a step is its
     // activation count divided by its token columns, so a batch of n token
     // columns contributes one step's worth of evidence instead of n.
-    st.swap_decay_hl = cparams.expert_pool_decay > 0 ? cparams.expert_pool_decay : st.swap_decay_hl;
+    st.swap_decay_hl = cparams.expert_pool_swap_decay > 0 ? cparams.expert_pool_swap_decay : st.swap_decay_hl;
     st.swap_lambda   = std::pow(2.0f, -1.0f / (float) st.swap_decay_hl);
     LLAMA_LOG_INFO("%s: expert pool: decaying counter, half-life %d steps (lambda %.6f)\n",
             __func__, st.swap_decay_hl, st.swap_lambda);
@@ -1260,6 +1261,7 @@ void llama_context::sched_reserve() {
     gf_res_prev_active = nullptr;
 
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+    ggml_backend_sched_set_layer_parallel(sched.get(), cparams.expert_pool_miss_method == 1);
 
     expert_pool_init();
 
@@ -1301,6 +1303,7 @@ void llama_context::sched_reserve() {
                 LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
                 cparams.pipeline_parallel = false;
                 sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
+                ggml_backend_sched_set_layer_parallel(sched.get(), cparams.expert_pool_miss_method == 1);
                 gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
             }
             if (!gf) {
@@ -4365,10 +4368,11 @@ llama_context_params llama_context_default_params() {
         /*.kv_unified                  =*/ false,
         /*.expert_pool                 =*/ 0,
         /*.expert_pool_init            =*/ nullptr,
-        /*.expert_pool_swap_per_step   =*/ 40,
+        /*.expert_pool_swap_cap        =*/ 40,
         /*.expert_pool_layers          =*/ 0,
         /*.expert_pool_width           =*/ 0,
-        /*.expert_pool_decay           =*/ 96,
+        /*.expert_pool_swap_decay      =*/ 96,
+        /*.expert_pool_miss_method     =*/ 0,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,

@@ -353,6 +353,9 @@ extern "C" {
     // Set a callback to be called for each resulting node during graph compute
     GGML_API void                 ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data);
 
+    // Hand the graph's chunks to their backend ahead of the CPU splits
+    GGML_API void                 ggml_backend_sched_set_layer_parallel(ggml_backend_sched_t sched, bool layer_parallel);
+
     //
     // Meta backend
     //

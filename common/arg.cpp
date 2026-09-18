@@ -1739,18 +1739,38 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ));
     add_opt(common_arg(
-        {"--expert-pool-swap-per-step"}, "N",
-        "max expert pairs swapped in per decode step (0 = no swapping, negative = unlimited)",
+        {"--expert-pool-swap-cap"}, "N",
+        "max expert pairs swapped in per decode step (0 = freeze the resident set, negative = unlimited)",
         [](common_params & params, int value) {
-            params.expert_pool_swap_per_step = value;
+            params.expert_pool_swap_cap = value;
         }
     ));
     add_opt(common_arg(
-        {"--expert-pool-decay"}, "H",
+        {"--expert-pool-swap-decay"}, "H",
         "activation counter half-life in decode steps for the swap refresh (default 96; lambda = 2^(-1/H) is derived). "
         "The increment of a step is its activation count divided by its token columns",
         [](common_params & params, int value) {
-            params.expert_pool_decay = value;
+            params.expert_pool_swap_decay = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--expert-pool-miss-method"}, "{cpu-serial,cpu-parallel,gpu}",
+        "how the expert pool runs a miss (default: cpu-serial). "
+        "cpu-serial = the CPU chain stays one split, cpu-parallel = the mount chain is handed to the device ahead of the CPU chain, "
+        "gpu = compute the miss rows on the GPU (not implemented)",
+        [](common_params & params, const std::string & value) {
+            if (value == "cpu-serial") {
+                params.expert_pool_miss_method = 0;
+                return;
+            }
+            if (value == "cpu-parallel") {
+                params.expert_pool_miss_method = 1;
+                return;
+            }
+            if (value == "gpu") {
+                throw std::invalid_argument("expert-pool-miss-method gpu is not implemented yet");
+            }
+            throw std::invalid_argument(string_format("expert-pool-miss-method: unknown value '%s'", value.c_str()));
         }
     ));
     add_opt(common_arg(

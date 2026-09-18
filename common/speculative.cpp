@@ -2547,7 +2547,7 @@ common_speculative_init_result::common_speculative_init_result(
     // the swap knobs keep the pool defaults
     cparams.expert_pool        = params.speculative.draft.expert_pool;
     cparams.expert_pool_layers = 0;
-    cparams.expert_pool_decay  = 0;
+    cparams.expert_pool_swap_decay = 0;
     cparams.expert_pool_init   = nullptr;
 
     if (spec_mtp) {

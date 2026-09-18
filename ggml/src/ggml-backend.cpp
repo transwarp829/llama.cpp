@@ -2444,10 +2444,9 @@ ggml_backend_sched_t ggml_backend_sched_new(
         }
     }
 
-    // layer-parallel mode (env GGML_EXPPOOL_LAYER_PARALLEL); no prefetch
-    // backend - the miss split uses the regular
-    // input-copy path.
-    sched->layer_parallel = getenv("GGML_EXPPOOL_LAYER_PARALLEL") != NULL;
+    // layer-parallel mode: off by default, set by the owner
+    // (ggml_backend_sched_set_layer_parallel). no prefetch backend - the miss
+    // split uses the regular input-copy path.
 
     sched->galloc = ggml_gallocr_new_n(sched->bufts, n_backends);
     sched->op_offload = op_offload;
@@ -2581,6 +2580,10 @@ void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {
         // which avoids changes in the graph that could cause CUDA or other graphs to be disabled
         sched->next_copy = 0;
     }
+}
+
+void ggml_backend_sched_set_layer_parallel(ggml_backend_sched_t sched, bool layer_parallel) {
+    sched->layer_parallel = layer_parallel;
 }
 
 void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data) {

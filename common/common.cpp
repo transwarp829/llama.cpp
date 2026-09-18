@@ -1758,10 +1758,11 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.kv_unified        = params.kv_unified;
     cparams.expert_pool       = params.expert_pool;
     cparams.expert_pool_init  = params.expert_pool_init.empty() ? nullptr : params.expert_pool_init.c_str();
-    cparams.expert_pool_swap_per_step = params.expert_pool_swap_per_step;
+    cparams.expert_pool_swap_cap = params.expert_pool_swap_cap;
     cparams.expert_pool_layers = params.expert_pool_layers;
     cparams.expert_pool_width  = params.expert_pool_width;
-    cparams.expert_pool_decay  = params.expert_pool_decay;
+    cparams.expert_pool_swap_decay = params.expert_pool_swap_decay;
+    cparams.expert_pool_miss_method = params.expert_pool_miss_method;
 
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;
