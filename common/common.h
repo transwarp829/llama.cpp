@@ -577,7 +577,8 @@ struct common_params {
     int32_t expert_pool        = 0;      // total expert-pool slots (0 = disabled)
     std::string expert_pool_init;         // csv file to seed the pool (empty = random)
     int32_t expert_pool_swap_per_step = 40; // max expert pairs swapped in per decode step (0 = no swapping, negative = unlimited)
-    int32_t expert_pool_layers = 0;       // pool the N deepest MoE layers, deep-to-shallow (0 = all eligible)
+    int32_t expert_pool_layers = 0;       // M of the M,N form: pool the M deepest MoE layers (0 = all eligible)
+    int32_t expert_pool_width  = 0;       // N of the M,N form: slots per pooled layer (0 = derive from expert_pool)
     int32_t expert_pool_decay  = 96;      // decaying activation counter: half-life in decode steps
 
     bool input_prefix_bos  = false; // prefix BOS to user inputs, preceding input_prefix

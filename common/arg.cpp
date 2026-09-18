@@ -1692,10 +1692,43 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_SWA_FULL"));
     add_opt(common_arg(
-        {"-nep", "--expert-pool"}, "N",
-        "total number of expert slots across all pooled MoE layers (0 = disabled)",
-        [](common_params & params, int value) {
-            params.expert_pool = value;
+        {"-nep", "--expert-pool"}, "N|M,N",
+        "expert pool slots (0 = disabled). N = total slots across all pooled MoE layers, "
+        "M,N = pool the M deepest MoE layers with N slots each",
+        [](common_params & params, const std::string & value) {
+            const std::vector<std::string> parts = string_split<std::string>(value, ',');
+            if (parts.empty() || parts.size() > 2) {
+                throw std::invalid_argument("expert-pool: expected N or M,N");
+            }
+
+            int32_t v[2] = { 0, 0 };
+            for (size_t i = 0; i < parts.size(); ++i) {
+                size_t n_read = 0;
+                if (parts[i].empty()) {
+                    throw std::invalid_argument("expert-pool: empty value in N or M,N");
+                }
+                try {
+                    v[i] = std::stoi(parts[i], &n_read);
+                } catch (const std::exception &) {
+                    n_read = 0;
+                }
+                if (n_read != parts[i].size() || v[i] < 0) {
+                    throw std::invalid_argument(string_format("expert-pool: '%s' is not a non-negative integer", parts[i].c_str()));
+                }
+            }
+
+            if (parts.size() == 1) {
+                params.expert_pool        = v[0];
+                params.expert_pool_layers = 0;
+                params.expert_pool_width  = 0;
+                return;
+            }
+            if (v[1] <= 0) {
+                throw std::invalid_argument("expert-pool: the per-layer width of M,N must be greater than zero");
+            }
+            params.expert_pool        = 0;
+            params.expert_pool_layers = v[0];
+            params.expert_pool_width  = v[1];
         }
     ));
     add_opt(common_arg(
@@ -1718,13 +1751,6 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "The increment of a step is its activation count divided by its token columns",
         [](common_params & params, int value) {
             params.expert_pool_decay = value;
-        }
-    ));
-    add_opt(common_arg(
-        {"--pooled-layers"}, "N",
-        "pool the N deepest MoE layers, selected deep-to-shallow (0 = all CPU-resident MoE layers)",
-        [](common_params & params, int value) {
-            params.expert_pool_layers = value;
         }
     ));
     add_opt(common_arg(
