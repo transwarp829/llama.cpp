@@ -865,10 +865,12 @@ void llama_context::expert_pool_build() {
         // COMPACT layout: slot s holds resident expert res[s] (S slots, no
         // zero padding). non-resident experts route to -1 in the GPU remap
         // (the -1 skip ids -> exact zero), so no sentinel slice is needed.
-        // keeping ne2 = S (not n_expert) matters for the MMQ kernel: its
-        // prep work (quantize/grouping) scales with the slot count, and the
-        // 128-slot identity layout cost ~7.5x there (measured 2.65 vs
-        // 0.35 ms/token on the GPU chain).
+        // keeping ne2 = S (not n_expert) keeps the ids compact: the 8/27
+        // layout A/B measured 2.65 vs 0.35 ms/token. the attributed cause
+        // ("MMQ prep scales with the slot count") is UNVERIFIED - decode runs
+        // the ids-driven MMVQ path, and a full-GPU layer (ne2 = n_expert) is
+        // the living counter-example (2026-09-12 audit; re-measure before
+        // asserting a large-row-space cost).
         const int32_t s_il = (int32_t) st.resident[il].size();
         if (s_il <= 0) {
             continue;
