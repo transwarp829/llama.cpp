@@ -7,6 +7,7 @@
 #include "ggml-opt.h"
 #include "ggml.h"
 #include "llama.h"
+#include "../src/llama-ext.h" // fork-private expert pool params (llama_context_params.expert_pool)
 
 #include <list>
 #include <set>
@@ -574,13 +575,10 @@ struct common_params {
     bool swa_full          = false; // use full-size SWA cache (https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055)
     bool kv_unified        = false; // enable unified KV cache
 
-    int32_t expert_pool        = 0;      // total expert-pool slots (0 = disabled)
+    // fork-private expert pool knobs (llama-ext.h); common_context_params_to_llama
+    // passes a pointer to this struct through llama_context_params
+    llama_expert_pool_params expert_pool = llama_expert_pool_default_params();
     std::string expert_pool_init;         // csv file to seed the pool (empty = random)
-    int32_t expert_pool_swap_cap = 40;  // max expert pairs swapped in per decode step (0 = freeze, negative = unlimited)
-    int32_t expert_pool_layers = 0;       // M of the M,N form: pool the M deepest MoE layers (0 = all eligible)
-    int32_t expert_pool_width  = 0;       // N of the M,N form: slots per pooled layer (0 = derive from expert_pool)
-    int32_t expert_pool_swap_decay = 96;  // decaying activation counter: half-life in decode steps
-    int32_t expert_pool_miss_method = 0;  // miss path: 0 = cpu-serial, 1 = cpu-parallel
 
     bool input_prefix_bos  = false; // prefix BOS to user inputs, preceding input_prefix
     bool verbose_prompt    = false; // print prompt tokens before generation
@@ -958,7 +956,9 @@ using common_init_result_ptr = std::unique_ptr<common_init_result>;
 common_init_result_ptr common_init_from_params(common_params & params, bool model_only = false);
 
 struct llama_model_params   common_model_params_to_llama  (      common_params & params);
-struct llama_context_params common_context_params_to_llama(const common_params & params);
+// non-const: the fork-private pool params are referenced from the context params,
+// so the caller's struct must stay alive (it does: common_params outlives the context)
+struct llama_context_params common_context_params_to_llama(common_params & params);
 
 // clear LoRA adapters from context, then apply new list of adapters
 void common_set_adapter_lora(struct llama_context * ctx, std::vector<common_adapter_lora_info> & lora);

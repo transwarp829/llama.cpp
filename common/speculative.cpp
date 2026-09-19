@@ -2544,11 +2544,12 @@ common_speculative_init_result::common_speculative_init_result(
 
     // the expert pool is per context: the draft context gets its own pool only
     // when explicitly configured (-nepd); only the slot count is draft-scoped,
-    // the swap knobs keep the pool defaults
-    cparams.expert_pool        = params.speculative.draft.expert_pool;
-    cparams.expert_pool_layers = 0;
-    cparams.expert_pool_swap_decay = 0;
-    cparams.expert_pool_init   = nullptr;
+    // the swap knobs keep the pool defaults. the struct must outlive the
+    // llama_init_from_model calls below.
+    llama_expert_pool_params ep_draft = llama_expert_pool_default_params();
+    ep_draft.slots      = params.speculative.draft.expert_pool;
+    ep_draft.swap_decay = 0;
+    cparams.expert_pool = &ep_draft;
 
     if (spec_mtp) {
         cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;

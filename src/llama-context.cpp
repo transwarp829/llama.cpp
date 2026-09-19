@@ -146,13 +146,17 @@ llama_context::llama_context(
     cparams.cb_eval           = params.cb_eval;
     cparams.cb_eval_user_data = params.cb_eval_user_data;
 
-    cparams.expert_pool      = params.expert_pool;
-    cparams.expert_pool_init = params.expert_pool_init;
-    cparams.expert_pool_swap_cap = params.expert_pool_swap_cap;
-    cparams.expert_pool_layers = params.expert_pool_layers;
-    cparams.expert_pool_width  = params.expert_pool_width;
-    cparams.expert_pool_swap_decay = params.expert_pool_swap_decay;
-    cparams.expert_pool_miss_method = params.expert_pool_miss_method;
+    // fork-private expert pool knobs (llama-ext.h): a null pointer keeps the
+    // defaults, which leave the pool off
+    const llama_expert_pool_params ep = params.expert_pool != nullptr
+        ? *params.expert_pool : llama_expert_pool_default_params();
+    cparams.expert_pool            = ep.slots;
+    cparams.expert_pool_layers     = ep.layers;
+    cparams.expert_pool_width      = ep.slots_per_layer;
+    cparams.expert_pool_swap_cap   = ep.swap_cap;
+    cparams.expert_pool_swap_decay = ep.swap_decay;
+    cparams.expert_pool_miss_method= ep.miss_method;
+    cparams.expert_pool_init       = ep.init_file;
 
     cparams.ctx_other = nullptr;
 
@@ -4366,13 +4370,7 @@ llama_context_params llama_context_default_params() {
         /*.op_offload                  =*/ true,
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
-        /*.expert_pool                 =*/ 0,
-        /*.expert_pool_init            =*/ nullptr,
-        /*.expert_pool_swap_cap        =*/ 40,
-        /*.expert_pool_layers          =*/ 0,
-        /*.expert_pool_width           =*/ 0,
-        /*.expert_pool_swap_decay      =*/ 96,
-        /*.expert_pool_miss_method     =*/ 0,
+        /*.expert_pool                 =*/ nullptr,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,

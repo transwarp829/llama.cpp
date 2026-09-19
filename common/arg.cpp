@@ -1718,17 +1718,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
 
             if (parts.size() == 1) {
-                params.expert_pool        = v[0];
-                params.expert_pool_layers = 0;
-                params.expert_pool_width  = 0;
+                params.expert_pool.slots           = v[0];
+                params.expert_pool.layers          = 0;
+                params.expert_pool.slots_per_layer = 0;
                 return;
             }
             if (v[1] <= 0) {
                 throw std::invalid_argument("expert-pool: the per-layer width of M,N must be greater than zero");
             }
-            params.expert_pool        = 0;
-            params.expert_pool_layers = v[0];
-            params.expert_pool_width  = v[1];
+            params.expert_pool.slots           = 0;
+            params.expert_pool.layers          = v[0];
+            params.expert_pool.slots_per_layer = v[1];
         }
     ));
     add_opt(common_arg(
@@ -1742,7 +1742,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--expert-pool-swap-cap"}, "N",
         "max expert pairs swapped in per decode step (0 = freeze the resident set, negative = unlimited)",
         [](common_params & params, int value) {
-            params.expert_pool_swap_cap = value;
+            params.expert_pool.swap_cap = value;
         }
     ));
     add_opt(common_arg(
@@ -1750,7 +1750,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "activation counter half-life in decode steps for the swap refresh (default 96; lambda = 2^(-1/H) is derived). "
         "The increment of a step is its activation count divided by its token columns",
         [](common_params & params, int value) {
-            params.expert_pool_swap_decay = value;
+            params.expert_pool.swap_decay = value;
         }
     ));
     add_opt(common_arg(
@@ -1760,11 +1760,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "gpu = compute the miss rows on the GPU (not implemented)",
         [](common_params & params, const std::string & value) {
             if (value == "cpu-serial") {
-                params.expert_pool_miss_method = 0;
+                params.expert_pool.miss_method = 0;
                 return;
             }
             if (value == "cpu-parallel") {
-                params.expert_pool_miss_method = 1;
+                params.expert_pool.miss_method = 1;
                 return;
             }
             if (value == "gpu") {

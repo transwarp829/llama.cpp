@@ -408,13 +408,9 @@ extern "C" {
                           // try to disable when n_seq_max > 1 for improved performance when the sequences do not share a large prefix
                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363
 
-        int32_t expert_pool;        // [EXPERIMENTAL] total expert-pool slots (0 = disabled)
-        const char * expert_pool_init; // [EXPERIMENTAL] csv file to seed the pool ("il,e1,e2,..."), null = random
-        int32_t expert_pool_swap_cap; // [EXPERIMENTAL] max expert pairs swapped in per decode step (0 = freeze, negative = unlimited)
-        int32_t expert_pool_layers; // [EXPERIMENTAL] M of the M,N form: pool the M deepest MoE layers (0 = all eligible)
-        int32_t expert_pool_width;  // [EXPERIMENTAL] N of the M,N form: slots per pooled layer (0 = derive from expert_pool)
-        int32_t expert_pool_swap_decay; // [EXPERIMENTAL] decaying activation counter: half-life in decode steps (default 96)
-        int32_t expert_pool_miss_method; // [EXPERIMENTAL] miss path: 0 = cpu-serial, 1 = cpu-parallel
+        // fork-specific expert pool configuration (defined in llama-ext.h); null = no pool.
+        // the struct must outlive the context's first reserve, like the other pointer fields here.
+        const struct llama_expert_pool_params * expert_pool;
 
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)

@@ -1724,7 +1724,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     return mparams;
 }
 
-struct llama_context_params common_context_params_to_llama(const common_params & params) {
+struct llama_context_params common_context_params_to_llama(common_params & params) {
     auto cparams = llama_context_default_params();
 
     cparams.n_ctx             = params.n_ctx;
@@ -1756,13 +1756,10 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.op_offload        = !params.no_op_offload;
     cparams.swa_full          = params.swa_full;
     cparams.kv_unified        = params.kv_unified;
-    cparams.expert_pool       = params.expert_pool;
-    cparams.expert_pool_init  = params.expert_pool_init.empty() ? nullptr : params.expert_pool_init.c_str();
-    cparams.expert_pool_swap_cap = params.expert_pool_swap_cap;
-    cparams.expert_pool_layers = params.expert_pool_layers;
-    cparams.expert_pool_width  = params.expert_pool_width;
-    cparams.expert_pool_swap_decay = params.expert_pool_swap_decay;
-    cparams.expert_pool_miss_method = params.expert_pool_miss_method;
+    // fork-private expert pool knobs: point the context params at the caller's
+    // struct and take the seed file from the string holder (both outlive the ctx)
+    params.expert_pool.init_file = params.expert_pool_init.empty() ? nullptr : params.expert_pool_init.c_str();
+    cparams.expert_pool = &params.expert_pool;
 
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;
