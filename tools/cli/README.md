@@ -64,7 +64,7 @@
 | `-cmoe, --cpu-moe` | keep all Mixture of Experts (MoE) weights in the CPU<br/>(env: LLAMA_ARG_CPU_MOE) |
 | `-ncmoe, --n-cpu-moe N` | keep the Mixture of Experts (MoE) weights of the first N layers in the CPU<br/>(env: LLAMA_ARG_N_CPU_MOE) |
 | `-ncffn, --n-cpu-ffn N` | keep the dense FFN weights of the first N layers in the CPU<br/>(dense models; for MoE expert weights use --n-cpu-moe)<br/>(env: LLAMA_ARG_N_CPU_FFN) |
-| `-nep, --expert-pool ARG` | keep the hottest MoE experts of the pooled layers in VRAM and compute a miss on the CPU (experimental)<br/>- N: total slots over all pooled MoE layers, deepest first<br/>- M,N: pool the M deepest MoE layers with N slots each<br/>- 0: disabled |
+| `-nep, --expert-pool ARG` | keep the hottest MoE experts of the pooled layers in VRAM and compute a miss on the CPU (experimental)<br/>- N: slot budget spread over all pooled MoE layers, deepest first<br/>- M,N: the same budget, spread over the M deepest MoE layers<br/>- 0: disabled |
 | `--expert-pool-init FILE` | csv file to seed the pool content ("il,e1,e2,..."), default random |
 | `--expert-pool-swap-cap N` | max expert pairs swapped in per decode step (0 = freeze the resident set, negative = unlimited; default: 40) |
 | `--expert-pool-swap-decay H` | activation counter half-life in decode steps for the swap refresh (default: 96) |
