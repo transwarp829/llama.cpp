@@ -2201,7 +2201,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // tensor dims are ambiguous (ids/cur can be 2D or 3D depending on the
     // graph form), so never derive T from a tensor here.
     const bool small_batch = n_tokens < moe_gate_min;
-    if (expert_pool != nullptr && cparams.expert_pool > 0 && il >= 0 && small_batch) {
+    if (expert_pool != nullptr && llama_expert_pool_configured(cparams.expert_pool, cparams.expert_pool_width) && il >= 0 && small_batch) {
         const llama_expert_pool_mount & mnt = expert_pool->mount(il);
         if (mnt.active) {
             // all tables live on the pool device, so every gather runs on the

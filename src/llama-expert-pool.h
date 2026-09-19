@@ -27,6 +27,13 @@ inline int32_t llama_expert_pool_offload_min_batch() {
     return v;
 }
 
+// single source for "the pool is configured": either budget form may be set
+// (the single value, the M,N per-layer width, or both). every gate - context
+// init and graph build - must use this, never a bare budget field.
+inline bool llama_expert_pool_configured(int32_t slots, int32_t width) {
+    return slots > 0 || width > 0;
+}
+
 // minimum slots per pooled layer (desert rule): below this width a mounted
 // layer pays the per-layer roundtrip tax for near-zero hits, so the single
 // value form trims the layer set instead of spreading the budget thin, and

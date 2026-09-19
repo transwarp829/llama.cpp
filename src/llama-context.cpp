@@ -663,7 +663,7 @@ void llama_context::expert_pool_init() {
     llama_expert_pool_state & st = expert_pool_state;
     st.reset();
 
-    if (cparams.expert_pool <= 0 && cparams.expert_pool_width <= 0) {
+    if (!llama_expert_pool_configured(cparams.expert_pool, cparams.expert_pool_width)) {
         return;
     }
     // multi-GPU (layer split) is not supported by the pool yet: per-device
