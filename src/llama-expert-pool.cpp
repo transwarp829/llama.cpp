@@ -62,6 +62,13 @@ void llama_expert_pool_set_route_observer(llama_expert_pool_route_fn cb, void * 
     }
 }
 
+llama_expert_pool_params llama_expert_pool_default_params() {
+    llama_expert_pool_params p = {};
+    p.swap_cap   = 40;
+    p.swap_decay = 96;
+    return p;
+}
+
 void llama_expert_pool_state::set_mount(int il, const llama_expert_pool_mount & m) {
     // auto-grow: setup writes mounts for the pooled layers only
     if (il < 0) {
