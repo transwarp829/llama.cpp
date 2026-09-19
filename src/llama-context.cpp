@@ -21,7 +21,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
-#include <regex>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -700,72 +699,46 @@ void llama_context::expert_pool_init() {
     LLAMA_LOG_INFO("%s: expert pool: decaying counter, half-life %d steps (lambda %.6f)\n",
             __func__, st.swap_decay_hl, st.swap_lambda);
 
-    // --- find the pooled layers (ALL expert matrices of the layer on CPU) ---
-    // a layer pools only when every present expert matrix resolves to a host
-    // buffer under the same first-match rule the loader applies; one
-    // device-pinned matrix (e.g. a narrow -ot) skips the whole layer instead
-    // of leaving a mixed CPU/GPU state the two chains cannot split exactly.
+    // --- find the pooled layers: every present expert matrix of the layer in a
+    // host buffer, and the rest of the layer on a device ---
+    // the placement is read from the tensors themselves - the loader resolved
+    // -ot/-cmoe/-ncmoe into buffers, including any fallback it had to make -
+    // so it is never re-derived from the override patterns. one device-pinned
+    // matrix (e.g. a narrow -ot) skips the whole layer instead of leaving a
+    // mixed CPU/GPU state the two chains cannot split exactly.
     // the layer must also be GPU-resident: the pool chain reads the layer's
     // FFN input after the GPU segment, so CPU-attn layers (e.g. a partial
     // -ngl) keep the pure -cmoe path
     std::vector<int32_t> pooled_ils;
-    const llama_model_tensor_buft_override * ov = model.params.tensor_buft_overrides;
-    if (ov) {
-        struct ov_pat {
-            std::regex re;
-            bool is_host;
-            ov_pat(const std::regex & r, bool h) : re(r), is_host(h) {}
-        };
-        std::vector<ov_pat> pats;
-        try {
-            for (const llama_model_tensor_buft_override * o = ov; o->pattern; ++o) {
-                pats.emplace_back(std::regex(o->pattern), ggml_backend_buft_is_host(o->buft));
+    // pooling stays opt-in: without a host-placement override the pool has no
+    // reason to build chains (a default placement puts the experts where the
+    // layer is), and a device that fell back to the host for mul_mat_id must
+    // not be handed a device-side pool
+    if (model.params.tensor_buft_overrides != nullptr) {
+        for (int32_t il = il_begin; il < il_end; ++il) {
+            const llama_layer & L = model.layers[il];
+            // CPU-attn layers are never pooled (see comment above)
+            if (ggml_backend_dev_type(model.dev_layer(il)) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                continue;
             }
-        } catch (const std::regex_error &) {
-            pats.clear();
-        }
-        // loader order: the first matching pattern wins (host or device)
-        auto resolve_host = [&](const char * name, bool & matched_host) -> bool {
-            matched_host = false;
-            for (const auto & p : pats) {
-                if (std::regex_search(name, p.re)) {
-                    matched_host = p.is_host;
-                    return p.is_host;
-                }
-            }
-            return false; // no override: default placement, never pooled
-        };
-        if (!pats.empty()) {
-            for (int32_t il = il_begin; il < il_end; ++il) {
-                const llama_layer & L = model.layers[il];
-                // CPU-attn layers are never pooled (see comment above)
-                if (ggml_backend_dev_type(model.dev_layer(il)) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+            ggml_tensor * ws[4] = {L.ffn_gate_up_exps, L.ffn_up_exps, L.ffn_gate_exps, L.ffn_down_exps};
+            bool any      = false;
+            bool any_host = false;
+            bool all_host = true;
+            for (ggml_tensor * w : ws) {
+                if (w == nullptr) {
                     continue;
                 }
-                ggml_tensor * ws[4] = {L.ffn_gate_up_exps, L.ffn_up_exps, L.ffn_gate_exps, L.ffn_down_exps};
-                bool any = false;
-                bool all_cpu = true;
-                bool saw_host = false;
-                for (ggml_tensor * w : ws) {
-                    if (w == nullptr) {
-                        continue;
-                    }
-                    any = true;
-                    char name_buf[GGML_MAX_NAME + 1] = {0};
-                    memcpy(name_buf, w->name, GGML_MAX_NAME);
-                    bool matched_host = false;
-                    if (!resolve_host(name_buf, matched_host)) {
-                        all_cpu = false;
-                        break;
-                    }
-                    saw_host = saw_host || matched_host;
-                }
-                if (any && all_cpu) {
-                    pooled_ils.push_back(il);
-                } else if (any && saw_host) {
-                    LLAMA_LOG_WARN("%s: layer %d has mixed CPU/GPU expert matrices, skipped by the pool (keep the whole layer on one device)\n",
-                            __func__, il);
-                }
+                any = true;
+                const bool host = w->buffer != nullptr && ggml_backend_buffer_is_host(w->buffer);
+                any_host = any_host || host;
+                all_host = all_host && host;
+            }
+            if (any && all_host) {
+                pooled_ils.push_back(il);
+            } else if (any_host) {
+                LLAMA_LOG_WARN("%s: layer %d has mixed CPU/GPU expert matrices, skipped by the pool (keep the whole layer on one device)\n",
+                        __func__, il);
             }
         }
     }
