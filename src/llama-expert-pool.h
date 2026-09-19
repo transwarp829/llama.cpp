@@ -351,5 +351,20 @@ void llama_expert_pool_tab_publish(llama_expert_pool_state & st);
 // refcounted across pools; the active pool of the current thread is marked
 // around llama_context::graph_compute (the hook resolves its state from it)
 llama_expert_pool_state * llama_expert_pool_set_current(llama_expert_pool_state * st);
+
+// scoped binding for that mark: the hook must be told which pool a graph
+// belongs to while the compute runs, and every exit path has to restore the
+// previous value - an object does that by construction, a hand-paired
+// set/restore does not.
+struct llama_expert_pool_bind {
+    explicit llama_expert_pool_bind(llama_expert_pool_state * st) : prev(llama_expert_pool_set_current(st)) {}
+    ~llama_expert_pool_bind() { llama_expert_pool_set_current(prev); }
+
+    llama_expert_pool_bind(const llama_expert_pool_bind &) = delete;
+    llama_expert_pool_bind & operator=(const llama_expert_pool_bind &) = delete;
+
+    llama_expert_pool_state * prev;
+};
+
 void llama_expert_pool_delegate_register();
 void llama_expert_pool_delegate_unregister();
