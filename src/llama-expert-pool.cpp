@@ -89,7 +89,7 @@ const llama_expert_pool_mount & llama_expert_pool_state::mount(int il) const {
 }
 
 void llama_expert_pool_state::reset() {
-    enabled = false;
+    phase = PHASE_NONE;
     direct_mount = false;
     layers.clear();
     mounts.clear();
@@ -100,7 +100,6 @@ void llama_expert_pool_state::reset() {
     step_done = false;
 
     swap_auto = false;
-    fill_done = false;
     hook_step = 0;
     last_ilx = -1;
     settled_steps = 0;
@@ -113,7 +112,8 @@ void llama_expert_pool_state::reset() {
     mirror_seq[0] = mirror_seq[1] = mirror_seq[2] = -1;
     pub_seq.store(-1);
 
-    pool_ready = false;
+    // note: delegate_ref is not released here - the registration lives with the
+    // state (the context), not with one build of the pool
 
     pool_backend  = nullptr;
     mirror_ready.store(-1);

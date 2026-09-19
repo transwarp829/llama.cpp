@@ -518,13 +518,6 @@ llama_context::~llama_context() {
     }
     ggml_opt_free(opt_ctx);
 
-    // moe delegate: drop this context's registration (the hook itself is a
-    // single process-wide slot, refcounted across pools)
-    if (expert_pool_state.delegate_registered) {
-        expert_pool_state.delegate_registered = false;
-        llama_expert_pool_delegate_unregister();
-    }
-
     // release the scheduler BEFORE the pool buffers: its CUDA graph cache
     // holds nodes that reference the pool weight/tensor objects, which the
     // frees below would invalidate (the member dtor would otherwise run
@@ -654,7 +647,7 @@ void llama_context::expert_pool_init() {
     // the pool is already built (csv seed or a segment-end rebuild): the
     // sched_reserve() that follows expert_pool_build() re-enters here, and
     // a reset() would wipe the freshly built pool
-    if (expert_pool_state.pool_ready) {
+    if (expert_pool_state.phase != llama_expert_pool_state::PHASE_NONE) {
         return;
     }
     llama_expert_pool_state & st = expert_pool_state;
@@ -787,7 +780,6 @@ void llama_context::expert_pool_init() {
         }
     }
 
-    st.enabled = true;
     st.layers.assign(n_layer_all, llama_expert_pool_layer{});
     st.resident.resize(n_layer_all);
     st.pooled_layers = pooled_ils;
@@ -815,7 +807,7 @@ void llama_context::expert_pool_init() {
                     __func__, cparams.expert_pool_init);
             llama_expert_pool_random(n_layer_all, n_expert, widths, st.resident);
         }
-        st.pool_ready = true;
+        st.phase = llama_expert_pool_state::PHASE_BUILT;
         expert_pool_build();
         return;
     }
@@ -824,7 +816,7 @@ void llama_context::expert_pool_init() {
     // shape costs less than 7% vs the global top-N at the same budget, while
     // a random+swap pool beats a stale csv seed)
     llama_expert_pool_random(n_layer_all, n_expert, widths, st.resident);
-    st.pool_ready = true;
+    st.phase = llama_expert_pool_state::PHASE_BUILT;
     expert_pool_build();
 }
 
@@ -1116,7 +1108,7 @@ void llama_context::expert_pool_build() {
 
 void llama_context::expert_pool_fill() {
     llama_expert_pool_state & st = expert_pool_state;
-    if (st.fill_done || !st.enabled || st.layers.empty()) {
+    if (st.phase != llama_expert_pool_state::PHASE_BUILT || st.layers.empty()) {
         return;
     }
     const int32_t n_expert = model.hparams.n_expert;
@@ -1178,7 +1170,7 @@ void llama_context::expert_pool_fill() {
             copy_slots(l.orig[k], l.pool[k], k);
         }
     }
-    st.fill_done = true;
+    st.phase = llama_expert_pool_state::PHASE_FILLED;
 
     // start the dedicated swap-copy worker: all later H2D weight copies run
     // on this thread (off the inference thread and off the main graph
@@ -1196,10 +1188,7 @@ void llama_context::expert_pool_fill() {
 
     // --- moe delegate hook (feeds the route observer, llama-ext.h) ---
     if (st.direct_mount) {
-        if (!st.delegate_registered) {
-            st.delegate_registered = true;
-            llama_expert_pool_delegate_register();
-        }
+        st.delegate_ref.acquire();
         LLAMA_LOG_INFO("%s: direct mount active (%d layers), in-graph merge\n",
                 __func__, (int) st.pooled_layers.size());
     }
