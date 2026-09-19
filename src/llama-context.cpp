@@ -151,7 +151,6 @@ llama_context::llama_context(
         ? *params.expert_pool : llama_expert_pool_default_params();
     cparams.expert_pool            = ep.slots;
     cparams.expert_pool_layers     = ep.layers;
-    cparams.expert_pool_width      = ep.slots_per_layer;
     cparams.expert_pool_swap_cap   = ep.swap_cap;
     cparams.expert_pool_swap_decay = ep.swap_decay;
     cparams.expert_pool_miss_method= ep.miss_method;
@@ -663,7 +662,7 @@ void llama_context::expert_pool_init() {
     llama_expert_pool_state & st = expert_pool_state;
     st.reset();
 
-    if (!llama_expert_pool_configured(cparams.expert_pool, cparams.expert_pool_width)) {
+    if (cparams.expert_pool <= 0) {
         return;
     }
     // multi-GPU (layer split) is not supported by the pool yet: per-device
@@ -764,36 +763,30 @@ void llama_context::expert_pool_init() {
     // (deep layers carry the stronger activation locality); the total slot
     // count stays exactly at the budget (remainder to the deepest kept layers)
     const int32_t min_slots = llama_expert_pool_min_slots(n_expert);
-    const bool width_explicit = cparams.expert_pool_width > 0;
-    int32_t n_slot = 0;
-    int32_t rem    = 0;
-    if (width_explicit) {
-        // M,N form: the width per layer is explicit, so the floor only warns -
-        // it must not trim the layer set behind the user's back
-        n_slot = cparams.expert_pool_width;
-        if (n_slot < min_slots) {
+    int32_t n_slot = cparams.expert_pool / n_pooled;
+    int32_t rem    = cparams.expert_pool % n_pooled;
+    if (n_slot < min_slots) {
+        if (cparams.expert_pool_layers > 0) {
+            // the M,N form names the layer count, so the floor only warns - it
+            // must not trim the layer set behind the user's back
             LLAMA_LOG_WARN("%s: %d slots per layer is below the %d-slot floor: expect the per-layer mount roundtrip to cost more than the hits save\n",
                     __func__, n_slot, min_slots);
+        } else {
+            const int32_t n_pooled_all = n_pooled;
+            const int32_t n_keep = std::min(n_pooled, cparams.expert_pool / min_slots);
+            if (n_keep <= 0) {
+                LLAMA_LOG_WARN("%s: expert pool budget %d too small for %d pooled layers (min %d slots each), pool disabled\n",
+                        __func__, cparams.expert_pool, n_pooled_all, min_slots);
+                return;
+            }
+            // keep the deepest n_keep pooled layers (loader order, il ascending)
+            pooled_ils.erase(pooled_ils.begin(), pooled_ils.end() - n_keep);
+            n_slot = cparams.expert_pool / n_keep;
+            rem    = cparams.expert_pool % n_keep;
+            n_pooled = n_keep;
+            LLAMA_LOG_WARN("%s: budget %d < %d slots x %d pooled layers: pooled the deepest %d layers (layer %d..%d) x ~%d slots (desert rule)\n",
+                    __func__, cparams.expert_pool, min_slots, n_pooled_all, n_keep, pooled_ils.front(), pooled_ils.back(), n_slot);
         }
-    } else {
-        n_slot = cparams.expert_pool / n_pooled;
-        rem    = cparams.expert_pool % n_pooled;
-    }
-    if (!width_explicit && n_slot < min_slots) {
-        const int32_t n_pooled_all = n_pooled;
-        const int32_t n_keep = std::min(n_pooled, cparams.expert_pool / min_slots);
-        if (n_keep <= 0) {
-            LLAMA_LOG_WARN("%s: expert pool budget %d too small for %d pooled layers (min %d slots each), pool disabled\n",
-                    __func__, cparams.expert_pool, n_pooled_all, min_slots);
-            return;
-        }
-        // keep the deepest n_keep pooled layers (loader order, il ascending)
-        pooled_ils.erase(pooled_ils.begin(), pooled_ils.end() - n_keep);
-        n_slot = cparams.expert_pool / n_keep;
-        rem    = cparams.expert_pool % n_keep;
-        n_pooled = n_keep;
-        LLAMA_LOG_WARN("%s: budget %d < %d slots x %d pooled layers: pooled the deepest %d layers (layer %d..%d) x ~%d slots (desert rule)\n",
-                __func__, cparams.expert_pool, min_slots, n_pooled_all, n_keep, pooled_ils.front(), pooled_ils.back(), n_slot);
     }
 
     st.enabled = true;
@@ -806,7 +799,7 @@ void llama_context::expert_pool_init() {
     if (n_slot > n_expert) {
         LLAMA_LOG_WARN("%s: expert pool request of %d slots exceeds capacity (%d pooled layers x %d experts), "
                        "saturating to full coverage per layer\n",
-                __func__, width_explicit ? n_pooled * n_slot : cparams.expert_pool, n_pooled, n_expert);
+                __func__, cparams.expert_pool, n_pooled, n_expert);
         n_slot = n_expert;
         rem    = 0;
     }

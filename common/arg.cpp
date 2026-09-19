@@ -1693,8 +1693,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_SWA_FULL"));
     add_opt(common_arg(
         {"-nep", "--expert-pool"}, "N|M,N",
-        "expert pool slots (0 = disabled). N = total slots across all pooled MoE layers, "
-        "M,N = pool the M deepest MoE layers with N slots each",
+        "expert pool slot budget (0 = disabled). N = spread over all pooled MoE layers, "
+        "M,N = spread over the M deepest MoE layers",
         [](common_params & params, const std::string & value) {
             const std::vector<std::string> parts = string_split<std::string>(value, ',');
             if (parts.empty() || parts.size() > 2) {
@@ -1718,17 +1718,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
 
             if (parts.size() == 1) {
-                params.expert_pool.slots           = v[0];
-                params.expert_pool.layers          = 0;
-                params.expert_pool.slots_per_layer = 0;
+                params.expert_pool.slots  = v[0];
+                params.expert_pool.layers = 0;
                 return;
             }
             if (v[1] <= 0) {
-                throw std::invalid_argument("expert-pool: the per-layer width of M,N must be greater than zero");
+                throw std::invalid_argument("expert-pool: the M,N budget must be greater than zero");
             }
-            params.expert_pool.slots           = 0;
-            params.expert_pool.layers          = v[0];
-            params.expert_pool.slots_per_layer = v[1];
+            params.expert_pool.slots  = v[1];
+            params.expert_pool.layers = v[0];
         }
     ));
     add_opt(common_arg(

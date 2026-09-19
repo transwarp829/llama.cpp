@@ -142,9 +142,8 @@ LLAMA_API uint32_t llama_model_get_tok_embd(const struct llama_model * model, fl
 // llama_expert_pool_default_params() and override what you need - a zeroed
 // struct means a frozen pool, not a default one.
 struct llama_expert_pool_params {
-    int32_t slots;           // total slots over all pooled MoE layers, or the M of M,N (0 = disabled)
-    int32_t layers;          // M of M,N: pool the M deepest MoE layers (0 = all eligible)
-    int32_t slots_per_layer; // N of M,N: slots per pooled layer (0 = derive from `slots`)
+    int32_t slots;           // slot budget (0 = disabled)
+    int32_t layers;          // spread the budget over the deepest N layers (0 = all eligible)
     int32_t swap_cap;        // max expert pairs swapped in per decode step (0 = freeze, < 0 = unlimited)
     int32_t swap_decay;      // decaying activation counter: half-life in decode steps (0 = library default)
     int32_t miss_method;     // how a miss runs: 0 = cpu-serial, 1 = cpu-parallel
