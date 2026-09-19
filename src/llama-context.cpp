@@ -850,7 +850,8 @@ void llama_context::expert_pool_build() {
     // --- create pool weight tensors ---
     pool_ctx = ggml_init({ 4u*1024u*1024u, nullptr, true }); // no_alloc = true (allocated via buft)
 
-    for (int32_t il : pooled_ils) {
+    for (size_t ix = 0; ix < pooled_ils.size(); ++ix) {
+        const int32_t il = pooled_ils[ix];
         const llama_layer & L = model.layers[il];
         // per-layer slot count = the pool file's line length for this layer;
         // zero-slot layers get no pool tensors (the layer falls back to CPU).
@@ -878,6 +879,8 @@ void llama_context::expert_pool_build() {
                 continue;
             }
             l.orig[k] = src[k];
+            // identity for the CPU hook: one entry per present expert tensor
+            st.tensor_refs.emplace(src[k], llama_expert_pool_state::tensor_ref{ il, (int32_t) ix });
             l.pool[k] = (k < PK_UP_B)
                 ? ggml_new_tensor_4d(pool_ctx, src[k]->type, src[k]->ne[0], src[k]->ne[1], s_il, 1)
                 : ggml_new_tensor_2d(pool_ctx, src[k]->type, src[k]->ne[0], s_il);

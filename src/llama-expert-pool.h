@@ -13,6 +13,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 #include <utility>
 
@@ -138,6 +139,13 @@ struct llama_expert_pool_state {
 
     // pooled layer indices (filled at init, consumed by the delayed fill)
     std::vector<int32_t> pooled_layers;
+    // host expert tensor -> (layer, index into pooled_layers), registered while
+    // the pool is built: the CPU hook then identifies its node with one lookup
+    struct tensor_ref {
+        int32_t il;
+        int32_t ilx;
+    };
+    std::unordered_map<const ggml_tensor *, tensor_ref> tensor_refs;
 
     // set once the pool weights/tables have been copied (idempotent fill)
     bool fill_done = false;
