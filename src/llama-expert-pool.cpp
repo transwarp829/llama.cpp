@@ -95,6 +95,7 @@ void llama_expert_pool_state::reset() {
     mounts.clear();
     resident.clear();
     pooled_layers.clear();
+    tensor_refs.clear();
 
     step_done = false;
 
@@ -363,20 +364,14 @@ void llama_expert_pool_delegate_begin(
         return;
     }
 
-    // find the pooled layer/matrix this node corresponds to (ilx = index into
-    // pooled_layers; il = actual layer number)
-    int32_t il = -1;
-    int32_t ilx = -1;
-    for (size_t ix = 0; ix < st.pooled_layers.size() && il < 0; ++ix) {
-        const int32_t i = st.pooled_layers[ix];
-        const llama_expert_pool_layer & l = st.layers[i];
-        for (int k = 0; k < PK_N; ++k) {
-            if (l.orig[k] == src0) { il = i; ilx = (int32_t) ix; break; }
-        }
-    }
-    if (il < 0) {
+    // this node's identity, registered while the pool was built
+    // (ilx = index into pooled_layers; il = actual layer number)
+    const auto it = st.tensor_refs.find(src0);
+    if (it == st.tensor_refs.end()) {
         return;
     }
+    const int32_t il  = it->second.il;
+    const int32_t ilx = it->second.ilx;
     // log only the layers that have an active mount (direct mount) or all
     // pooled layers in routing-log-only mode
     if (st.direct_mount) {
