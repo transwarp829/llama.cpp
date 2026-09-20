@@ -673,6 +673,21 @@ void llama_context::expert_pool_init() {
     if (n_expert <= 0) {
         return;
     }
+    // unified memory (iGPU / APUs such as Strix Halo, Intel/AMD integrated,
+    // coherent CPU-GPU links): there is nothing to cache - no CPU offload is
+    // needed at all, the same memory already holds the experts (-cmoe/-ncmoe
+    // would only serialize CPU and GPU work). informational only.
+    // GGML_CUDA_ENABLE_UNIFIED_MEMORY (managed memory on a discrete card) is the
+    // same situation but the device still reports itself as a discrete GPU, so
+    // it is not detected here.
+    for (int32_t il = 0; il < n_layer_all; ++il) {
+        if (ggml_backend_dev_type(model.dev_layer(il)) == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+            LLAMA_LOG_WARN("%s: expert pool is used on an integrated/unified-memory GPU (layer %d) - "
+                           "consider disabling the pool and running without CPU offload for better performance\n",
+                           __func__, il);
+            break;
+        }
+    }
     // an MTP draft context executes only the appended NextN block(s): its
     // pooled set is that block range instead of the trunk
     const bool    mtp_ctx  = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP;
