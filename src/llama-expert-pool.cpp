@@ -383,8 +383,10 @@ void llama_expert_pool_delegate_begin(
     // batch gate: prefill-scale batches (at/above the MoE offload threshold)
     // run the native path with the pool fully inert - no table publish, no
     // counter rows, no hit/miss counting. same threshold as the graph-side
-    // small-batch gate, never a literal.
-    const bool small_batch = ids->ne[1] < llama_expert_pool_offload_min_batch();
+    // small-batch gate, never a literal. GGML_EXPPOOL_MISS_GPU keeps the
+    // hook active at every batch (the gpu miss-method pairs the two paths).
+    static const bool miss_gpu = getenv("GGML_EXPPOOL_MISS_GPU") != nullptr;
+    const bool small_batch = ids->ne[1] < llama_expert_pool_offload_min_batch() || miss_gpu;
     // NOTE: below the threshold the activation counter and the hit/miss counters
     // must see EVERY token column of the batch: multi-sequence runs (-np N)
     // and speculative verify batches (T = 1 + n_draft) both arrive with
