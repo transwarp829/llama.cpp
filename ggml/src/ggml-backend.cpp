@@ -2065,6 +2065,20 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     while (id < n_expert && !ggml_bitset_get(used_ids.data(), id)) {
                         id++;
                     }
+
+                    // experiment probe (env-gated, GGML_EXPPOOL_STAGE_LOG):
+                    // the staged expert count per node - verifies that the
+                    // pool's -1 mask shrinks the copied volume in the
+                    // GGML_EXPPOOL_MISS_GPU coexistence form
+                    if (getenv("GGML_EXPPOOL_STAGE_LOG") != nullptr) {
+                        int n_used = 0;
+                        for (int e = 0; e < n_expert; e++) {
+                            n_used += ggml_bitset_get(used_ids.data(), e) ? 1 : 0;
+                        }
+                        fprintf(stderr, "exppool_stage: %s T=%lld used=%d all_skip=%d bytes=%lld\n",
+                                node->name ? node->name : "?", (long long) node->ne[2], n_used, n_used == 0 ? 1 : 0,
+                                (long long) n_used * (long long) expert_size);
+                    }
                     if (id >= n_expert) {
                         // all columns skipped (fully resident used set): the
                         // mmid kernels read no weight row, so skip the copy
