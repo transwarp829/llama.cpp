@@ -2189,19 +2189,19 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // batches (T>1) share the same graph.
     // the mounts come from THIS context's pool: every context owns its own
     // registry, so a draft graph resolves its own mounts (or none)
-    // small-batch gate: the mount chain is a small-batch-only feature (user
-    // ruling: layer-parallel stays below the offload threshold). at/above the MoE offload threshold the miss
-    // chain flips to the GPU and runs via the upstream selective-copy path;
-    // the mount chain (and its shared-output merge segment) must not build
-    // there, so every form (plain -cmoe, serial pool, parallel pool) runs
-    // the SAME verified native graph shape and the pool is inert for that
-    // graph.
-    static const int32_t moe_gate_min = llama_expert_pool_offload_min_batch();
-    // the graph context's n_tokens is the real batch size of THIS graph - the
-    // tensor dims are ambiguous (ids/cur can be 2D or 3D depending on the
-    // graph form), so never derive T from a tensor here.
-    const bool small_batch = n_tokens < moe_gate_min;
-    if (expert_pool != nullptr && cparams.expert_pool > 0 && il >= 0 && small_batch) {
+    // batch policy: the mount chain is built for every batch size. the pool's
+    // residency then applies to prefill as well - a pooled layer gathers its
+    // resident experts from the pool and streams only the non-resident ones.
+    // which backend computes the miss columns is NOT decided here: the
+    // scheduler sends the host-weight mmids to the GPU at/above the MoE
+    // offload threshold (upstream selective copy) and keeps them on the CPU
+    // below it, so the method switch needs no knob of its own. that threshold
+    // is GGML_OP_OFFLOAD_MIN_BATCH - the same value the CUDA backend reads.
+    // the layer-parallel split / early submit stays small-batch-only (its gate
+    // lives in the scheduler, not here).
+    // GGML_EXPPOOL_MISS_GPU is a probe switch: it only widens the pool hook's
+    // batch gate for measurement runs, the graph shape no longer depends on it.
+    if (expert_pool != nullptr && cparams.expert_pool > 0 && il >= 0) {
         const llama_expert_pool_mount & mnt = expert_pool->mount(il);
         if (mnt.active) {
             // all tables live on the pool device, so every gather runs on the
