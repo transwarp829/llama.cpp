@@ -152,58 +152,24 @@ void llama_expert_pool_push_marker(llama_expert_pool_state & st) {
     st.route_cv.notify_one();
 }
 
-// push the FULL activation row of one (step, layer): the ids the CPU chain
-// actually used, with the -1 (pool hit) entries recovered from the original
-// top-k ids before the inverse remap. hook thread only, inside the cpu mmid
-// delegate (no locks held while walking/reading; queue lock is brief).
+// push the layer's FULL activation row (clean topk ids, no -1 recovery).
+// observer thread only; the queue lock is brief.
 static void route_push_row(llama_expert_pool_state & st, int32_t step, int32_t ilx,
-                           const ggml_tensor * ids) {
-    const int64_t n_used = ids->ne[0];
-    const int64_t n_tok  = ids->ne[1];
-    // original top-k ids: the inverse-remap get_rows' src[1] is the private
-    // continuous copy of selected_experts (ffn_moe_ids_flat_priv). walk:
-    // ids (cpu chain) = reshape(get_rows(remap_inv_host, ids_flat)); the
-    // scheduler rewrites cross-backend inputs to CPU-side copies (src[1]
-    // points at a CPU#... copy tensor), so the data is host-readable here.
-    const ggml_tensor * gr = ids;
-    if (gr->op == GGML_OP_RESHAPE && gr->src[0] != nullptr) {
-        gr = gr->src[0];
-    }
-    const ggml_tensor * raw_t = nullptr;
-    if (gr->op == GGML_OP_GET_ROWS && gr->src[1] != nullptr) {
-        raw_t = gr->src[1];
-    }
-    const bool have_raw = raw_t != nullptr && raw_t->data != nullptr && raw_t->type == GGML_TYPE_I32;
-    // the original row is either the flat [K*T, 1] ids_flat or a [K, T] view, read through its own strides below
-    const bool raw_flat = have_raw && raw_t->ne[0] == n_used * n_tok && raw_t->ne[1] == 1 && raw_t->nb[0] == sizeof(int32_t);
-    const bool raw_2d   = have_raw && raw_t->ne[0] == n_used && raw_t->ne[1] == n_tok;
-    if (!raw_flat && !raw_2d) {
-        // no silent degradation: without the original row the row is skipped, so the counter gets no evidence for it and zero counts never evict (the resident set freezes instead of chasing cold experts on miss-side-only counting)
-        static bool warned = false;
-        if (!warned) {
-            warned = true;
-            LLAMA_LOG_WARN("%s: original top-k row not readable (found %s) - route rows are skipped, the swap counter sees no evidence\n",
-                    __func__, raw_t == nullptr ? "nothing" : raw_t->name);
-        }
-        st.seg.rows_skipped ++;
+                           const int32_t * ids, int32_t n_used, int32_t n_tok) {
+    if (ids == nullptr || n_used <= 0 || n_tok <= 0) {
         return;
     }
-
     llama_expert_pool_state::route_block rb;
     rb.step  = step;
     rb.ilx   = ilx;
-    rb.n_tok = (int32_t) n_tok;
+    rb.n_tok = n_tok;
     rb.ids.reserve((size_t) n_used * (size_t) n_tok);
-    for (int64_t t = 0; t < n_tok; ++t) {
-        for (int64_t j = 0; j < n_used; ++j) {
-            // every entry (hit or miss) comes from the original top-k row: the CPU chain's ids are the inverse remap and carry -1 for hits, and for the flat [K*T, 1] layout a t*nb[1] read is out of bounds for T > 1 (spec verify, -np batches), so index the flat row explicitly.
-            const size_t off = raw_flat
-                ? (size_t) (t * n_used + j) * raw_t->nb[0]
-                : (size_t) t * raw_t->nb[1] + (size_t) j * raw_t->nb[0];
-            const int32_t o = *(const int32_t *) ((const char *) raw_t->data + off);
-            if (o >= 0 && o < st.n_expert) {
-                rb.ids.push_back(o);
-            }
+    // the row is the contiguous [n_used*n_tok, 1] I32 copy of the topk output
+    // (shape guard at the observer): every entry is an expert id
+    for (int64_t i = 0; i < (int64_t) n_used * (int64_t) n_tok; ++i) {
+        const int32_t o = ids[i];
+        if (o >= 0 && o < st.n_expert) {
+            rb.ids.push_back(o);
         }
     }
     if (rb.ids.empty()) {
@@ -325,148 +291,217 @@ void llama_expert_pool_random(int32_t n_layer, int32_t n_expert,
     }
 }
 // -----------------------------------------------------------------------------
-// moe delegate hook: called by the CPU MUL_MAT_ID kernel (ith==0) before row
-// grouping. collects NO rows (nothing is skipped: the -1 skip ids zero the
-// columns natively, both chains merge in the main graph); it feeds the swap
-// activation counter and the hit/miss counters, and fans the served ids out to the route
-// observer (llama-ext.h).
+// split-head observation: the scheduler reports every split's head node right
+// before it runs. the pool reads its statistics from the registered heads, and the
+// route observer (llama-ext.h) forwards the same rows - in the lane form via one
+// small D2H per layer per step, where the clean rows do not cross on their own.
 // -----------------------------------------------------------------------------
 
-void llama_expert_pool_delegate_begin(
-        ggml_tensor * src0, ggml_tensor * src1, ggml_tensor * ids, ggml_tensor * dst,
-        const int32_t ** skip_out, void * ud) {
-    (void) ud; // the pool is resolved from the current thread (set_current)
-    *skip_out = nullptr;
+// match a split head: the pool's registered tensors first, then a foreign expert
+// mmid (a run without a pool) - its layer comes from the weight name.
+static bool split_head_match(llama_expert_pool_state & st, ggml_tensor * head,
+                             int32_t & il, int32_t & ilx, bool & lane, bool & registered) {
+    il = -1;
+    ilx = -1;
+    lane = false;
+    registered = false;
+    const auto it = st.split_head_refs.find(head);
+    if (it != st.split_head_refs.end()) {
+        il         = it->second.il;
+        ilx        = it->second.ilx;
+        lane       = it->second.lane;
+        registered = true;
+        return true;
+    }
+    if (head->op != GGML_OP_MUL_MAT_ID || head->src[0] == nullptr || head->src[2] == nullptr ||
+        head->src[2]->type != GGML_TYPE_I32 || head->src[0]->name == nullptr) {
+        return false;
+    }
+    // "BACKEND#" prefixes a staged copy (above the offload threshold only, where
+    // no one-token row is forwarded)
+    if (sscanf(head->src[0]->name, "blk.%d.", &il) != 1 &&
+        sscanf(head->src[0]->name, "%*[^#]#blk.%d.", &il) != 1) {
+        il = -1;
+    }
+    return il >= 0;
+}
 
-    // route observer capture path (llama-ext.h): without a direct-mount pool
-    // on this thread's context the ids are the native top-k values. forward
-    // one-token decode rows; a layer index that moves BACKWARDS begins a new
-    // step (the CPU kernel runs only below the MoE offload threshold, so the
-    // stream is decode-only and every step visits the layers in ascending
-    // order; repeats of the same layer are the per-node calls of one layer)
-    if (g_route_cb != nullptr && (g_current_pool == nullptr || !g_current_pool->direct_mount)) {
-        if (ids->ne[1] == 1) {
-            int32_t il = -1;
-            if (sscanf(src0->name, "blk.%d.", &il) == 1 && il >= 0) {
-                const int32_t prev = g_cap_prev_il;
-                g_cap_prev_il = il;
-                g_route_cb(g_route_ud, il, (const int32_t *) ids->data, (int32_t) ids->ne[0],
-                        prev >= 0 && il < prev ? 1 : 0);
-            }
+// host-readable CLEAN rows of a matched head, flattened to [n_used*T] I32
+static const int32_t * split_head_rows(llama_expert_pool_state & st, ggml_tensor * head, ggml_backend_t backend,
+                                       int32_t il, bool lane, bool registered, int32_t n_used, int32_t & n_tok) {
+    n_tok = 0;
+    if (head == nullptr || n_used <= 0) {
+        return nullptr;
+    }
+    if (lane) {
+        const ggml_tensor * t = 0 <= il && il < (int32_t) st.ids_clean.size() ? st.ids_clean[il] : nullptr;
+        if (t == nullptr || backend == nullptr || t->ne[1] != 1 || t->ne[0] % n_used != 0) {
+            return nullptr;
         }
+        st.ids_buf.resize(ggml_nelements(t));
+        ggml_backend_tensor_get(t, st.ids_buf.data(), 0, ggml_nbytes(t));
+        n_tok = (int32_t) (t->ne[0] / n_used);
+        return st.ids_buf.data();
+    }
+    // cpu forms: the registered copy, or a CPU split's ids input (possibly strided)
+    const ggml_tensor * row = registered ? head->src[1] : head->src[2];
+    if (row == nullptr || row->type != GGML_TYPE_I32 || row->data == nullptr) {
+        return nullptr;
+    }
+    if (row->ne[1] == 1) {
+        if (row->ne[0] % n_used != 0) {
+            return nullptr;
+        }
+        n_tok = (int32_t) (row->ne[0] / n_used);
+        return (const int32_t *) row->data;
+    }
+    if (row->ne[0] != (int64_t) n_used || row->ne[1] <= 0) {
+        return nullptr;
+    }
+    const int64_t nt  = row->ne[1];
+    const int64_t nb0 = row->nb[0] / sizeof(int32_t);
+    const int64_t nb1 = row->nb[1] / sizeof(int32_t);
+    st.ids_buf.resize((size_t) n_used * (size_t) nt);
+    for (int64_t s = 0; s < nt; ++s) {
+        for (int32_t j = 0; j < n_used; ++j) {
+            st.ids_buf[(size_t) s * n_used + j] =
+                *(const int32_t *) ((const char *) row->data + (size_t) (s * nb1 + j * nb0) * sizeof(int32_t));
+        }
+    }
+    n_tok = (int32_t) nt;
+    return st.ids_buf.data();
+}
+
+void llama_expert_pool_observe_split_head(void * user_data, ggml_tensor * head, ggml_backend_t backend) {
+    llama_expert_pool_state & st = *(llama_expert_pool_state *) user_data;
+    if (head == nullptr) {
         return;
     }
-    if (g_current_pool == nullptr) {
+    int32_t il  = -1;
+    int32_t ilx = -1;
+    bool lane = false;
+    bool registered = false;
+    if (!split_head_match(st, head, il, ilx, lane, registered)) {
         return;
     }
-    llama_expert_pool_state & st = *g_current_pool;
-    if (st.pooled_layers.empty()) {
+    const int32_t n_used = registered && 0 <= il && il < (int32_t) st.ids_n_used.size() ? st.ids_n_used[il]
+                          : (head->op == GGML_OP_MUL_MAT_ID ? (int32_t) head->ne[1] : 0);
+    int32_t n_tok = 0;
+    const int32_t * ids = split_head_rows(st, head, backend, il, lane, registered, n_used, n_tok);
+
+    // route observer (llama-ext.h): one row per (step, layer), one-token batches
+    // only; a layer index that moves backwards marks a new step
+    if (ids != nullptr && g_route_cb != nullptr && n_tok == 1) {
+        const int32_t prev = st.rtlog_prev_il;
+        st.rtlog_prev_il = il;
+        g_route_cb(g_route_ud, il, ids, n_used, prev >= 0 && il < prev ? 1 : 0);
+    }
+
+    // pool statistics: registered heads of a direct-mount pool only
+    if (ids == nullptr || !registered || !st.direct_mount || st.pooled_layers.empty() || ilx < 0) {
+        return;
+    }
+    if (st.last_ilx == ilx) {
+        // once per (step, layer): the lane form reports every miss mmid of the layer
         return;
     }
 
-    // this node's identity, registered while the pool was built
-    // (ilx = index into pooled_layers; il = actual layer number)
-    const auto it = st.tensor_refs.find(src0);
-    if (it == st.tensor_refs.end()) {
-        return;
-    }
-    const int32_t il  = it->second.il;
-    const int32_t ilx = it->second.ilx;
-    // log only the layers that have an active mount (direct mount) or all
-    // pooled layers in routing-log-only mode
-    if (st.direct_mount) {
-        const llama_expert_pool_mount & mnt = st.mount(il);
-        if (!mnt.active) {
-            return;
-        }
-    }
-    // batch gate: prefill-scale batches (at/above the MoE offload threshold)
-    // run the native path with the pool fully inert - no table publish, no
-    // counter rows, no hit/miss counting. same threshold as the graph-side
-    // small-batch gate, never a literal. GGML_EXPPOOL_MISS_GPU keeps the
-    // hook active at every batch (the gpu miss-method pairs the two paths).
-    static const bool miss_gpu = getenv("GGML_EXPPOOL_MISS_GPU") != nullptr;
-    const bool small_batch = ids->ne[1] < llama_expert_pool_offload_min_batch() || miss_gpu;
-    // NOTE: below the threshold the activation counter and the hit/miss counters
-    // must see EVERY token column of the batch: multi-sequence runs (-np N)
-    // and speculative verify batches (T = 1 + n_draft) both arrive with
-    // ids->ne[1] > 1, and dropping them silently disables the swap under
-    // -np N or speculative decoding (the counter is a global mix of all
-    // sequences routed in this decode). only the route observer below keeps
-    // the one-token-per-line format.
-    // lazy counter allocation is gone from the hook: the swap worker owns
-    // act_cnt and allocates it at its first settlement.
-    if (st.stat.empty() && !st.pooled_layers.empty()) {
+    if (st.stat.empty()) {
         st.stat.assign(st.pooled_layers.size(), llama_expert_pool_counts{});
     }
-    // step-advance detection: the first layer with an active mount of a step
-    // begins after the last one of the previous step (step_done is set at the
-    // end of this hook); the same condition is the step flag forwarded to the
-    // route observer below
+    // step-advance: the first active-mount layer follows the previous step's last
+    // one (a graph's splits run in layer order)
     const bool first_of_step = ilx == st.first_active_ilx && st.step_done;
     if (first_of_step) {
         st.step_done = false;
         // new step: re-arm the per-layer gate (a single active layer would
         // otherwise be skipped forever after its first count)
         st.last_ilx = -1;
-        if (st.swap_auto && small_batch) {
-            // publish the worker's latest ready mirror: the only table write
-            // point. if the worker is still copying (no new ready mirror),
-            // the tables keep the old mapping - the swap decision takes
-            // effect one or more steps later, which is fine: the routing
-            // drift it tracks moves far slower than the step rate.
+        if (st.swap_auto) {
+            // publish the worker's latest ready mirror (the only table write point;
+            // no ready mirror = the tables keep the old mapping)
             llama_expert_pool_tab_publish(st);
-            // step marker: the rows queued before it are now a complete step
-            // and the worker may settle them (count + exchange + mirror).
+            // step marker: the worker may settle the rows queued before it
             llama_expert_pool_push_marker(st);
             st.hook_step += 1;
         }
     }
-    // route observer (llama-ext.h): forward the ids of one-token decode rows;
-    // the consumer dedups repeats and owns the file. the first_of_step flag is
-    // the same wrap condition that anchors the swap publish above.
-    if (g_route_cb != nullptr && ids->ne[1] == 1) {
-        g_route_cb(g_route_ud, il, (const int32_t *) ids->data, (int32_t) ids->ne[0],
-                first_of_step ? 1 : 0);
+    st.last_ilx = ilx;
+    // the layer's full activation row: one tick per step regardless of the tokens
+    if (st.swap_auto) {
+        route_push_row(st, st.hook_step, ilx, ids, n_used, n_tok);
     }
-
-    // --- swap: push the FULL activation row of this layer
-    // (resident + non-resident, every token column of the batch) to the swap
-    // worker. one decode step = one counter tick regardless of the token
-    // count; pushed once per (step, layer): the hook fires per MUL_MAT_ID
-    // node (2-3 per layer) with the same ids, and the worker attributes the
-    // row from the -1 positions against the original top-k ids.
-    // both the counter row and the hit/miss counting run once per (step,
-    // layer) - idle layers (active=false) are skipped by the mount gate
-    // above. hit/miss: with direct mount the ids come from remap_inv, so
-    // -1 is a GPU pool hit and a non-negative id is a CPU miss
-    if (small_batch && st.last_ilx != ilx) {
-        st.last_ilx = ilx;
-        if (st.swap_auto) {
-            route_push_row(st, st.hook_step, ilx, ids);
-        }
-        if (st.direct_mount) {
-            for (int64_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
-                for (int id = 0; id < (int) ids->ne[0]; ++id) {
-                    const int32_t e = *((const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]));
-                    if (e < 0) {
-                        st.stat[ilx].hit ++;
-                        st.seg.hit ++;
-                    } else if (e < st.n_expert) {
-                        st.stat[ilx].miss ++;
-                        st.seg.miss ++;
-                    }
-                }
+    // hit/miss from the inverse half of the PUBLISHED table (resident maps to -1,
+    // exactly what this graph read)
+    const int32_t pub = st.mirror_pub.load(std::memory_order_acquire);
+    if (st.direct_mount && pub >= 0 && pub < 3 && !st.tab_mirror[pub].empty()) {
+        const int32_t * inv = st.tab_mirror[pub].data() +
+                              (size_t) st.n_expert * st.layers.size() + (size_t) il * st.n_expert;
+        for (int64_t i = 0; i < (int64_t) n_used * (int64_t) n_tok; ++i) {
+            const int32_t e = ids[i];
+            if (e < 0 || e >= st.n_expert) {
+                continue;
+            }
+            if (inv[e] == -1) {
+                st.stat[ilx].hit ++;
+                st.seg.hit ++;
+            } else {
+                st.stat[ilx].miss ++;
+                st.seg.miss ++;
             }
         }
     }
-    // the LAST layer with an active mount completes the step (single-layer-
-    // safe detection: a 0-slot layer has no mount and its hook early-returns,
-    // so the anchor is not always the last pooled index - using the last
-    // ACTIVE index keeps the step-boundary alive under the desert rule)
+    // the LAST layer with an active mount completes the step (single-layer-safe
+    // detection: a 0-slot layer has no mount and is never reported, so the
+    // anchor is not always the last pooled index)
     if (ilx == st.last_active_ilx) {
         st.step_done = true;
     }
+}
+
+// graph-builder side of the registry: %il ascends within one build, so a decreasing
+// index means a new graph - no pointer survives its graph.
+static void bind_new_build(const llama_expert_pool_state & st, int32_t il) {
+    if (il < st.bind_last_il) {
+        st.split_head_refs.clear();
+        st.ids_clean.clear();
+        st.ids_n_used.clear();
+    }
+    st.bind_last_il = il;
+}
+
+static int32_t bind_ilx(const llama_expert_pool_state & st, int32_t il) {
+    for (size_t i = 0; i < st.pooled_layers.size(); ++i) {
+        if (st.pooled_layers[i] == il) {
+            return (int32_t) i;
+        }
+    }
+    return -1;
+}
+
+void llama_expert_pool_bind_ids(const llama_expert_pool_state & st, int32_t il, int32_t n_used, const ggml_tensor * ids_clean) {
+    if (il < 0 || ids_clean == nullptr) {
+        return;
+    }
+    bind_new_build(st, il);
+    if ((size_t) il >= st.ids_clean.size()) {
+        st.ids_clean.resize((size_t) il + 1, nullptr);
+        st.ids_n_used.resize((size_t) il + 1, 0);
+    }
+    st.ids_clean[il]   = ids_clean;
+    st.ids_n_used[il]  = n_used;
+}
+
+void llama_expert_pool_bind_split_head(const llama_expert_pool_state & st, int32_t il, const ggml_tensor * head, bool lane) {
+    if (il < 0 || head == nullptr) {
+        return;
+    }
+    bind_new_build(st, il);
+    const int32_t ilx = bind_ilx(st, il);
+    if (ilx < 0) {
+        return;
+    }
+    st.split_head_refs[head] = { il, ilx, lane };
 }
 
 // ---------------------------------------------------------------
