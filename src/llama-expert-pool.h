@@ -138,8 +138,6 @@ struct llama_expert_pool_layer {
 struct llama_expert_pool_counts {
     uint64_t hit  = 0;
     uint64_t miss = 0;
-    // route rows the hook could not attribute (no readable original top-k), counted loudly instead of degenerating to miss-only counting
-    uint64_t rows_skipped = 0;
 };
 
 struct llama_expert_pool_state {
@@ -160,13 +158,21 @@ struct llama_expert_pool_state {
 
     // pooled layer indices (filled at init, consumed by the delayed fill)
     std::vector<int32_t> pooled_layers;
-    // host expert tensor -> (layer, index into pooled_layers), registered while
-    // the pool is built: the CPU hook then identifies its node with one lookup
-    struct tensor_ref {
-        int32_t il;
-        int32_t ilx;
+
+    // split-head registry, rebuilt per graph build (the builder registers the clean
+    // topk ids and the miss chain's first node of each pooled layer).
+    struct split_head_ref {
+        int32_t il   = -1;
+        int32_t ilx  = -1;
+        bool    lane = false;  // true: read the clean rows from the device
     };
-    std::unordered_map<const ggml_tensor *, tensor_ref> tensor_refs;
+    mutable std::unordered_map<const ggml_tensor *, split_head_ref> split_head_refs;
+    mutable int32_t                          bind_last_il = -1;
+    mutable std::vector<const ggml_tensor *> ids_clean;   // [layer] clean topk ids
+    mutable std::vector<int32_t>             ids_n_used;  // [layer]
+    mutable std::vector<int32_t>             ids_buf;     // host scratch for a device read
+    // route-observer step flag (the wrap is detected by the layer index)
+    int32_t rtlog_prev_il = -1;
 
     // set once the pool weights/tables have been copied (idempotent fill):
     // part of the phase below
@@ -339,13 +345,12 @@ void llama_expert_pool_random(int32_t n_layer, int32_t n_expert,
                               const std::vector<int32_t> & widths,
                               std::vector<std::vector<int32_t>> & resident);
 
-// moe delegate hook: called by the CPU MUL_MAT_ID kernel (ith==0); feeds the
-// activation counter and the hit/miss counters, and fans the served ids out to the route
-// observer (llama-ext.h). returns a null skip table: no rows are skipped,
-// column zeroing is done by the -1 ids natively.
-void llama_expert_pool_delegate_begin(
-        ggml_tensor * src0, ggml_tensor * src1, ggml_tensor * ids, ggml_tensor * dst,
-        const int32_t ** skip_out, void * ud);
+// split-head observer: the scheduler hands every split's head to it. the pool reads
+// its statistics from the registered heads and the route observer (llama-ext.h)
+// forwards the same rows - with or without a pool.
+void llama_expert_pool_bind_ids(const llama_expert_pool_state & st, int32_t il, int32_t n_used, const ggml_tensor * ids_clean);
+void llama_expert_pool_bind_split_head(const llama_expert_pool_state & st, int32_t il, const ggml_tensor * head, bool lane);
+void llama_expert_pool_observe_split_head(void * user_data, ggml_tensor * head, ggml_backend_t backend);
 
 // swap worker: the worker owns the activation counters, the top-k refresh
 // decisions and the weight copies; the hook only pushes

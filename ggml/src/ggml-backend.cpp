@@ -903,10 +903,15 @@ struct ggml_backend_sched {
 
     bool op_offload;
 
-    // layer-parallel mode (env GGML_EXPPOOL_LAYER_PARALLEL):
+    // layer-parallel mode (ggml_backend_sched_set_layer_parallel, driven by
+    // --expert-pool-miss-method cpu-parallel):
     // the pool-chain GPU split and the miss-chain CPU split run concurrently
     // (the mount split is submitted ahead of the CPU miss chain).
     bool layer_parallel = false;
+
+    // fork-private split-head observer (the expert pool's statistics source)
+    ggml_backend_sched_split_head_fn obs_split_head    = nullptr;
+    void *                           obs_split_head_ud = nullptr;
 
     // the anchor split's end mark (layer-parallel): recorded before the mount chain is submitted, so the anchor's immediate successor can wait for the front alone instead of draining the stream (the timeline probe reads the same mark)
     ggml_backend_event_t anchor_event = nullptr;
@@ -2149,6 +2154,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 }
             }
         }
+        // fork-private: report this split's head before it runs (both the compute
+        // and the callback_eval paths)
+        if (sched->obs_split_head != nullptr && split->graph.n_nodes > 0) {
+            sched->obs_split_head(sched->obs_split_head_ud, split->graph.nodes[0], split_backend);
+        }
         const int64_t t1 = tl_on && tl_fp ? ggml_time_us() : 0;
         if (!sched->callback_eval) {
             if (sched->layer_parallel && split->submitted_early) {
@@ -2588,6 +2598,11 @@ void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {
 
 void ggml_backend_sched_set_layer_parallel(ggml_backend_sched_t sched, bool layer_parallel) {
     sched->layer_parallel = layer_parallel;
+}
+
+void ggml_backend_sched_set_split_head_observer(ggml_backend_sched_t sched, ggml_backend_sched_split_head_fn fn, void * user_data) {
+    sched->obs_split_head    = fn;
+    sched->obs_split_head_ud = user_data;
 }
 
 void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data) {

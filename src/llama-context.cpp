@@ -1245,6 +1245,8 @@ void llama_context::sched_reserve() {
 
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
     ggml_backend_sched_set_layer_parallel(sched.get(), cparams.expert_pool_miss_method == 1);
+    // serves the pool's statistics and the route observer: with or without a pool
+    ggml_backend_sched_set_split_head_observer(sched.get(), llama_expert_pool_observe_split_head, &expert_pool_state);
 
     expert_pool_init();
 
@@ -1287,6 +1289,8 @@ void llama_context::sched_reserve() {
                 cparams.pipeline_parallel = false;
                 sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
                 ggml_backend_sched_set_layer_parallel(sched.get(), cparams.expert_pool_miss_method == 1);
+                // serves the pool's statistics and the route observer: with or without a pool
+                ggml_backend_sched_set_split_head_observer(sched.get(), llama_expert_pool_observe_split_head, &expert_pool_state);
                 gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
             }
             if (!gf) {
@@ -5071,12 +5075,6 @@ void llama_context::expert_pool_finalize() {
             100.0 * st.seg.hit / (double) (st.seg.hit + st.seg.miss),
             (unsigned long long) st.seg.hit,
             (unsigned long long) (st.seg.hit + st.seg.miss));
-    if (st.seg.rows_skipped > 0) {
-        // loud: the swap counter got no evidence for these rows (it decays on
-        // them and zero counts never evict, so the resident set freezes)
-        LLAMA_LOG_WARN("%s: %llu route rows skipped (original top-k not readable) - the swap counter got no evidence for them\n",
-                __func__, (unsigned long long) st.seg.rows_skipped);
-    }
     st.seg = {};
 
     // the segment-end accounting below reads worker-owned state (settled_steps,

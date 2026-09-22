@@ -2199,8 +2199,6 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // is GGML_OP_OFFLOAD_MIN_BATCH - the same value the CUDA backend reads.
     // the layer-parallel split / early submit stays small-batch-only (its gate
     // lives in the scheduler, not here).
-    // GGML_EXPPOOL_MISS_GPU is a probe switch: it only widens the pool hook's
-    // batch gate for measurement runs, the graph shape no longer depends on it.
     if (expert_pool != nullptr && cparams.expert_pool > 0 && il >= 0) {
         const llama_expert_pool_mount & mnt = expert_pool->mount(il);
         if (mnt.active) {
@@ -2222,6 +2220,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             ggml_tensor * ids_c = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_expert_used, n_tokens);
             ggml_tensor * ids_cpy = ggml_cpy(ctx0, selected_experts, ids_c);
             ggml_tensor * ids_flat = ggml_reshape_2d(ctx0, ids_cpy, n_expert_used * n_tokens, 1);
+            // register the layer's clean topk rows for the split-head observer
+            llama_expert_pool_bind_ids(*expert_pool, il, (int32_t) n_expert_used, ids_flat);
             // the pool remap gather (below, GPU segment) and the inverse remap
             // gather (CPU segment) share this one clean contiguous topk copy;
             // each side produces its own -1 (pool skip / inverse) locally
@@ -2343,6 +2343,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     if (gate_up_exps) {
         // merged gate_up path: one mul_mat_id, then split into gate and up views
         ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, selected_experts, up_exps_s); // [n_ff*2, n_expert_used, n_tokens]
+        if (mount_p != nullptr) {
+            // the miss chain's first node (lane form: this staged mmid heads its split)
+            llama_expert_pool_bind_split_head(*expert_pool, il, gate_up, /*lane=*/true);
+        }
         cb(gate_up, "ffn_moe_gate_up", il);
 
         if (up_exps_s) {
@@ -2372,6 +2376,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     } else {
         // separate gate and up path
         up = build_lora_mm_id(up_exps, cur, selected_experts, up_exps_s); // [n_ff, n_expert_used, n_tokens]
+        if (mount_p != nullptr) {
+            llama_expert_pool_bind_split_head(*expert_pool, il, up, /*lane=*/true);
+        }
         cb(up, "ffn_moe_up", il);
 
         if (up_exps_s) {
@@ -2392,6 +2399,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
         if (gate_exps) {
             cur = build_lora_mm_id(gate_exps, cur, selected_experts, gate_exps_s); // [n_ff, n_expert_used, n_tokens]
+            if (mount_p != nullptr) {
+                llama_expert_pool_bind_split_head(*expert_pool, il, cur, /*lane=*/true);
+            }
             cb(cur, "ffn_moe_gate", il);
         } else {
             cur = up;
@@ -2503,6 +2513,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     if (arch == LLM_ARCH_MISTRAL4) {
         // src1 can exceed F16 range
         ggml_prec_set_src(experts, GGML_PREC_F32, 1);
+    }
+    if (mount_p != nullptr) {
+        llama_expert_pool_bind_split_head(*expert_pool, il, experts, /*lane=*/true);
     }
     cb(experts, "ffn_moe_down", il);
 
