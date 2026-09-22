@@ -137,10 +137,9 @@ LLAMA_API uint32_t llama_model_get_tok_embd(const struct llama_model * model, fl
 // expert pool: configuration (fork-private)
 //
 
-// The pool's knobs, referenced from llama_context_params.expert_pool (a null
-// pointer there means "no pool", which is the default). Start from
-// llama_expert_pool_default_params() and override what you need - a zeroed
-// struct means a frozen pool, not a default one.
+// The pool's knobs (llama_context_params.expert_pool; a null pointer there means
+// "no pool", the default). Start from llama_expert_pool_default_params() - a
+// zeroed struct means a frozen pool, not a default one.
 struct llama_expert_pool_params {
     int32_t slots;           // slot budget (0 = disabled)
     int32_t layers;          // spread the budget over the deepest N layers (0 = all eligible)
@@ -150,19 +149,16 @@ struct llama_expert_pool_params {
     const char * init_file;  // csv file to seed the pool content, null = random
 };
 
-// swap_cap 40, swap_decay 96, miss_method cpu-serial, everything else off. the
-// struct must outlive the context's first reserve (llama_init_from_model in
-// practice), like the other pointer arguments of the context params.
+// swap_cap 40, swap_decay 96, miss_method cpu-serial, everything else off; the
+// struct must outlive the context's first reserve, like the other pointer args.
 LLAMA_API struct llama_expert_pool_params llama_expert_pool_default_params(void);
 
 //
 // expert pool: routing observer (fork-private experimental API)
 //
 
-// The split-head observer fans out the CLEAN topk rows of one (step, layer), one
-// call per split head (one-token batches only). Used by tools (e.g. step-profiler)
-// to capture the routing stream; works with and without a pool. Pass cb = nullptr
-// to unregister.
+// The split-head observer fans out the CLEAN topk rows of one (step, layer), one call
+// per split head (one-token batches only); pass cb = nullptr to unregister.
 //   il            - layer number the row belongs to
 //   ids           - the layer's clean topk ids (the pool's -1 encodings stay out
 //                   of the stream)
@@ -177,10 +173,9 @@ LLAMA_API void llama_expert_pool_set_route_observer(llama_expert_pool_route_fn c
 // expert pool: delegate statistics and segment accounting (fork-private)
 //
 
-// per pooled-layer counters fed by the CPU MUL_MAT_ID hook. the call returns
-// the totals since the previous call (per decode step: call once after each
-// llama_decode), fills up to max_layers entries in pooled-layer order and
-// resets them. returns the number of layers written.
+// per pooled-layer counters fed by the split-head observer. the call returns the
+// totals since the previous call (call once after each llama_decode), fills up to
+// max_layers entries in pooled-layer order and resets them.
 struct llama_expert_pool_layer_stats {
     int32_t  layer;          // actual model layer number
     uint64_t hit_rows;       // rows computed by the GPU pool chain
@@ -190,20 +185,17 @@ struct llama_expert_pool_layer_stats {
 LLAMA_API uint32_t llama_expert_pool_get_stats(struct llama_context * ctx,
         struct llama_expert_pool_layer_stats * out, uint32_t max_layers);
 
-// end of a generation segment: print the accumulated hit rate (since the last
-// finalize) at info verbosity and reset the segment counters. call once after
-// the decode loop finishes.
+// end of a generation segment: print the accumulated hit rate at info verbosity and
+// reset the segment counters (call once after the decode loop).
 LLAMA_API void llama_expert_pool_finalize(struct llama_context * ctx);
 
 //
 // verbosity-explicit logging (fork-private)
 //
 
-// bypasses the ggml-level -> verbosity remap in the common default callback.
-// `verbosity` uses the same numbering as the common LOG_LEVEL_* (3 = info,
-// shown at -lv 3). the common layer registers a verbosity callback that
-// forwards to its own log; with no callback registered, llama_log_verbose
-// falls back to llama_log_internal.
+// bypasses the ggml-level -> verbosity remap in the common default callback;
+// `verbosity` numbers as common LOG_LEVEL_* (3 = info). with no callback registered
+// llama_log_verbose falls back to llama_log_internal.
 typedef enum llama_log_verbosity {
     LLAMA_LOG_VERBOSITY_ERROR = 1,
     LLAMA_LOG_VERBOSITY_WARN  = 2,
@@ -215,6 +207,5 @@ typedef enum llama_log_verbosity {
 // same signature as ggml_log_callback with an explicit verbosity prepended
 typedef void (*llama_log_verbosity_callback)(int verbosity, enum ggml_log_level level, const char * text, void * user_data);
 
-// register the verbosity-explicit callback (global, not thread safe, like
-// llama_log_set)
+// register the verbosity-explicit callback (global, not thread safe, like llama_log_set)
 LLAMA_API void llama_log_set_verbosity(llama_log_verbosity_callback callback, void * user_data);
