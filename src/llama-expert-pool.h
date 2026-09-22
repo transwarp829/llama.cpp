@@ -85,8 +85,12 @@ struct llama_expert_pool_mount {
                                        // resident -> pool slot, non-resident -> -1
     ggml_tensor * remap_inv_host = nullptr; // I32 [1, n_expert] on the CPU device:
                                            // resident -> -1, non-resident -> expert id
-                                           // (CPU-segment get_rows host mirror; the
-                                           // GPU side has NO inv table - only remap)
+                                           // (host copy; read when the scheduler keeps
+                                           // the miss mmids on the CPU)
+    ggml_tensor * remap_inv = nullptr; // I32 [1, n_expert] on the pool device: the same
+                                      // inv table, gathered device-side when the
+                                      // scheduler offloads the miss mmids (no CPU
+                                      // segment, no 32B H2D, no cross-side read)
     ggml_tensor * scale     = nullptr; // F32 [1, n_expert] on the pool device:
                                        // per-expert down scale (null = no scale)
     ggml_tensor * scale_up   = nullptr; // F32 [1, n_expert]: up scale, factored
@@ -295,13 +299,14 @@ struct llama_expert_pool_state {
     // main stream, see tab_publish below)
     ggml_backend_t pool_backend = nullptr;
 
-    // merged mount tables: the remap half lives in tab_all on the pool
-    // device (read by the GPU chain's get_rows), the remap_inv half in
-    // tab_cpu on the CPU device (read by the miss chain's get_rows). both
-    // are [n_expert, n_layers] I32; each layer's remap/remap_inv_host are
-    // views sliced from them. the host mirrors rebuilt by the worker and
-    // published by the hook (step-granular swap update).
-    ggml_tensor * tab_all = nullptr;             // [n_expert, n_layers] remap (pool device)
+    // merged mount tables: BOTH halves live in tab_all on the pool device in
+    // the mirror's own layout (remap block, then inv block), so publishing is
+    // one stream-ordered copy; each layer's remap/remap_inv are views sliced
+    // from either block. tab_cpu keeps the CPU-side copy of the inv half for
+    // the miss chain's host-segment reads below the offload threshold. the
+    // host mirrors are rebuilt by the worker and published by the hook
+    // (step-granular swap update).
+    ggml_tensor * tab_all = nullptr;             // [n_expert, 2*n_layers] remap|inv (pool device)
     // CPU-hosted copy of the inverse table: the miss chain's get_rows reads
     // remap_inv_host from HERE (host memory), so its ids are not tied to the
     // pool segment's 32B output slot. [n_expert, n_layers] layout,

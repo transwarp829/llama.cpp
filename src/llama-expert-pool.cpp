@@ -500,8 +500,10 @@ int32_t llama_expert_pool_tab_build(llama_expert_pool_state & st) {
         return st.seq_ctr;
     }
     const int32_t n_expert = st.n_expert;
-    const size_t n_total = (size_t) st.tab_all->ne[0] * (size_t) st.tab_all->ne[1];
-    const size_t n_half  = n_total; // one half of the mirror (remap or inv) per table
+    // one half of the mirror (the remap block or the inv block). the tables live
+    // in one tensor of 2*n_layers columns, so derive the half from the layer
+    // count, not from the tensor's shape.
+    const size_t n_half = (size_t) st.n_expert * st.layers.size();
     // pick a free mirror slot: never the ready one (the hook may not have
     // published it yet) and never the published one (its set_async may still
     // be in flight). three slots, so at most two are busy - no waiting.
@@ -519,8 +521,8 @@ int32_t llama_expert_pool_tab_build(llama_expert_pool_state & st) {
         return st.seq_ctr; // cannot happen: ready and pub occupy at most two of three
     }
     std::vector<int32_t> & mir = st.tab_mirror[k];
-    if (mir.size() != 2 * n_total) {
-        mir.assign(2 * n_total, -1);
+    if (mir.size() != 2 * n_half) {
+        mir.assign(2 * n_half, -1);
     }
     for (int32_t il : st.pooled_layers) {
         const llama_expert_pool_mount & m = st.mount(il);
@@ -564,8 +566,9 @@ void llama_expert_pool_tab_publish(llama_expert_pool_state & st) {
     if (r < 0 || r == st.mirror_pub.load(std::memory_order_acquire)) {
         return;
     }
-    const size_t n_half = (size_t) st.tab_all->ne[0] * (size_t) st.tab_all->ne[1];
-    ggml_backend_tensor_set_async(st.pool_backend, st.tab_all, st.tab_mirror[r].data(), 0, n_half * sizeof(int32_t));
+    const size_t n_half = (size_t) st.n_expert * st.layers.size();
+    // both halves in one stream-ordered copy (the table layout matches the mirror)
+    ggml_backend_tensor_set_async(st.pool_backend, st.tab_all, st.tab_mirror[r].data(), 0, 2 * n_half * sizeof(int32_t));
     if (st.tab_cpu != nullptr) {
         ggml_backend_tensor_set(st.tab_cpu, st.tab_mirror[r].data() + n_half, 0, n_half * sizeof(int32_t));
     }
