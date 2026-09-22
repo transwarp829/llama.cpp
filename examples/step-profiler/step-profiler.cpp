@@ -19,9 +19,8 @@
 
 #include "../../src/llama-ext.h" // fork-private ext API (expert-pool route observer)
 
-// --- expert-pool routing capture (GGML_EXPPOOL_ROUTING_LOG) -----------------
-// the library no longer writes routing files; the route observer fans out the
-// clean topk rows of each (step, layer) (decode rows) and this tool owns the CSV.
+// --- expert-pool routing capture (GGML_EXPPOOL_ROUTING_LOG) ---
+// the library no longer writes routing files; this tool owns the CSV.
 struct route_capture {
     FILE *   fp = nullptr;
     uint64_t step = 0;
@@ -49,27 +48,21 @@ static void route_cb(void * ud, int32_t il, const int32_t * ids, int32_t n_ids, 
 
 // llama-step-profiler
 //
-// measures per-step (per-token) decode timing using the scheduler eval callback
+// measures per-step (per-token) decode timing using the scheduler eval callback.
 // writes:
-//   <prefix>.timing.csv   raw view, one row per (step, layer): the 20-column
-//                         execution-order layout, plus a per-step summary row
-//                         (layer = -1) carrying wall/gap/cb and totals
-//   <prefix>.summary.csv  aggregate view: run totals row (step = -1, layer = -1)
-//                         and per-layer means across decode tokens
+//   <prefix>.timing.csv   raw view, one row per (step, layer): the execution-order
+//                         layout plus a per-step summary row (layer = -1)
+//   <prefix>.summary.csv  aggregate view: run totals and per-layer means
 //   <prefix>.routing.csv  per step x per layer: activated expert ids
 //   <prefix>.delegate.csv per step: delegate submits/hit_rows totals
 //
 // prefix: env STEP_PROFILE_OUT, default "step-profile"
-//
 // usage: llama-step-profiler -m model.gguf -p "prompt" -n 100 [-t N] [-ngl N] [--cpu-moe]
 //
-// note: by default the profiler SYNCHRONIZES after each llama_decode, so
-// wall_ms is the real per-step decode time (llama_decode is async - without
-// the sync the timestamp measures only the API submission cost). the old
-// async-only timing is kept behind STEP_PROFILE_NO_SYNC=1 (diagnostics:
-// compare submission vs execution).
-// note: the callback forces the per-node compute path, so timings are contaminated
-// (CUDA graphs disabled). routing data is timing-independent and still valid.
+// note: by default the profiler SYNCHRONIZES after each llama_decode, so wall_ms is
+// the real per-step decode time; STEP_PROFILE_NO_SYNC=1 keeps the async-only timing.
+// note: the callback forces the per-node path (CUDA graphs disabled), so timings are
+// contaminated; routing data is timing-independent and still valid.
 
 enum step_cat {
     CAT_ATTN,
@@ -121,11 +114,8 @@ static int node_layer(const char * name) {
     return atoi(p + 1);
 }
 
-// classify a node into a timing bucket
-// - MUL_MAT_ID is always the routed expert matmul
-// - attention ops are named "attn_*"
-// - other MoE ops (router, top-k, weights) are named "ffn_moe_*"
-// - shared/dense FFN ops are named "ffn_*" (not "ffn_moe_*")
+// classify a node into a timing bucket: MUL_MAT_ID = the routed expert matmul,
+// attn_* = attention, ffn_moe_* = router/top-k/weights, ffn_* = shared/dense FFN
 static int classify(const ggml_tensor * t) {
     const char * name = t->name;
     if (t->op == GGML_OP_MUL_MAT_ID) {
@@ -173,17 +163,10 @@ static bool cb_eval(ggml_tensor * t, bool ask, void * user_data) {
             }
         }
 
-        // capture activated expert ids from MUL_MAT_ID inputs (once per step/layer)
-        // ggml_mul_mat_id(ctx, as, b, ids) -> src[2] = selected expert indices
-        //
-        // never read a ggml view linearly: the graph feeds ggml_argsort_top_k(),
-        // which is a strided VIEW over the argsort buffer (nb[1] = n_expert*4).
-        // a flat get() of ne[0]*ne[1] elements then reads the buffer head - one
-        // n_expert-long argsort row per token instead of the ids. that went
-        // unnoticed for as long as the capture existed because single-token rows
-        // (ne[1] == 1) are contiguous and read correctly by accident, so only
-        // prefill rows were corrupted (they came out as exact permutations of
-        // 0..n_expert, i.e. "all experts").
+        // capture activated expert ids from MUL_MAT_ID inputs (once per step/layer):
+        // ggml_mul_mat_id(ctx, as, b, ids) -> src[2]. never read a ggml view linearly -
+        // the graph feeds ggml_argsort_top_k(), a strided view over the argsort buffer
+        // (nb[1] = n_expert*4); a flat read returns the buffer head, not the ids.
         if (t->op == GGML_OP_MUL_MAT_ID && data->f_routing != nullptr && t->src[2] != nullptr) {
             const int cur_step = (int) data->steps.size() - 1;
             if (layer >= 0 && layer < (int) data->n_layers &&
@@ -359,9 +342,8 @@ int main(int argc, char ** argv) {
     const llama_vocab * vocab = llama_model_get_vocab(model);
     const bool add_bos = llama_vocab_get_add_bos(vocab);
     std::string prompt = params.prompt;
-    // -f/--file: read the prompt file (common's prompt_file field is parsed but
-    // not consumed by any common function in this tree; read it here). only
-    // used when -p/--prompt was not given on the command line.
+    // -f/--file: read the prompt file (common's prompt_file is parsed but consumed
+    // by nobody in this tree); only used when -p was not given
     if (prompt.empty() && !params.prompt_file.empty()) {
         std::ifstream fin(params.prompt_file);
         if (!fin) {
@@ -371,9 +353,8 @@ int main(int argc, char ** argv) {
         prompt.assign((std::istreambuf_iterator<char>(fin)), std::istreambuf_iterator<char>());
         LOG_INF("%s: prompt file loaded (%zu chars)\n", __func__, prompt.size());
     }
-    // chat-template mode (like llama-cli -cnv): STEP_PROFILE_CHAT_FILE
-    // = text file used as the user message; the model's own chat template
-    // (from GGUF metadata) is applied before tokenizing.
+    // chat-template mode (like llama-cli -cnv): STEP_PROFILE_CHAT_FILE = the user
+    // message; the model's own template (GGUF metadata) is applied before tokenizing
     const char * chat_file = getenv("STEP_PROFILE_CHAT_FILE");
     if (chat_file != nullptr && chat_file[0] != '\0') {
         std::ifstream fin(chat_file);
@@ -415,9 +396,8 @@ int main(int argc, char ** argv) {
 
     auto * smpl = common_sampler_init(model, params.sampling);
 
-    // routing capture (the library-side writer is retired; see llama-ext.h):
-    // capture the route observer's rows into the env-named CSV,
-    // one line per (step, layer): "step,layer,expert_ids"
+    // routing capture (the library-side writer is retired): write the route
+    // observer's rows as "step,layer,expert_ids"
     const char * route_path = getenv("GGML_EXPPOOL_ROUTING_LOG");
     if (route_path != nullptr && route_path[0] != '\0') {
         g_route.fp = fopen(route_path, "w");
@@ -427,8 +407,8 @@ int main(int argc, char ** argv) {
         }
     }
 
-    // sync-after-decode (default on): llama_decode is async; the wall clock is
-    // read after a device sync so it measures real execution, not submission.
+    // sync-after-decode (default on): the wall is read after a device sync, so it
+    // measures real execution
     const bool no_sync = getenv("STEP_PROFILE_NO_SYNC") != nullptr;
     if (no_sync) {
         LOG_WRN("%s: STEP_PROFILE_NO_SYNC=1 - wall_ms is submission time, not execution\n", __func__);
@@ -441,8 +421,7 @@ int main(int argc, char ** argv) {
         data.steps.back().layer_cat[CAT_EXPERT].resize(data.n_layers, 0.0);
 
         const int64_t t0 = ggml_time_us();
-        // long prompts: feed in n_batch-sized chunks (llama_decode rejects a
-        // batch larger than n_batch); the step-0 wall covers the whole prompt
+        // long prompts: feed in n_batch-sized chunks (llama_decode rejects a larger batch)
         const int32_t n_chunk = params.n_batch > 0 ? (int32_t) params.n_batch : (int32_t) tokens.size();
         for (size_t off = 0; off < tokens.size(); off += (size_t) n_chunk) {
             int32_t n = n_chunk;
