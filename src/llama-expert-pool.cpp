@@ -12,10 +12,7 @@
 
 // ---- per-context pool plumbing ----
 
-// the CPU moe delegate is a single process-wide hook and the model weight
-// tensors are shared across contexts of the same model, so the graph being
-// computed must identify its own pool: llama_context::graph_compute marks
-// the calling thread, the delegate resolves its state from here
+// per-context pool plumbing
 static thread_local llama_expert_pool_state * g_current_pool = nullptr;
 
 llama_expert_pool_state * llama_expert_pool_set_current(llama_expert_pool_state * st) {
@@ -24,8 +21,7 @@ llama_expert_pool_state * llama_expert_pool_set_current(llama_expert_pool_state 
     return prev;
 }
 
-// route observer (llama-ext.h, fork-private): the split-head observer forwards the
-// clean topk rows to it; set once at tool init, read from compute threads.
+// route observer (llama-ext.h, fork-private): gets the clean topk rows; set once at init.
 static llama_expert_pool_route_fn g_route_cb = nullptr;
 static void *                     g_route_ud = nullptr;
 
@@ -87,12 +83,10 @@ void llama_expert_pool_state::reset() {
     mirror_ready.store(-1);
     mirror_pub.store(-1);
 
-    // stop the swap worker (if running)
     stop_worker();
 }
 
 void llama_expert_pool_state::stop_worker() {
-    // signal + drain the route queue + join; also safe when no worker runs
     {
         std::lock_guard<std::mutex> lk(route_mtx);
         route_stop = true;
@@ -105,10 +99,8 @@ void llama_expert_pool_state::stop_worker() {
     route_stop = false;
 }
 
-// push a step marker: the rows previously queued now belong to a complete
-// step and the worker may settle them. hook thread only, except the
-// segment-end drain in llama_context::expert_pool_finalize (no decode in
-// flight there, so no hook can race it).
+// push a step marker: the queued rows are a complete step. hook thread only,
+// except the segment-end drain in llama_context::expert_pool_finalize.
 void llama_expert_pool_push_marker(llama_expert_pool_state & st) {
     llama_expert_pool_state::route_block m;
     m.step = st.hook_step;
@@ -120,8 +112,7 @@ void llama_expert_pool_push_marker(llama_expert_pool_state & st) {
     st.route_cv.notify_one();
 }
 
-// push the layer's FULL activation row (clean topk ids, no -1 recovery).
-// observer thread only; the queue lock is brief.
+// push the layer's full activation row (clean topk ids). observer thread only.
 static void route_push_row(llama_expert_pool_state & st, int32_t step, int32_t ilx,
                            const int32_t * ids, int32_t n_used, int32_t n_tok) {
     if (ids == nullptr || n_used <= 0 || n_tok <= 0) {
@@ -133,7 +124,6 @@ static void route_push_row(llama_expert_pool_state & st, int32_t step, int32_t i
     rb.n_tok = n_tok;
     rb.ids.reserve((size_t) n_used * (size_t) n_tok);
     // the row is the contiguous [n_used*n_tok, 1] I32 copy of the topk output
-    // (shape guard at the observer): every entry is an expert id
     for (int64_t i = 0; i < (int64_t) n_used * (int64_t) n_tok; ++i) {
         const int32_t o = ids[i];
         if (o >= 0 && o < st.n_expert) {
@@ -150,11 +140,9 @@ static void route_push_row(llama_expert_pool_state & st, int32_t step, int32_t i
     st.route_cv.notify_one();
 }
 
-// start the swap worker thread (one per pool). the worker consumes the
-// route rows, owns the activation counters and the top-k refresh, performs
-// the H2D weight copies (sync tensor_set on its own thread - the inference
-// thread and the main graph stream never wait for it), and rebuilds the
-// table mirror for the hook to publish. runaway workers are drained on reset().
+// start the swap worker thread (one per pool): consumes the route rows, owns
+// the counters and the refresh, performs the H2D copies on its own thread (the
+// inference thread never waits), rebuilds the table mirror. drained by reset().
 namespace { void swap_copy_one_sync(ggml_backend_t, ggml_tensor *, ggml_tensor *, int32_t, int32_t, int); }
 
 void llama_expert_pool_start_worker(llama_expert_pool_state & st) {
@@ -169,27 +157,22 @@ void llama_expert_pool_start_worker(llama_expert_pool_state & st) {
                 st.route_cv.wait(lk, [&st]() { return st.route_stop || !st.route_q.empty(); });
                 if (st.route_stop) {
                     // drain before exit: settle every marker queued before the
-                    // stop so no counted step is lost (finalize pushes a final
-                    // marker for the tail rows first; teardown paths clear the
-                    // queue, so this is a no-op there)
+                    // stop so no counted step is lost (no-op on teardown paths)
                     lk.unlock();
                     while (llama_expert_pool_worker_settle(st)) {
                     }
                     return;
                 }
             }
-            // settle every marker queued so far (each marker completes the
-            // previous step; a slow worker drains the backlog step by step)
+            // settle every marker queued so far (a slow worker drains the backlog)
             while (llama_expert_pool_worker_settle(st)) {
             }
         }
     });
 }
 
-// parse seed csv: one line per layer "il,e1,e2,...". layers missing from the
-// file get zero slots (full CPU fallback); the per-layer slot count is the
-// line length, i.e. the pool file itself defines the budget distribution.
-// returns false only on open failure.
+// parse seed csv: one line per layer "il,e1,e2,..."; the line length is that
+// layer's slot count, missing layers get zero. false only on open failure.
 bool llama_expert_pool_parse_init(const std::string & path, int32_t n_layer,
                                   int32_t n_expert,
                                   std::vector<std::vector<int32_t>> & resident) {
@@ -203,7 +186,6 @@ bool llama_expert_pool_parse_init(const std::string & path, int32_t n_layer,
         std::istringstream ss(line);
         std::string tok;
         std::getline(ss, tok, ',');
-        // skip comment/empty lines
         if (tok.empty() || tok[0] == '#') {
             continue;
         }
@@ -234,9 +216,7 @@ bool llama_expert_pool_parse_init(const std::string & path, int32_t n_layer,
     return true;
 }
 
-// random resident set per layer (fixed seed for reproducibility); samples
-// without replacement so every slot holds a distinct expert. `widths` is
-// indexed by layer number (0 = layer not pooled)
+// random resident set (fixed seed); `widths` indexed by layer (0 = not pooled)
 void llama_expert_pool_random(int32_t n_layer, int32_t n_expert,
                               const std::vector<int32_t> & widths,
                               std::vector<std::vector<int32_t>> & resident) {
@@ -259,14 +239,11 @@ void llama_expert_pool_random(int32_t n_layer, int32_t n_expert,
     }
 }
 // -----------------------------------------------------------------------------
-// split-head observation: the scheduler reports every split's head node right
-// before it runs. the pool reads its statistics from the registered heads, and the
-// route observer (llama-ext.h) forwards the same rows - in the lane form via one
-// small D2H per layer per step, where the clean rows do not cross on their own.
+// split-head observation: the scheduler reports every split's head right before it
+// runs; the pool reads its statistics there (in the lane form via one small D2H).
 // -----------------------------------------------------------------------------
 
-// match a split head: the pool's registered tensors first, then a foreign expert
-// mmid (a run without a pool) - its layer comes from the weight name.
+// match a split head: registered tensors first, then a foreign expert mmid (layer from the weight name)
 static bool split_head_match(llama_expert_pool_state & st, ggml_tensor * head,
                              int32_t & il, int32_t & ilx, bool & lane, bool & registered) {
     il = -1;
@@ -285,8 +262,7 @@ static bool split_head_match(llama_expert_pool_state & st, ggml_tensor * head,
         head->src[2]->type != GGML_TYPE_I32 || head->src[0]->name == nullptr) {
         return false;
     }
-    // "BACKEND#" prefixes a staged copy (above the offload threshold only, where
-    // no one-token row is forwarded)
+    // a "BACKEND#" prefix marks a staged copy (above the threshold only)
     if (sscanf(head->src[0]->name, "blk.%d.", &il) != 1 &&
         sscanf(head->src[0]->name, "%*[^#]#blk.%d.", &il) != 1) {
         il = -1;
@@ -357,8 +333,7 @@ void llama_expert_pool_observe_split_head(void * user_data, ggml_tensor * head, 
     int32_t n_tok = 0;
     const int32_t * ids = split_head_rows(st, head, backend, il, lane, registered, n_used, n_tok);
 
-    // route observer (llama-ext.h): one row per (step, layer), one-token batches
-    // only; a layer index that moves backwards marks a new step
+    // route observer: one row per (step, layer), one-token batches only
     if (ids != nullptr && g_route_cb != nullptr && n_tok == 1) {
         const int32_t prev = st.rtlog_prev_il;
         st.rtlog_prev_il = il;
@@ -377,19 +352,15 @@ void llama_expert_pool_observe_split_head(void * user_data, ggml_tensor * head, 
     if (st.stat.empty()) {
         st.stat.assign(st.pooled_layers.size(), llama_expert_pool_counts{});
     }
-    // step-advance: the first active-mount layer follows the previous step's last
-    // one (a graph's splits run in layer order)
+    // step-advance: splits run in layer order, so this follows the previous step's last
     const bool first_of_step = ilx == st.first_active_ilx && st.step_done;
     if (first_of_step) {
         st.step_done = false;
-        // new step: re-arm the per-layer gate (a single active layer would
-        // otherwise be skipped forever after its first count)
+        // new step: re-arm the per-layer gate (a single active layer would stick)
         st.last_ilx = -1;
         if (st.swap_auto) {
-            // publish the worker's latest ready mirror (the only table write point;
-            // no ready mirror = the tables keep the old mapping)
+            // publish the ready mirror (the only table write point; none ready = keep the old mapping)
             llama_expert_pool_tab_publish(st);
-            // step marker: the worker may settle the rows queued before it
             llama_expert_pool_push_marker(st);
             st.hook_step += 1;
         }
@@ -399,8 +370,7 @@ void llama_expert_pool_observe_split_head(void * user_data, ggml_tensor * head, 
     if (st.swap_auto) {
         route_push_row(st, st.hook_step, ilx, ids, n_used, n_tok);
     }
-    // hit/miss from the inverse half of the PUBLISHED table (resident maps to -1,
-    // exactly what this graph read)
+    // hit/miss from the inverse half of the published table (what this graph read)
     const int32_t pub = st.mirror_pub.load(std::memory_order_acquire);
     if (st.direct_mount && pub >= 0 && pub < 3 && !st.tab_mirror[pub].empty()) {
         const int32_t * inv = st.tab_mirror[pub].data() +
@@ -419,16 +389,14 @@ void llama_expert_pool_observe_split_head(void * user_data, ggml_tensor * head, 
             }
         }
     }
-    // the LAST layer with an active mount completes the step (single-layer-safe
-    // detection: a 0-slot layer has no mount and is never reported, so the
-    // anchor is not always the last pooled index)
+    // the LAST active-mount layer completes the step: a 0-slot layer has no mount
+    // and is never reported, so the anchor is not always the last pooled index
     if (ilx == st.last_active_ilx) {
         st.step_done = true;
     }
 }
 
-// graph-builder side of the registry: %il ascends within one build, so a decreasing
-// index means a new graph - no pointer survives its graph.
+// %il ascends within one build: a decreasing index means a new graph, and no pointer survives its graph
 static void bind_new_build(const llama_expert_pool_state & st, int32_t il) {
     if (il < st.bind_last_il) {
         st.split_head_refs.clear();
@@ -485,31 +453,26 @@ void swap_copy_one_sync(ggml_backend_t be, ggml_tensor * src, ggml_tensor * pw, 
     const size_t sz = llama_expert_pool_stride(src, k);
     const char * data = (const char *) src->data + e * llama_expert_pool_stride(src, k);
     const size_t off  = slot * llama_expert_pool_stride(pw, k);
-    // SYNC copy: the worker blocks only its own thread, and the settled step
-    // publishes the result into the mirror (the tables change at the next
-    // hook publish, so no torn slot is ever readable by a graph).
+    // SYNC copy: only the worker's thread blocks; the result reaches the tables
+    // at the next hook publish, so no torn slot is ever readable by a graph.
     ggml_backend_tensor_set(pw, data, off, sz);
 }
 
 } // namespace
 
-// rebuild the merged host mirror from resident[] (worker thread only) and
-// mark it ready, tagged with the next sequence number. mirror layout:
-// [2*n_expert, n_layers]; layer il = [il*2*n_expert + e] remap, [+n_expert]
-// remap_inv (the inv half feeds tab_cpu). the tables themselves are NOT
-// written here. returns the sequence number of the built mirror.
+// rebuild the merged host mirror from resident[] (worker thread only), mark it
+// ready, return its sequence number. layout: [2*n_expert, n_layers]; layer il =
+// [il*2*n_expert + e] remap, [+n_expert] remap_inv. no tensor writes here.
 int32_t llama_expert_pool_tab_build(llama_expert_pool_state & st) {
     if (st.tab_all == nullptr) {
         return st.seq_ctr;
     }
     const int32_t n_expert = st.n_expert;
-    // one half of the mirror (the remap block or the inv block). the tables live
-    // in one tensor of 2*n_layers columns, so derive the half from the layer
-    // count, not from the tensor's shape.
+    // one half of the mirror; the tables live in one tensor of 2*n_layers
+    // columns, so derive the half from the layer count, not from its shape
     const size_t n_half = (size_t) st.n_expert * st.layers.size();
-    // pick a free mirror slot: never the ready one (the hook may not have
-    // published it yet) and never the published one (its set_async may still
-    // be in flight). three slots, so at most two are busy - no waiting.
+    // pick a free mirror slot: never the ready one (not published yet) nor the
+    // published one (its set_async may be in flight); three slots, no waiting
     const int32_t ready = st.mirror_ready.load(std::memory_order_acquire);
     const int32_t pub   = st.mirror_pub.load(std::memory_order_acquire);
     int32_t k = -1;
@@ -553,14 +516,10 @@ int32_t llama_expert_pool_tab_build(llama_expert_pool_state & st) {
     return st.seq_ctr;
 }
 
-// publish the ready mirror (hook thread only, at a step boundary): the GPU
-// table write uses the BACKEND iface so it is stream-ordered after all
-// in-flight compute on the main stream, and it is queued before the current
-// step's remaining GPU segments submit (the hook runs before the sched
-// resumes, see run_swap in the previous form). no host sync: the worker only
-// reuses a published slot after another publish cycle (mirror slot rules).
-// the CPU-hosted copy is a sync set - same-thread ordering with the miss
-// chain's get_rows reads, exactly as before.
+// publish the ready mirror (hook thread only, at a step boundary): the GPU table
+// write goes through the BACKEND iface so it is stream-ordered after all in-flight
+// compute and queued before the step's remaining GPU segments submit; no host sync
+// (the mirror slot rules keep the source alive). the CPU copy is a sync set.
 void llama_expert_pool_tab_publish(llama_expert_pool_state & st) {
     if (st.tab_all == nullptr) {
         return;
@@ -581,20 +540,14 @@ void llama_expert_pool_tab_publish(llama_expert_pool_state & st) {
 
 // top-k refresh + two-phase slot fill + mirror rebuild (worker thread only).
 //
-// each settled step, every pooled layer's resident set converges towards the k
-// highest-scoring experts (k = slot count): the new top-k is the experts with
-// a positive count ranked descending (zero-count experts never evict
-// anything), incoming experts take the empty slots first, then the slots of
-// resident experts that fell out of the top-k (coldest first). the pairs are
-// executed globally in count order, descending, until the per-step pair limit
-// (swap_per_step, negative = unlimited) is exhausted.
+// every settled step each pooled layer's resident set converges towards the k
+// highest-scoring experts (k = slot count): the top-k is the positive-count experts
+// ranked descending, incoming experts take empty slots first, then the coldest
+// incumbent that fell out; pairs run globally in count order until swap_per_step.
 //
-// an exchange spans two settles, because the tables map an expert onto its
-// slot and a graph reads the slot through that mapping: settle N unmaps the
-// victim (res = -1, which the mirror rebuild turns into "no expert maps
-// here"), the hook publishes that mirror at the step boundary, and only then
-// settle N+1 - guarded by the published sequence - writes the weights and
-// remaps the slot.
+// an exchange spans two settles: settle N unmaps the victim (res = -1), the hook
+// publishes that mirror at the step boundary, and only then - guarded by the
+// published sequence - settle N+1 writes the weights and remaps the slot.
 static int32_t worker_decide_and_copy(llama_expert_pool_state & st) {
     const int32_t P = (int32_t) st.pooled_layers.size();
     const int32_t n_expert = st.n_expert;
@@ -610,8 +563,7 @@ static int32_t worker_decide_and_copy(llama_expert_pool_state & st) {
     std::vector<pair_t> queue;
     queue.reserve(P);
 
-    // a slot whose fill is still waiting for its unmap to be published is
-    // owned by the pending queue - never plan it again
+    // a slot with a pending fill is owned by the pending queue - never plan it again
     auto slot_pending = [&](int32_t il, int32_t slot) {
         for (const auto & p : st.pend_fill) {
             if (p.il == il && p.slot == slot) {
@@ -655,8 +607,7 @@ static int32_t worker_decide_and_copy(llama_expert_pool_state & st) {
         if (res.empty()) {
             continue;
         }
-        // the refresh only affects layers with an active mount; others run
-        // the plain CPU chain, so swapping their resident set is a no-op
+        // only layers with an active mount are refreshed (others run the plain path)
         const llama_expert_pool_mount & mnt = st.mount(il);
         if (!mnt.active) {
             continue;
@@ -694,10 +645,8 @@ static int32_t worker_decide_and_copy(llama_expert_pool_state & st) {
                 in.emplace_back(hot[i].first, e);
             }
         }
-        // outgoing slots: empty slots first (an empty slot has no incumbent
-        // to lose), then resident experts outside the new top-k, coldest
-        // first; when the top-k is smaller than K, slots beyond it keep
-        // their content - the pool only fills, it never shrinks
+        // outgoing slots: empty first (no incumbent to lose), then residents
+        // outside the new top-k, coldest first; the pool only fills, never shrinks
         std::vector<int32_t> empty;
         std::vector<std::pair<float, int32_t>> out; // (cnt, slot)
         for (int32_t s = 0; s < K; ++s) {
@@ -721,8 +670,7 @@ static int32_t worker_decide_and_copy(llama_expert_pool_state & st) {
             queue.push_back({ilx, in[i].second, slot, in[i].first});
         }
     }
-    // execute the queue in count order, descending, until the
-    // per-step pair limit: the first pair over the limit stops the batch
+    // execute in count order, descending, until the per-step limit is passed
     const int32_t limit = st.swap_per_step < 0 ? -1 : st.swap_per_step;
     std::sort(queue.begin(), queue.end(), [](const pair_t & a, const pair_t & b) {
         if (a.cnt != b.cnt) return a.cnt > b.cnt;
@@ -751,8 +699,7 @@ static int32_t worker_decide_and_copy(llama_expert_pool_state & st) {
                 __func__, il, p.slot, st.settled_steps, victim_e, p.e, p.cnt);
     }
     if (filled > 0 || planned > 0) {
-        // the mirror built here carries the unmaps of the planned victims;
-        // tag the fills queued above with its sequence so they wait for it
+        // tag the fills queued above with this mirror's sequence so they wait for it
         const int32_t seq = llama_expert_pool_tab_build(st);
         for (auto & p : st.pend_fill) {
             if (p.seq == 0) {
@@ -769,17 +716,14 @@ static int32_t worker_decide_and_copy(llama_expert_pool_state & st) {
     return filled;
 }
 
-// settle one queued step marker: drain the route rows pushed before it (the
-// previous step's FULL activation counts), decay the counters and count the
-// rows in, run the top-k refresh decisions, and rebuild the mirror. worker
-// thread only; the hook never touches act_cnt/resident.
+// settle one queued step marker: drain the rows pushed before it, decay and count
+// them, run the refresh, rebuild the mirror. worker thread only.
 bool llama_expert_pool_worker_settle(llama_expert_pool_state & st) {
     std::vector<llama_expert_pool_state::route_block> rows;
     {
         std::lock_guard<std::mutex> lk(st.route_mtx);
-        // find the first marker WITHOUT consuming anything: rows are only
-        // complete once their marker arrives, so an early wake (rows pushed,
-        // marker not yet) must leave the queue untouched.
+        // find the first marker WITHOUT consuming: rows are only complete once
+        // their marker arrives, so an early wake must leave the queue untouched
         size_t nrows = 0;
         for (; nrows < st.route_q.size() && st.route_q[nrows].ilx >= 0; ++nrows) {
         }
@@ -797,20 +741,17 @@ bool llama_expert_pool_worker_settle(llama_expert_pool_state & st) {
         // a marker with no rows (the first step marker): nothing settled.
         return true;
     }
-    // lazy allocation of the counters (the rows are the first thing the worker
-    // sees)
+    // lazy allocation of the counters
     if (st.act_cnt.empty() && !st.pooled_layers.empty()) {
         st.act_cnt.assign((size_t) st.pooled_layers.size() * st.n_expert, 0.0f);
     }
-    // count the rows by their own step id. a lagging worker may drain rows
-    // of several old steps at once (multiple markers queued), so group by
-    // step: each step gets one decay tick, then its rows land.
+    // count by the rows' own step id: a lagging worker may drain several old
+    // steps at once, so each step gets one decay tick and then its rows land
     size_t i = 0;
     while (i < rows.size()) {
         const int32_t t = rows[i].step;
-        // one decay tick per settled step, then the step's rows land with
-        // per-token normalized increments, so a batch of n token columns
-        // contributes one step's worth of evidence instead of n
+        // one decay tick per settled step; the rows land with 1/n_tok increments,
+        // so a batch of n columns contributes one step's worth of evidence
         const float lam = st.swap_lambda;
         for (float & c : st.act_cnt) {
             c *= lam;
@@ -824,14 +765,12 @@ bool llama_expert_pool_worker_settle(llama_expert_pool_state & st) {
             }
         }
         i = j;
-        // the refresh runs after this step's rows are counted: the decision
-        // sees the settled step and reaches the graph 1-2 steps later (the
-        // tables are published by the hook at a step boundary).
+        // the refresh runs after this step's rows are counted, and reaches the
+        // graph 1-2 steps later (the hook publishes at a step boundary)
         const int32_t delta = worker_decide_and_copy(st);
         st.settled_steps = t + 1;
-        // per-exchange lines: the pair detail (TRACE) and the per-step count
-        // (DEBUG). the INFO level gets a PERIODIC average instead of per-step
-        // noise. print_timings-style: every 64 steps, one average line.
+        // per-exchange lines at TRACE/DEBUG; INFO gets a periodic average
+        // instead of per-step noise (print_timings-style, every 64 steps)
         if (delta > 0) {
             LLAMA_LOG_INFV(LLAMA_LOG_VERBOSITY_DEBUG,
                     "%s: swap step %d: swapped %d\n",
@@ -844,8 +783,6 @@ bool llama_expert_pool_worker_settle(llama_expert_pool_state & st) {
             st.swap_sum = 0;
         }
     }
-    // the pool hit rate is printed once at the end of the generation segment
-    // by llama_expert_pool_finalize; the segment counters accumulate across the
-    // segment (no per-swap reset here)
+    // the hit rate is printed once at segment end by expert_pool_finalize
     return true;
 }
