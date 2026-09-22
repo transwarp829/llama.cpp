@@ -27,6 +27,15 @@ inline int32_t llama_expert_pool_offload_min_batch() {
     return v;
 }
 
+// miss method (llama_expert_pool_params::miss_method). the threshold above
+// which the miss chain always goes to the pool device is upstream's and
+// applies to every method; these only decide the range below it.
+enum llama_expert_pool_miss_method {
+    LLAMA_EXPERT_POOL_MISS_CPU_SERIAL   = 0, // CPU chain as one split (delivery)
+    LLAMA_EXPERT_POOL_MISS_CPU_PARALLEL = 1, // mount chain submitted ahead of the CPU chain
+    LLAMA_EXPERT_POOL_MISS_GPU          = 2, // miss rows on the pool device at every batch size
+};
+
 // minimum slots per pooled layer (desert rule): below this width a mounted
 // layer pays the per-layer roundtrip tax for near-zero hits, so the budget
 // form that did not name the layer count trims the layer set instead of
