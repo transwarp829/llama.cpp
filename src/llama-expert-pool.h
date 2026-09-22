@@ -37,25 +37,6 @@ inline int32_t llama_expert_pool_min_slots(int32_t n_expert) {
     return (n_expert + 99) / 100;
 }
 
-// the CPU MoE delegate is one process-wide slot, refcounted across pools.
-// acquiring registers the hook, destroying releases it, so a pool never has to
-// remember whether it holds the registration
-void llama_expert_pool_delegate_register();
-void llama_expert_pool_delegate_unregister();
-
-struct llama_expert_pool_delegate_ref {
-    llama_expert_pool_delegate_ref() = default;
-    ~llama_expert_pool_delegate_ref() { release(); }
-
-    llama_expert_pool_delegate_ref(const llama_expert_pool_delegate_ref &) = delete;
-    llama_expert_pool_delegate_ref & operator=(const llama_expert_pool_delegate_ref &) = delete;
-
-    void acquire() { if (!held) { held = true; llama_expert_pool_delegate_register();   } }
-    void release() { if ( held) { held = false; llama_expert_pool_delegate_unregister(); } }
-
-    bool held = false;
-};
-
 // ---------------------------------------------------------------
 // direct mount (main-graph execution): per-layer tensors that let
 // build_moe_ffn run a second, GPU-resident chain over the pool
@@ -176,11 +157,6 @@ struct llama_expert_pool_state {
 
     // set once the pool weights/tables have been copied (idempotent fill):
     // part of the phase below
-
-    // the CPU MoE delegate registration belongs to this state: the ref
-    // registers on acquire() and unregisters in its destructor, so teardown
-    // order releases it and no flag tracks whether we hold it
-    llama_expert_pool_delegate_ref delegate_ref;
 
     // direct mount: a second GPU-resident
     // expert chain runs inside the main graph; the -1 skip ids zero the

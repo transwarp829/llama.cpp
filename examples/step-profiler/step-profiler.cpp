@@ -21,7 +21,7 @@
 
 // --- expert-pool routing capture (GGML_EXPPOOL_ROUTING_LOG) -----------------
 // the library no longer writes routing files; the route observer fans out the
-// ids served by the CPU MoE delegate (decode rows) and this tool owns the CSV.
+// clean topk rows of each (step, layer) (decode rows) and this tool owns the CSV.
 struct route_capture {
     FILE *   fp = nullptr;
     uint64_t step = 0;
@@ -416,7 +416,7 @@ int main(int argc, char ** argv) {
     auto * smpl = common_sampler_init(model, params.sampling);
 
     // routing capture (the library-side writer is retired; see llama-ext.h):
-    // capture the ids the CPU MoE delegate serves into the env-named CSV,
+    // capture the route observer's rows into the env-named CSV,
     // one line per (step, layer): "step,layer,expert_ids"
     const char * route_path = getenv("GGML_EXPPOOL_ROUTING_LOG");
     if (route_path != nullptr && route_path[0] != '\0') {
