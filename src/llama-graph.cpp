@@ -2235,17 +2235,19 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             // inverse table for the miss chain: resident -> -1, non-resident ->
             // expert id, so the miss mul_mat_id zeroes the hit columns natively
             // (the -1 skip ids) and computes exactly the miss columns. which
-            // copy is read follows the same threshold the scheduler uses for
-            // the miss mmids:
-            // - below it the miss chain runs on the CPU: read the CPU-HOSTED
-            //   copy and pin the gather there (on the raw output, before the
-            //   reshape view is created). the GPU-side output slot is shared
-            //   with the pool remap and is not A1-final, so a cross-side read
-            //   of it would race the pool chain.
-            // - at/above it the scheduler offloads the miss mmids to the pool
-            //   device: gather from the device-side inv half instead, so the
-            //   ids never leave the device (no CPU segment, no 32B H2D).
-            const bool miss_on_cpu = n_tokens < llama_expert_pool_offload_min_batch();
+            // copy is read follows where the miss mmids run (method first,
+            // then the threshold):
+            // - a cpu method below the threshold keeps them on the CPU: read
+            //   the CPU-HOSTED copy and pin the gather there (on the raw output,
+            //   before the reshape view is created). the GPU-side output slot is
+            //   shared with the pool remap and is not A1-final, so a cross-side
+            //   read of it would race the pool chain.
+            // - otherwise (method gpu, or any method at/above the threshold)
+            //   they run on the pool device: gather from the device-side inv
+            //   half instead, so the ids never leave the device (no CPU segment,
+            //   no 32B H2D).
+            const bool miss_on_cpu = cparams.expert_pool_miss_method != LLAMA_EXPERT_POOL_MISS_GPU &&
+                                     n_tokens < llama_expert_pool_offload_min_batch();
             ggml_tensor * inv_tab = miss_on_cpu ? mnt.remap_inv_host : mnt.remap_inv;
             ggml_tensor * remap_inv_3d = ggml_reshape_3d(ctx0, inv_tab, 1, n_expert, 1);
             ggml_tensor * ids_cpu = ggml_get_rows(ctx0, remap_inv_3d, ids_flat);
@@ -2303,6 +2305,19 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     }
 
+    // miss method gpu: the miss chain's mmids run on the pool device at every
+    // batch size. the weights stay host-resident, so the placement is a
+    // node-level backend override - the scheduler's own rule (a host-weight op
+    // goes to the device above the offload threshold, ggml_backend_offload_op)
+    // would keep them on the CPU below it. the split input copy that follows is
+    // untouched: a host-weight mmid heading its split stages only the used
+    // expert rows, exactly as it does above the threshold.
+    auto pin_miss_mmid = [&](ggml_tensor * t) {
+        if (mount_p != nullptr && cparams.expert_pool_miss_method == LLAMA_EXPERT_POOL_MISS_GPU) {
+            ggml_backend_sched_set_tensor_backend(sched, t, ggml_backend_sched_get_backend(sched, 0));
+        }
+    };
+
     if (chain_weights_in != nullptr) {
         // the mounted chain (chain_only) skips the routing section, so the
         // routing weights were never gathered; take the miss chain's weights
@@ -2346,6 +2361,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         if (mount_p != nullptr) {
             // the miss chain's first node (lane form: this staged mmid heads its split)
             llama_expert_pool_bind_split_head(*expert_pool, il, gate_up, /*lane=*/true);
+            pin_miss_mmid(gate_up);
         }
         cb(gate_up, "ffn_moe_gate_up", il);
 
@@ -2378,6 +2394,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         up = build_lora_mm_id(up_exps, cur, selected_experts, up_exps_s); // [n_ff, n_expert_used, n_tokens]
         if (mount_p != nullptr) {
             llama_expert_pool_bind_split_head(*expert_pool, il, up, /*lane=*/true);
+            pin_miss_mmid(up);
         }
         cb(up, "ffn_moe_up", il);
 
@@ -2401,6 +2418,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             cur = build_lora_mm_id(gate_exps, cur, selected_experts, gate_exps_s); // [n_ff, n_expert_used, n_tokens]
             if (mount_p != nullptr) {
                 llama_expert_pool_bind_split_head(*expert_pool, il, cur, /*lane=*/true);
+                pin_miss_mmid(cur);
             }
             cb(cur, "ffn_moe_gate", il);
         } else {
@@ -2516,6 +2534,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     }
     if (mount_p != nullptr) {
         llama_expert_pool_bind_split_head(*expert_pool, il, experts, /*lane=*/true);
+        pin_miss_mmid(experts);
     }
     cb(experts, "ffn_moe_down", il);
 

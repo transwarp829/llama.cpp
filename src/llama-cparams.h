@@ -59,7 +59,7 @@ struct llama_cparams {
     int32_t expert_pool_swap_cap; // max expert pairs swapped in per decode step (0 = freeze, negative = unlimited)
     int32_t expert_pool_layers; // spread the budget over the deepest N MoE layers (0 = all eligible)
     int32_t expert_pool_swap_decay;  // decaying activation counter: half-life in decode steps (default 96)
-    int32_t expert_pool_miss_method; // miss path: 0 = cpu-serial, 1 = cpu-parallel
+    int32_t expert_pool_miss_method; // miss path: 0 = cpu-serial, 1 = cpu-parallel, 2 = gpu
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
 

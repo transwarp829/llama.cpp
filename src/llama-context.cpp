@@ -673,6 +673,27 @@ void llama_context::expert_pool_init() {
     if (n_expert <= 0) {
         return;
     }
+    // miss method gpu needs a device-resident pool: the miss chain's mmids are
+    // pinned to it, and a host pool would run them on the CPU - the method the
+    // user did not ask for. refuse loudly instead of degrading silently.
+    const bool miss_gpu = cparams.expert_pool_miss_method == LLAMA_EXPERT_POOL_MISS_GPU;
+    if (miss_gpu) {
+        bool have_device = false;
+        for (const ggml_backend_buffer_type_t bt : backend_buft) {
+            have_device = have_device || !ggml_backend_buft_is_host(bt);
+        }
+        if (!have_device) {
+            LLAMA_LOG_ERROR("%s: expert pool: miss method gpu needs a device pool, "
+                            "none in this context - expert pool disabled\n", __func__);
+            return;
+        }
+    }
+    // the method governs the range below the offload threshold only: at/above it
+    // every method runs the miss chain on the pool device (upstream's lane)
+    LLAMA_LOG_INFO("%s: expert pool: miss method %s, offload threshold %d\n", __func__,
+            miss_gpu ? "gpu" :
+            cparams.expert_pool_miss_method == LLAMA_EXPERT_POOL_MISS_CPU_PARALLEL ? "cpu-parallel" : "cpu-serial",
+            llama_expert_pool_offload_min_batch());
     // unified memory (iGPU / APUs such as Strix Halo, Intel/AMD integrated,
     // coherent CPU-GPU links): there is nothing to cache - no CPU offload is
     // needed at all, the same memory already holds the experts (-cmoe/-ncmoe
@@ -1240,7 +1261,7 @@ void llama_context::sched_reserve() {
     gf_res_prev_active = nullptr;
 
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
-    ggml_backend_sched_set_layer_parallel(sched.get(), cparams.expert_pool_miss_method == 1);
+    ggml_backend_sched_set_layer_parallel(sched.get(), cparams.expert_pool_miss_method == LLAMA_EXPERT_POOL_MISS_CPU_PARALLEL);
     // serves the pool's statistics and the route observer: with or without a pool
     ggml_backend_sched_set_split_head_observer(sched.get(), llama_expert_pool_observe_split_head, &expert_pool_state);
 
@@ -1284,7 +1305,7 @@ void llama_context::sched_reserve() {
                 LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
                 cparams.pipeline_parallel = false;
                 sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
-                ggml_backend_sched_set_layer_parallel(sched.get(), cparams.expert_pool_miss_method == 1);
+                ggml_backend_sched_set_layer_parallel(sched.get(), cparams.expert_pool_miss_method == LLAMA_EXPERT_POOL_MISS_CPU_PARALLEL);
                 // serves the pool's statistics and the route observer: with or without a pool
                 ggml_backend_sched_set_split_head_observer(sched.get(), llama_expert_pool_observe_split_head, &expert_pool_state);
                 gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
