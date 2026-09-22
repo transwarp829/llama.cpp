@@ -2556,7 +2556,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         build_mount_block();
     }
 
-    // shared expert output [n_embd, n_used, T]: the mount (hit) columns and
+    // merged expert output [n_embd, n_used, T]: the mount (hit) columns and
     // the CPU miss columns are mutually exclusive (-1 skip ids), so a single
     // element-wise add is exact per column (0 + x == x) - no scatter needed.
     // the whole weighting + aggregation then happens ONCE on the GPU segment,
@@ -2565,23 +2565,23 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // fewer). the layer tail (merge + residual + norm) folds in after.
     ggml_tensor * moe_out = experts;
     if (mount_out != nullptr) {
-        ggml_tensor * shared = ggml_add(ctx0, mount_out, experts);
-        cb(shared, "ffn_moe_shared", il);
-        ggml_backend_sched_set_tensor_backend(sched, shared,
+        ggml_tensor * merged = ggml_add(ctx0, mount_out, experts);
+        cb(merged, "ffn_moe_merged", il);
+        ggml_backend_sched_set_tensor_backend(sched, merged,
                                               ggml_backend_sched_get_backend(sched, 0));
         // scale first, weights second: the plain path scales the down output
         // inside build_lora_mm_id and applies the router weights afterwards, so
         // this order keeps the per-column arithmetic bit-equal to the no-pool
         // path (same node count, only the order changes)
         if (mount_scale != nullptr) {
-            shared = ggml_mul(ctx0, shared, mount_scale);
-            cb(shared, "ffn_moe_scaled", il);
+            merged = ggml_mul(ctx0, merged, mount_scale);
+            cb(merged, "ffn_moe_scaled", il);
         }
         if (!weight_before_ffn) {
-            shared = ggml_mul(ctx0, shared, weights);
-            cb(shared, "ffn_moe_weighted", il);
+            merged = ggml_mul(ctx0, merged, weights);
+            cb(merged, "ffn_moe_weighted", il);
         }
-        moe_out = shared;
+        moe_out = merged;
     }
 
     ggml_tensor * cur_experts[LLAMA_MAX_EXPERTS] = { nullptr };
