@@ -10,17 +10,6 @@
 #include <random>
 #include <sstream>
 
-// ---- per-context pool plumbing ----
-
-// per-context pool plumbing
-static thread_local llama_expert_pool_state * g_current_pool = nullptr;
-
-llama_expert_pool_state * llama_expert_pool_set_current(llama_expert_pool_state * st) {
-    llama_expert_pool_state * prev = g_current_pool;
-    g_current_pool = st;
-    return prev;
-}
-
 // route observer (llama-ext.h, fork-private): gets the clean topk rows; set once at init.
 static llama_expert_pool_route_fn g_route_cb = nullptr;
 static void *                     g_route_ud = nullptr;
