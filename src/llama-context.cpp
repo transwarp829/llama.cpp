@@ -883,7 +883,9 @@ void llama_context::expert_pool_build() {
     // same topology. the tables are plain pool-buffer tensors (created before the
     // alloc below); their content is written by expert_pool_fill().
     // NOTE: the gates below only skip REGISTRATION, never the allocation above.
-    st.mounts.clear();
+    // sized to n_layer_all before any mount is written, so a reference taken
+    // here stays valid for the whole run
+    st.mounts.assign(model.hparams.n_layer_all, llama_expert_pool_mount{});
     st.direct_mount = true;
     for (int32_t il : pooled_ils) {
         const int32_t s_il = (int32_t) st.resident[il].size();
