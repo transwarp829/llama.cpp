@@ -2025,10 +2025,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     const int64_t n_tokens = cur->ne[1];
     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
 
-    // expert-pool mount mode (chain_only): the caller supplies the selected
-    // experts and the routing weights, so the routing section is skipped and
-    // the chain below (gate/up -> activation -> down) is built exactly as the
-    // main graph would - every model variant is inherited automatically
+    // expert-pool mount mode (chain_only): the caller supplies the ids and the
+    // routing weights, so the routing section is skipped and the chain below
+    // is built exactly as the main graph would - every variant inherited.
     ggml_tensor * selected_experts = selected_experts_in;
 
     ggml_tensor * logits = nullptr;
@@ -2176,76 +2175,49 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     //call early so that topk-moe can be used
     ggml_build_forward_expand(gf, weights);
 
-    // expert-pool direct mount: a second, GPU-resident copy of the expert
-    // chain runs inside THIS graph (chain_only over the pool weights; the
-    // real layer index is passed through, so the activation variants -
-    // including the swiglu_clamp limits - are identical to the main chain).
-    // the -1 skip ids zero a column natively on both
-    // backends, so the split is by construction: the GPU chain ids route
-    // non-resident experts to -1 (zero), the CPU chain ids route resident
-    // experts to -1. the merge is a single add: hit col = 0(cpu) + gpu,
-    // miss col = cpu + 0.
-    // direct mount serves every batch size: decode (T=1) and verify/parallel
-    // batches (T>1) share the same graph.
-    // the mounts come from THIS context's pool: every context owns its own
-    // registry, so a draft graph resolves its own mounts (or none)
-    // batch policy: the mount chain is built for every batch size. the pool's
-    // residency then applies to prefill as well - a pooled layer gathers its
-    // resident experts from the pool and streams only the non-resident ones.
-    // which backend computes the miss columns is NOT decided here: the
-    // scheduler sends the host-weight mmids to the GPU at/above the MoE
-    // offload threshold (upstream selective copy) and keeps them on the CPU
-    // below it, so the method switch needs no knob of its own. that threshold
-    // is GGML_OP_OFFLOAD_MIN_BATCH - the same value the CUDA backend reads.
-    // the layer-parallel split / early submit stays small-batch-only (its gate
-    // lives in the scheduler, not here).
+    // expert-pool direct mount: a second, device-resident copy of the expert
+    // chain runs inside THIS graph over the pool weights (chain_only, real layer
+    // index passed through, so every model variant is inherited).
+    // the -1 skip ids split the columns by construction - the device chain sends
+    // non-resident experts to -1, the CPU chain sends resident ones - so one add
+    // merges the two (hit col = 0 + gpu, miss col = cpu + 0).
+    // the mounts come from THIS context's pool (each context owns its registry).
+    // the mount chain is built for every batch size, prefill included: a pooled
+    // layer gathers its residents from the pool and streams only the rest.
+    // which backend computes the miss columns is not decided here: the scheduler
+    // sends host-weight mmids to the device at/above GGML_OP_OFFLOAD_MIN_BATCH
+    // (upstream's lane) and keeps them on the CPU below it.
     if (expert_pool != nullptr && cparams.expert_pool > 0 && il >= 0) {
         const llama_expert_pool_mount & mnt = expert_pool->mount(il);
         if (mnt.active) {
-            // all tables live on the pool device, so every gather runs on the
-            // GPU segment from the same topk ids. ids_cpu and the scale values
-            // are handed to the CPU segment as regular split inputs (32B
-            // each), so the CPU segment stays lookup-free. the I32 tables fill
-            // the mul_mat_id ids directly (get_rows keeps the table type on
+            // all tables live on the device, so every gather runs on the GPU segment
+            // from the same topk ids (ids_cpu and the scale values reach the CPU
+            // segment as 32B split inputs, keeping it lookup-free). the I32 tables
+            // fill the mul_mat_id ids directly (get_rows keeps the table type on
             // every backend, no cast).
-            // the tables are constant (one row per expert, identical for every
-            // token), but get_rows requires src0.ne[2] == ids.ne[1]. instead
-            // of repeating the table over T (an I32 REPEAT has no CUDA kernel
-            // and falls to the CPU segment), flatten the ids to [n_used*T, 1]
-            // so the check holds on the ids side - a single get_rows on the
-            // GPU segment serves every batch size. the topk ids come from
-            // argsort_top_k as a strided view; get_rows tolerates that, a
-            // reshape does not, so copy them into a contiguous tensor first
-            // (I32->I32 cpy is supported on every backend).
+            // get_rows needs src0.ne[2] == ids.ne[1], so the ids are flattened to
+            // [n_used*T, 1] (an I32 REPEAT has no CUDA kernel) and copied contiguous
+            // first (topk is a strided view; get_rows tolerates that, a reshape does
+            // not) - one gather then serves every batch size.
             ggml_tensor * ids_c = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_expert_used, n_tokens);
             ggml_tensor * ids_cpy = ggml_cpy(ctx0, selected_experts, ids_c);
             ggml_tensor * ids_flat = ggml_reshape_2d(ctx0, ids_cpy, n_expert_used * n_tokens, 1);
             // register the layer's clean topk rows for the split-head observer
             llama_expert_pool_bind_ids(*expert_pool, il, (int32_t) n_expert_used, ids_flat);
-            // the pool remap gather (below, GPU segment) and the inverse remap
-            // gather (CPU segment) share this one clean contiguous topk copy;
-            // each side produces its own -1 (pool skip / inverse) locally
+            // both remap gathers share this one clean contiguous topk copy; each side
+            // produces its own -1 locally
             ggml_tensor * remap_3d = ggml_reshape_3d(ctx0, mnt.remap, 1, n_expert, 1);
             ids_remap = ggml_get_rows(ctx0, remap_3d, ids_flat);
             ids_remap = ggml_reshape_2d(ctx0, ids_remap, n_expert_used, n_tokens);
-            // no private copy here: the gather rides inside the mount split,
-            // so stream order reads it before any later reuse of its slot
+            // no private copy: the gather rides inside the mount split
             cb(ids_remap, "ffn_moe_ids_remap", il);
 
-            // inverse table for the miss chain: resident -> -1, non-resident ->
-            // expert id, so the miss mul_mat_id zeroes the hit columns natively
-            // (the -1 skip ids) and computes exactly the miss columns. which
-            // copy is read follows where the miss mmids run (method first,
-            // then the threshold):
-            // - a cpu method below the threshold keeps them on the CPU: read
-            //   the CPU-HOSTED copy and pin the gather there (on the raw output,
-            //   before the reshape view is created). the GPU-side output slot is
-            //   shared with the pool remap and is not A1-final, so a cross-side
-            //   read of it would race the pool chain.
-            // - otherwise (method gpu, or any method at/above the threshold)
-            //   they run on the pool device: gather from the device-side inv
-            //   half instead, so the ids never leave the device (no CPU segment,
-            //   no 32B H2D).
+            // inverse table for the miss chain: resident -> -1, else the expert id, so
+            // the miss mul_mat_id zeroes the hit columns natively. which copy is read
+            // follows the method, then the threshold: a cpu method below it reads the
+            // CPU-HOSTED copy (pinned there; the device slot is shared with the pool
+            // remap and would race), anything else reads the device-side half (the ids
+            // never leave the device).
             const bool miss_on_cpu = cparams.expert_pool_miss_method != LLAMA_EXPERT_POOL_MISS_GPU &&
                                      n_tokens < llama_expert_pool_offload_min_batch();
             ggml_tensor * inv_tab = miss_on_cpu ? mnt.remap_inv_host : mnt.remap_inv;
@@ -2260,23 +2232,19 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             cb(ids_cpu, "ffn_moe_ids_cpu", il);
             mount_ids_cpu = ids_cpu;
 
-            // per-expert down scale: same flat lookup. stays [1, n_used, T]:
-            // the mul broadcasts over n_ff. a 2D reshape would shift the
-            // broadcast and fail can_repeat for T>1 (ne1 8 % T == 0 only for
-            // T in 1,2,4,8).
+            // per-expert down scale: same flat lookup, stays [1, n_used, T] (a 2D
+            // reshape would shift the broadcast and fail can_repeat for T>1)
             if (mnt.scale != nullptr) {
                 ggml_tensor * sc3 = ggml_reshape_3d(ctx0, mnt.scale, 1, n_expert, 1);
                 mount_scale = ggml_get_rows(ctx0, sc3, ids_flat);
                 mount_scale = ggml_reshape_3d(ctx0, mount_scale, 1, n_expert_used, n_tokens);
                 cb(mount_scale, "ffn_moe_scale", il);
-                // call early so the scale lookup precedes the weighted mul:
-                // the CUDA MoE weighted-reduction matcher needs the two muls
-                // adjacent (upstream does the same for the router weights above)
+                // call early so the scale lookup precedes the weighted mul (the CUDA
+                // MoE weighted-reduction matcher needs the two muls adjacent)
                 ggml_build_forward_expand(gf, mount_scale);
             }
-            // factored up/gate scales: same clean-ids gather; consumed
-            // pre-activation on both chains (activation is nonlinear, so the
-            // scale cannot wait until the merge like the down scale does)
+            // factored up/gate scales: same gather, consumed pre-activation on both
+            // chains (activation is nonlinear, so the scale cannot wait for the merge)
             if (mnt.scale_up != nullptr) {
                 ggml_tensor * sc3 = ggml_reshape_3d(ctx0, mnt.scale_up, 1, n_expert, 1);
                 mount_scale_up = ggml_get_rows(ctx0, sc3, ids_flat);
@@ -2290,28 +2258,24 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 cb(mount_scale_gate, "ffn_moe_scale_gate", il);
             }
 
-            // keep the 2D cur for the mount block below: the miss chain
-            // reshapes cur to 3d before its matmuls, so the mount block must
-            // receive the original shape
+            // keep the 2D cur for the mount block: the miss chain reshapes it to 3d
+            // before its matmuls
             cur_mount_in = cur;
             mount_p = &mnt;
 
-            // the mount block is expanded at the end of this function, after the
-            // miss chain: the graph order is front -> CPU miss -> mount -> merge.
-            // build order is not graph order.
+            // the mount block is expanded at the end of this function, after the miss
+            // chain: build order is not graph order
 
         }
     }
 
     }
 
-    // miss method gpu: the miss chain's mmids run on the pool device at every
-    // batch size. the weights stay host-resident, so the placement is a
-    // node-level backend override - the scheduler's own rule (a host-weight op
-    // goes to the device above the offload threshold, ggml_backend_offload_op)
-    // would keep them on the CPU below it. the split input copy that follows is
-    // untouched: a host-weight mmid heading its split stages only the used
-    // expert rows, exactly as it does above the threshold.
+    // miss method gpu: the miss chain's mmids run on the pool device at every batch
+    // size. the weights stay host-resident, so this is a node-level backend override
+    // around the scheduler's own rule (a host-weight op moves to the device only
+    // at/above the offload threshold). the split input copy is untouched: a
+    // host-weight mmid heading its split stages only the used rows.
     auto pin_miss_mmid = [&](ggml_tensor * t) {
         if (mount_p != nullptr && cparams.expert_pool_miss_method == LLAMA_EXPERT_POOL_MISS_GPU) {
             ggml_backend_sched_set_tensor_backend(sched, t, ggml_backend_sched_get_backend(sched, 0));
@@ -2319,29 +2283,23 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     };
 
     if (chain_weights_in != nullptr) {
-        // the mounted chain (chain_only) skips the routing section, so the
-        // routing weights were never gathered; take the miss chain's weights
-        // (weight_before_ffn archs apply them pre-FFN inside the chain)
+        // the mounted chain (chain_only) skipped the routing section, so take the
+        // miss chain's weights
         weights = chain_weights_in;
     }
     if (mount_ids_cpu != nullptr) {
-        // the CPU chain reads the inverse remap: resident columns are -1
-        // (zeroed natively), non-resident columns keep their expert ids
+        // the CPU chain reads the inverse remap: resident columns are -1 (zeroed natively)
         selected_experts = mount_ids_cpu;
-        // the scales would index this ids tensor (it may contain -1,
-        // which get_rows cannot take); they are re-applied per column via
-        // the factored mount_scale_* instead (down at the merge, up/gate
-        // pre-activation at the marker points below)
+        // the scales would index ids that may contain -1 (get_rows cannot take that):
+        // they are re-applied per column via the factored mount_scale_*
         down_exps_s = nullptr;
         up_exps_s   = nullptr;
         gate_exps_s = nullptr;
     }
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
     if (chain_only) {
-        // the mount chain block head marker: the scheduler splits the GPU
-        // segment at this node so the self-contained mount block (cur prep +
-        // chain) becomes its own split, submitted right after the layer front
-        // and therefore running while the CPU miss chain computes.
+        // mount chain block head marker: the scheduler splits the GPU segment here so
+        // the mount block becomes its own split, submitted right after the layer front
         cb(cur, "ffn_moe_mount_cur", il);
     }
 
@@ -2368,9 +2326,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         if (up_exps_s) {
             cb(gate_up, "ffn_moe_gate_up_scaled", il);
         }
-        // factored up scale: same point (post-mm, pre-split), native order
-        // mm -> x scale -> +bias -> activation is preserved on both chains;
-        // skipped (-1) columns are 0 here, so 0 x scale = 0 is exact
+        // factored up scale: same point (post-mm, pre-split), so mm -> x scale -> +bias
+        // -> activation stays native on both chains
         {
             ggml_tensor * fu = chain_only ? chain_scale_up : mount_scale_up;
             if (fu != nullptr) {
@@ -2547,8 +2504,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(experts, "ffn_moe_down_biased", il);
     }
 
-    // chain_only mode: return the raw down output; the caller (expert-pool
-    // mini graph) handles weighting/merging itself on the CPU side
+    // chain_only mode: return the raw down output; the caller handles weighting/merging
     if (chain_only) {
         ggml_build_forward_expand(gf, experts);
         return experts;
@@ -2573,10 +2529,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }
 
         if (mount_scale != nullptr) {
-            // down scale gathered on the GPU segment from the same topk ids and
-            // handed to the CPU segment as a split input; the -1 ids keep the
-            // skipped columns zero on the CPU chain too, so 0*any_scale = 0 -
-            // exact.
+            // down scale: gathered on the GPU segment from the same ids and handed to the
+            // CPU segment; the -1 ids keep skipped columns at 0*scale = 0, exact
             experts = ggml_mul(ctx0, experts, mount_scale);
             cb(experts, "ffn_moe_scaled", il);
         }
@@ -2588,23 +2542,19 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         build_mount_block();
     }
 
-    // merged expert output [n_embd, n_used, T]: the mount (hit) columns and
-    // the CPU miss columns are mutually exclusive (-1 skip ids), so a single
-    // element-wise add is exact per column (0 + x == x) - no scatter needed.
-    // the whole weighting + aggregation then happens ONCE on the GPU segment,
-    // and the dedup sched H2D's the CPU experts block into it (same IO as
-    // the standalone weighted segment, but one split and one weight pass
-    // fewer). the layer tail (merge + residual + norm) folds in after.
+    // merged expert output [n_embd, n_used, T]: the mount (hit) and the CPU miss columns
+    // are mutually exclusive (-1 skip ids), so one element-wise add is exact per
+    // column (0 + x == x) - no scatter. the weighting + aggregation then happens
+    // once on the GPU segment and the layer tail folds in after.
     ggml_tensor * moe_out = experts;
     if (mount_out != nullptr) {
         ggml_tensor * merged = ggml_add(ctx0, mount_out, experts);
         cb(merged, "ffn_moe_merged", il);
         ggml_backend_sched_set_tensor_backend(sched, merged,
                                               ggml_backend_sched_get_backend(sched, 0));
-        // scale first, weights second: the plain path scales the down output
-        // inside build_lora_mm_id and applies the router weights afterwards, so
-        // this order keeps the per-column arithmetic bit-equal to the no-pool
-        // path (same node count, only the order changes)
+        // scale first, weights second: the plain path scales inside build_lora_mm_id and
+        // applies the weights afterwards, so this keeps the per-column arithmetic
+        // bit-equal to the no-pool path
         if (mount_scale != nullptr) {
             merged = ggml_mul(ctx0, merged, mount_scale);
             cb(merged, "ffn_moe_scaled", il);
