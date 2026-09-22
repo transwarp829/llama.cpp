@@ -807,14 +807,11 @@ static bool ggml_is_view_op(enum ggml_op op) {
 #define GGML_SCHED_MAX_COPIES 4
 #endif
 
-// layer-parallel split markers: the llama graph builder tags the mount
-// block head/tail and the moe gate via cb() (src/llama-graph.cpp
-// build_moe_ffn); the scheduler splits on these names. keep both sides in
-// sync when renaming (the gate prefix also covers ffn_moe_gate_up/...).
-// NOTE: the names are a cross-layer contract (ggml cannot include the llama
-// headers), so a rename on one side does not fail loudly - it only stops the
-// mount block from becoming its own split, i.e. the parallel split degrades
-// to the serial delivery form.
+// layer-parallel split markers: the llama builder tags the mount block head/tail
+// and the moe gate via cb(); the sched splits on these names. a rename on one
+// side does not fail loudly - the mount block just stops becoming its own split
+// and the parallel form degrades to the serial delivery (ggml cannot include
+// the llama headers).
 #define SPLIT_MARK_MOUNT_CUR "ffn_moe_mount_cur"
 #define SPLIT_MARK_GATE      "ffn_moe_gate"
 #define SPLIT_MARK_LOGITS    "ffn_moe_logits"
@@ -824,8 +821,8 @@ static bool split_name_is(const struct ggml_tensor * t, const char * prefix) {
     return t != NULL && t->name != NULL && strncmp(t->name, prefix, strlen(prefix)) == 0;
 }
 
-// exact match of "<marker>-<layer>": the mount chain's tail marker is a prefix
-// of the block head's, so a prefix test cannot tell the two apart
+// exact match of "<marker>-<layer>": the mount tail marker prefixes the block
+// head, so a prefix test cannot tell them apart
 static bool split_name_is_marked(const struct ggml_tensor * t, const char * marker) {
     if (t == NULL || t->name == NULL) {
         return false;
@@ -849,9 +846,8 @@ struct ggml_backend_sched_split {
     int inputs_capacity;
     // graph view of this split
     struct ggml_cgraph graph;
-    // this split was already submitted ahead of the current
-    // split (the mounted chain submitted while the CPU miss chain computes);
-    // the main loop skips its input-copy and compute.
+  // this split was submitted ahead (the mount chain, while the CPU miss chain
+  // computes): skip its copy+compute
     bool submitted_early = false;
 };
 
@@ -903,10 +899,8 @@ struct ggml_backend_sched {
 
     bool op_offload;
 
-    // layer-parallel mode (ggml_backend_sched_set_layer_parallel, driven by
-    // --expert-pool-miss-method cpu-parallel):
-    // the pool-chain GPU split and the miss-chain CPU split run concurrently
-    // (the mount split is submitted ahead of the CPU miss chain).
+// layer-parallel mode (--expert-pool-miss-method cpu-parallel): the pool-chain
+// GPU split and the miss-chain CPU split run concurrently
     bool layer_parallel = false;
 
     // fork-private split-head observer (the expert pool's statistics source)
@@ -923,8 +917,8 @@ struct ggml_backend_sched {
     int debug;
 
     // used for debugging graph reallocations [GGML_SCHED_DEBUG_REALLOC]
-    // base size of context_buffer at sched_new: layer-parallel growth is
-    // measured against this (0 = not captured yet)
+// base size of context_buffer at sched_new (layer-parallel growth is measured
+// against it; 0 = not captured yet)
     size_t context_buffer_base_size = 0;
     // ref: https://github.com/ggml-org/llama.cpp/pull/17617
     int debug_realloc;
@@ -1162,11 +1156,8 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     sched->n_graph_inputs = 0;
     sched->is_reset = false;
 
-    // the layer-parallel window deps add up to one view tensor
-    // per graph tensor to the sched context - grow the buffer to fit them.
-    // the extra need is a function of this graph only, so grow against the
-    // fixed base size: recomputing from the current size would add another
-    // 2/node on every call and leak.
+    // the layer-parallel window deps add ~2 views/node to the sched context: grow
+    // against the fixed base size (recomputing from the current size would leak)
     if (sched->layer_parallel) {
         if (sched->context_buffer_base_size == 0) {
             sched->context_buffer_base_size = sched->context_buffer_size;
@@ -1404,9 +1395,8 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         GGML_ASSERT(*cur_backend_id != -1);
     }
 
-    // marker contract (layer-parallel): the mount chain's tail only exists when
-    // a mount block was built, so a tail without a head means the marker names
-    // drifted apart on one side and the split silently stopped happening
+    // marker check: a mount tail without a head means the names drifted and the split
+    // silently stopped happening
     bool saw_mount_tail = false;
     bool saw_mount_head = false;
 
@@ -1414,11 +1404,10 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     {
         int i_split = 0;
         struct ggml_backend_sched_split * split = &sched->splits[0];
-        // batch size of the current layer's moe section (ne[2] of
-        // the gate mmid / the mount block head), for the small-batch gate.
+    // batch of the layer's moe section (ne[2] of the gate mmid / mount head), for the
+    // small-batch gate
         int64_t layer_T = -1;
-        // set on the mount block's tail: the node AFTER it starts a new split
-        // (see the marker scan below)
+    // set on the mount block's tail: the node AFTER it starts a new split
         bool mount_end = false;
         // find the backend of the first split, skipping view ops
         int i = 0;
@@ -1437,9 +1426,9 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
 
             const int node_backend_id = tensor_backend_id(node);
 
-            // pool-scoped relaxation: the mount-block head is a view (reshape)
-            // that forces a boundary and inherits the current backend below.
-            // with layer-parallel off this is the upstream assert verbatim.
+            // pool-scoped relaxation: the mount-block head is a view (reshape) that forces
+            // a boundary and inherits the backend below (upstream assert verbatim when
+            // layer-parallel is off)
             GGML_ASSERT(node_backend_id != -1 || (sched->layer_parallel && ggml_is_view_op(node->op)));
 
             // check if we should start a new split based on the sources of the current node
@@ -1449,26 +1438,18 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 need_new_split = true;
                 mount_end = false;
             }
-            // split the layer's GPU segment so the mounted chain
-            // forms its own split that can be submitted right after the layer
-            // front. the mount block head (ffn_moe_mount_cur, the cur prep) and
-            // its tail (ffn_moe_mount, the mounted down output) mark the block:
-            // everything between them is self-contained (A1-final inputs only,
-            // the id gather lands just before the head, the matmuls ride
-            // inside), so the block is a legal split of its own. the gate
-            // section rides inside the layer's GPU segment (attn + gate + ids
-            // as one split), and the boundary check runs on VIEW ops too (the
-            // prep head is a reshape).
-            // GPU segments only - the CPU miss chain must stay one split. the layer-parallel split/submit is a small-batch feature only: at or above the offload threshold the native path (mmid on GPU, upstream selective expert copy) must behave untouched.
-            // the threshold is the same env the CUDA backend reads (GGML_OP_OFFLOAD_MIN_BATCH, default 32); the batch of a MUL_MAT_ID / the mount block head is its ne[2].
-            // the cut exists only to feed the early submit and is gated with it: callback mode keeps the serial shape (no cut, the mount runs inline).
+            // split the layer's GPU segment so the mounted chain forms its own split,
+            // submittable right after the layer front: the head (ffn_moe_mount_cur, the
+            // cur prep) and the tail (ffn_moe_mount, the down output) mark the block,
+            // and everything between them is self-contained (A1-final inputs only), so
+            // it is a legal split. GPU segments only - the CPU miss chain must stay one
+            // split; gated with the early submit (callback mode keeps the serial shape).
             if (sched->layer_parallel && !sched->callback_eval && node->name != NULL) {
                 const bool is_mount_head = split_name_is(node, SPLIT_MARK_MOUNT_CUR);
                 const bool is_mount_tail = split_name_is_marked(node, SPLIT_MARK_MOUNT);
                 saw_mount_tail = saw_mount_tail || is_mount_tail;
                 saw_mount_head = saw_mount_head || is_mount_head;
 
-                // GPU segments only: the CPU miss chain must stay one split
                 if (node_backend_id != sched->n_backends - 1 &&
                     (node_backend_id == cur_backend_id || ggml_is_view_op(node->op))) {
                     if (is_mount_head || split_name_is(node, SPLIT_MARK_GATE)) {
@@ -1526,11 +1507,8 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 split->backend_id = node_backend_id != -1 ? node_backend_id : cur_backend_id;
                 split->i_start = i;
                 split->n_inputs = 0;
-                // split slots are reused across graphs (reserve probes, then
-                // prefill/decode with different topologies): a stale
-                // submitted_early from a previous graph would skip this
-                // split's copy+compute while downstream still reads its
-                // outputs - always re-arm here
+            // split slots are reused across graphs: a stale submitted_early would skip this
+            // split's copy+compute - always re-arm here
                 split->submitted_early = false;
                 cur_backend_id = split->backend_id;
             }
@@ -1645,15 +1623,10 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         }
     }
 
-    // pool-window alloc deps. the early submit executes the mount
-    // block of a layer BEFORE its CPU miss chain, so any tensor whose address
-    // the sequential galloc model frees before the mount (the shared flat ids,
-    // the mount's inputs) must stay allocated until the mount block computed -
-    // otherwise the mount's own tensors write over values the miss chain still
-    // reads (the -1 remap values over the clean ids, etc).
-    // COMPLETE coverage: dep every tensor of the layer front and of the mount
-    // block (no name-patterns - the window's read/write pairs are all inside
-    // this set).
+    // pool-window alloc deps: the early submit runs the mount BEFORE its CPU miss chain,
+    // so any tensor the sequential galloc model frees earlier (the shared flat ids,
+    // the mount's inputs) must stay allocated until the mount computed - dep every
+    // tensor of the layer front and of the mount block (the complete set).
     if (sched->layer_parallel && !sched->callback_eval) {
         for (int i = 0; i < sched->n_splits; i++) {
             ggml_backend_sched_split & sp = sched->splits[i];
@@ -1666,10 +1639,8 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             for (int k = 0; k < sp.graph.n_nodes; k++) {
                 opt_params.add_alloc_dep(&alloc_deps, sp.graph.nodes[k], until);
             }
-            // the front of this layer: the nearest preceding split that holds
-            // the layer's ffn_moe_logits (the mount reads from it / its address
-            // gets reused by the mount's tensors). no layer number needed - the
-            // mount split is the front's successor by construction.
+        // the front of this layer: the nearest preceding split holding ffn_moe_logits (the
+        // mount reads it); the mount split is its successor by construction
             int jf = -1;
             for (int j = i - 1; j >= 0; j--) {
                 ggml_backend_sched_split & fp = sched->splits[j];
@@ -1693,13 +1664,8 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 jf = j;
                 break;
             }
-            // any GPU split BETWEEN the front and the mount in graph order:
-            // the window runs the mount BEFORE it, so the mount's tensors must
-            // not reuse its addresses - keep them allocated until the mount
-            // tail, otherwise the mount's writes land on addresses the later
-            // run split still reads/writes. no such split exists today (the
-            // mount is the front's immediate successor in the graph); CPU
-            // splits are skipped - a different pool.
+            // any GPU split BETWEEN the front and the mount in graph order must stay allocated
+            // until the mount tail (the window runs the mount earlier); none exists today
             for (int j = jf + 1; j < i; j++) {
                 ggml_backend_sched_split & mp = sched->splits[j];
                 if (mp.graph.n_nodes == 0 || mp.backend_id == sched->n_backends - 1) {
@@ -1734,9 +1700,8 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         sched->graph.leafs = (ggml_tensor **) realloc(sched->graph.leafs, graph_size * sizeof(struct ggml_tensor *));
         GGML_ASSERT(sched->graph.nodes != NULL);
         GGML_ASSERT(sched->graph.leafs != NULL);
-        // the layer-parallel dep nodes grow graph_copy beyond the size
-        // budgeted at sched_new - grow the backend-id arrays too. graph_size
-        // already includes n_dep_nodes (above), so it is the exact bound.
+        // the layer-parallel dep nodes grow graph_copy beyond the sched_new budget - grow
+        // the backend-id arrays too (graph_size includes them, so it is the bound)
         const size_t new_nodes_size = (size_t) graph_size;
         sched->node_backend_ids = (int *) realloc(sched->node_backend_ids, new_nodes_size * sizeof(int));
         sched->prev_node_backend_ids = (int *) realloc(sched->prev_node_backend_ids, new_nodes_size * sizeof(int));
@@ -1908,8 +1873,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
 
-    // lightweight split timeline probe (env GGML_SCHED_TIMELINE_CSV,
-    // no serialization): per split record enter/inputs/submit timestamps in us.
+    // split timeline probe (GGML_SCHED_TIMELINE_CSV): per split enter/inputs/submit us
     static FILE * tl_fp = nullptr;
     static int64_t tl_step = -1;
     static const bool tl_on = getenv("GGML_SCHED_TIMELINE_CSV") != nullptr;
@@ -1937,18 +1901,16 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
         const int64_t tl_t0 = tl_on && tl_fp ? ggml_time_us() : 0;
-        // true-wait probe stamps, captured at the ids fetch below (0 =
-        // no fetch on this split: not a wait sample, drop it offline)
+    // true-wait probe stamps, taken at the ids fetch (0 = no fetch on this split, not a
+    // wait sample)
         int64_t tl_idsready_us = 0;
         int64_t tl_anchorend_us = 0;
 
         // ensure the previous split's async work has completed before we start
         // this split, the allocator may have reused buffer regions across splits
         if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
-            // upstream form: the host blocks until the previous split's async
-            // work is complete (a device-side wait would free the host to
-            // submit ahead, but the waiting backend need not be able to wait -
-            // the CPU backend has no event_wait)
+            // upstream form: the host blocks until the previous split's async work completes
+            // (the CPU backend has no event_wait)
             if (sched->events[prev_backend_id][sched->cur_copy] != NULL) {
                 ggml_backend_event_synchronize(sched->events[prev_backend_id][sched->cur_copy]);
             } else {
@@ -1956,8 +1918,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
-        // a split submitted ahead (the layer-parallel early submit) already has
-        // its inputs copied - the copy section below is skipped for it
+        // a split submitted ahead already has its inputs copied - the copy section is skipped
         const bool pre_submitted = sched->layer_parallel && split->submitted_early;
 
         ggml_san_split(split_id, split_backend, split->n_inputs);
@@ -2019,10 +1980,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     if (ids_tensor != prev_ids_tensor) {
                         ids.resize(ggml_nbytes(ids_tensor) / sizeof(int32_t));
                         ggml_backend_tensor_get_async(ids_backend, ids_tensor, ids.data(), 0, ggml_nbytes(ids_tensor));
-                        // true-wait probe: the host's real dependency point is
-                        // here (topk ids in hand). the anchor precedes on the
-                        // same stream, so syncing its end mark first returns no
-                        // later than the full sync below - no behavior change.
+                        // true-wait probe: the host's real dependency point (topk ids in hand);
+                        // the anchor precedes on the same stream, so syncing its end mark
+                        // returns no later
                         if (tl_on && tl_fp && sched->anchor_valid && ids_backend == sched->anchor_be) {
                             ggml_backend_event_synchronize(sched->anchor_event);
                             tl_anchorend_us = ggml_time_us();
@@ -2039,8 +1999,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             for (int64_t i0 = 0; i0 < ids_tensor->ne[0]; i0++) {
                                 int32_t id = ids[i1 * ids_tensor->nb[1]/sizeof(int32_t) + i0 * ids_tensor->nb[0]/sizeof(int32_t)];
                                 if (id == -1) {
-                                    // skipped column (-1 skip ids): the kernel
-                                    // zeroes it - no weight range needed
+                                    // skipped column (-1 skip ids): the kernel zeroes it, no
+                                    // weight range needed
                                     continue;
                                 }
                                 GGML_ASSERT(id >= 0 && id < n_expert);
@@ -2071,10 +2031,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         id++;
                     }
 
-                    // experiment probe (env-gated, GGML_EXPPOOL_STAGE_LOG):
-                    // the staged expert count per node - verifies that the
-                    // pool's -1 mask shrinks the copied volume in the
-                    // GGML_EXPPOOL_MISS_GPU coexistence form
+                    // probe (GGML_EXPPOOL_STAGE_LOG): staged experts/bytes per node - verifies
+                    // that the pool's -1 mask shrinks the copied volume
                     if (getenv("GGML_EXPPOOL_STAGE_LOG") != nullptr) {
                         int n_used = 0;
                         for (int e = 0; e < n_expert; e++) {
@@ -2085,8 +2043,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                 (long long) n_used * (long long) expert_size);
                     }
                     if (id >= n_expert) {
-                        // all columns skipped (fully resident used set): the
-                        // mmid kernels read no weight row, so skip the copy
+                    // all columns skipped (fully resident used set): the mmid reads no weight
+                    // row - skip the copy
                         prev_ids_tensor = ids_tensor;
                     } else {
                         int32_t first_id = id;
@@ -2131,10 +2089,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                 tl_anchorend_us = ggml_time_us();
                             }
                         } else {
-                            // true-wait probe: this is the host-blocking drain of
-                            // the producer stream (e.g. every GPU->CPU input of a
-                            // miss split - the CPU backend has no cpy_tensor_async).
-                            // stamp only real syncs; host->host no-ops carry no signal.
+                        // true-wait probe: the host-blocking drain of the producer stream (the
+                        // CPU backend has no cpy_tensor_async); stamp only real syncs
                             if (tl_on && tl_fp && sched->anchor_valid && input_backend == sched->anchor_be) {
                                 ggml_backend_event_synchronize(sched->anchor_event);
                                 tl_anchorend_us = ggml_time_us();
@@ -2154,16 +2110,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 }
             }
         }
-        // fork-private: report this split's head before it runs (both the compute
-        // and the callback_eval paths)
+    // fork-private: report this split's head before it runs (compute and callback_eval paths)
         if (sched->obs_split_head != nullptr && split->graph.n_nodes > 0) {
             sched->obs_split_head(sched->obs_split_head_ud, split->graph.nodes[0], split_backend);
         }
         const int64_t t1 = tl_on && tl_fp ? ggml_time_us() : 0;
         if (!sched->callback_eval) {
             if (sched->layer_parallel && split->submitted_early) {
-                // already submitted (with its input copies) by the
-                // previous split - event record below still applies.
+            // already submitted (with its input copies) by the previous split
             } else {
             const int64_t t0 = ggml_time_us();
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
@@ -2178,14 +2132,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         (long long) tl_idsready_us, (long long) tl_anchorend_us);
                 fflush(tl_fp);
             }
-            // record this split's completion point on the backend's stream; the
-            // host does not block - other splits wait on it device-side.
+        // record this split's completion on the backend's stream (no host block; other
+        // splits wait device-side)
             if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                 ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
             }
             if (sched->debug >= 2) {
-                // sync to get the real duration of async backends (GPU)
-                // this adds per-split sync latency (~20-50 us), acceptable for profiling
+        // sync to get the real duration of async backends (adds ~20-50 us/split; profiling only)
                 ggml_backend_synchronize(split_backend);
                 const int64_t dt_us = ggml_time_us() - t0;
                 GGML_LOG_DEBUG("sched_split #%03d: %-8s nodes [%4d,%4d) %-24s %9.3f ms\n",
@@ -2196,30 +2149,19 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
             }
 
-            // layer-parallel: the mount chain is its own split (the mount
-            // block head/tail markers), and in this graph order it sits AFTER
-            // the CPU miss chain (gate/ids/gather -> CPU miss -> GPU mount ->
-            // shared/merge). the host would reach it only after running the
-            // miss chain inline, so submit it NOW on the same stream: the GPU
-            // runs it while the CPU miss chain computes. the anchor is the
-            // layer's GPU expert-front split: attn + gate + ids live in ONE
-            // split (the former gate boundary is gone), identified by
-            // CONTAINING a node named ffn_moe_logits (the router A1 output; the
-            // ffn_moe_gate prefix only occurs inside the chain sections, so it
-            // would anchor the mount split itself). the submit comes AFTER the
-            // anchor split's own compute: the mount block reads ids that only
-            // the anchor produces (A1-final), the stream order is anchor ->
-            // mount. submitting from the GPU split keeps the copies+launch OFF
-            // the CPU miss split's critical path.
+                // layer-parallel: the mount chain is its own split and sits AFTER the CPU miss
+                // chain in graph order, so submit it NOW on the same stream: the GPU runs it
+                // while the CPU miss chain computes. the anchor is the layer's GPU expert-front
+                // split (identified by CONTAINING ffn_moe_logits - the ffn_moe_gate prefix only
+                // occurs inside the chain sections and would anchor the mount itself). the mount
+                // reads ids the anchor produces, so the submit comes after the anchor's compute;
+                // submitting from the GPU split keeps the copies+launch off the CPU miss split.
             if (sched->layer_parallel && !sched->callback_eval &&
                 !split->submitted_early &&
                 split_backend_id != sched->n_backends - 1 &&
                 split->graph.n_nodes > 0 &&
                 split_id + 1 < sched->n_splits) {
-                // anchor: any node of this split named ffn_moe_logits (the
-                // router A1 output - the true layer front; the ffn_moe_gate
-                // prefix only occurs inside the chain sections, so it would
-                // anchor the mount split itself)
+        // anchor: any node named ffn_moe_logits (the router A1 output - the true layer front)
                 bool has_gate = false;
                 for (int k = 0; k < split->graph.n_nodes; k++) {
                     if (split->graph.nodes[k]->name != NULL &&
@@ -2229,14 +2171,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     }
                 }
                 if (has_gate) {
-                    // the anchor's end mark on this stream (async record, the
-                    // host does not block): everything enqueued up to here - the
-                    // layer front - is done when it fires. it is recorded BEFORE
-                    // the mount chain is handed to the device, so the split that
-                    // follows the anchor can wait for the front alone instead of
-                    // draining the stream - the drain would also serialize it
-                    // against the submitted-ahead mount. the timeline probe
-                    // stamps the same mark (topk-ready of the true-wait split).
+        // the anchor's end mark on this stream (async, no host block): everything enqueued
+        // up to the layer front is done when it fires. recorded BEFORE the mount is handed
+        // over, so the anchor's successor can wait for the front alone instead of draining
+        // the stream.
                     if (split_backend->iface.event_record != NULL &&
                         ggml_backend_get_device(split_backend)->iface.event_synchronize != NULL) {
                         if (sched->anchor_event == NULL) {
@@ -2249,13 +2187,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             sched->anchor_valid = true;
                         }
                     }
-                    // the mount split: the anchor's next non-CPU split (CPU
-                    // splits in between - today the CPU miss chain IS the
-                    // immediate successor - are skipped, they live in a
-                    // different pool). it must start
-                    // with the mount block head and contain the mounted chain -
-                    // any other head means this is not this layer's mount block,
-                    // so nothing is submitted ahead.
+            // the mount split: the anchor's next non-CPU split (CPU splits live in a different
+            // pool), starting with the mount block head and containing the mounted chain -
+            // any other head means no early submit
                     ggml_backend_sched_split * nxt = nullptr;
                     for (int j = split_id + 1; j < sched->n_splits; j++) {
                         ggml_backend_sched_split * cand = &splits[j];
@@ -2268,10 +2202,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         if (!split_name_is(cand->graph.nodes[0], SPLIT_MARK_MOUNT_CUR)) {
                             break; // not a mount block head
                         }
-                        // only the mounted (pool) chain qualifies: the split must
-                        // contain a ffn_moe_mount node. plain MoE segments (e.g.
-                        // draft/MTP graphs without the pool) have gate nodes too,
-                        // but no mount chain - never submit those ahead.
+            // only the mounted (pool) chain qualifies: the split must contain a ffn_moe_mount
+            // node (plain MoE segments have gate nodes too)
                         bool has_mount = false;
                         for (int k = 0; k < cand->graph.n_nodes; k++) {
                             if (split_name_is(cand->graph.nodes[k], SPLIT_MARK_MOUNT)) {
@@ -2280,11 +2212,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             }
                         }
                         if (has_mount) {
-                            // small-batch gate: for batches >= the offload
-                            // threshold the miss chain runs on the GPU too
-                            // (selective expert copy), the mount block is
-                            // inside the natural layer run: never submit
-                            // ahead, the native path runs untouched.
+                    // small-batch gate: at/above the offload threshold the miss chain runs on
+                    // the GPU too and the mount rides inside the natural layer run - never
+                    // submit ahead
                             const int64_t cand_T = cand->graph.nodes[0]->ne[2];
                             if (cand_T >= split_op_min_batch()) {
                                 break;
@@ -2303,14 +2233,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             }
                         }
                         if (all_gpu) {
-                            // the copies below use the BACKEND iface (main graph
-                            // stream): they are stream-ordered after the producers of
-                            // this split, no host-side sync needed. (a full
-                            // ggml_backend_synchronize here serializes the CPU
-                            // against the GPU queue 41x/step and kills the steal
-                            // window.)
-                            // missing copy slot: fall back to the sequential
-                            // path (never submit a half-copied split ahead)
+                // the copies below use the BACKEND iface (main stream), so they are stream-ordered
+                // after the producers - no host sync (a full synchronize here serializes the CPU
+                // against the GPU 41x/step and kills the steal window). missing copy slot: fall
+                // back to the sequential path.
                             bool copies_ok = true;
                             for (int input_id = 0; input_id < nxt->n_inputs; input_id++) {
                                 struct ggml_tensor * input = nxt->inputs[input_id];
@@ -2334,10 +2260,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             if (sched->events[nxt->backend_id][sched->cur_copy] != NULL) {
                                 ggml_backend_event_record(sched->events[nxt->backend_id][sched->cur_copy], sched->backends[nxt->backend_id]);
                             }
-                            // no event record+wait around the early submit: the
-                            // early mount and the later main-loop splits go
-                            // through the SAME single stream of the CUDA
-                            // backend, so stream order alone orders them.
+            // no event record+wait around the early submit: the early mount and the later
+            // splits share the CUDA stream, so stream order alone orders them
                             nxt->submitted_early = true;
                             GGML_LOG_DEBUG("exppool: submitted_early split %d (mount chain) at split %d\n",
                                     (int) (nxt - splits), split_id);
@@ -2458,9 +2382,9 @@ ggml_backend_sched_t ggml_backend_sched_new(
         }
     }
 
-    // layer-parallel mode: off by default, set by the owner
-    // (ggml_backend_sched_set_layer_parallel). no prefetch backend - the miss
-    // split uses the regular input-copy path.
+// layer-parallel mode: off by default, set by the owner
+// (ggml_backend_sched_set_layer_parallel); no prefetch backend - the miss split
+// uses the regular input-copy path
 
     sched->galloc = ggml_gallocr_new_n(sched->bufts, n_backends);
     sched->op_offload = op_offload;

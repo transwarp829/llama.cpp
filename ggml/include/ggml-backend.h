@@ -356,9 +356,8 @@ extern "C" {
     // Hand the graph's chunks to their backend ahead of the CPU splits
     GGML_API void                 ggml_backend_sched_set_layer_parallel(ggml_backend_sched_t sched, bool layer_parallel);
 
-    // fork-private observer: the scheduler reports every split's head node (and its
-    // backend) right before the split runs. the expert pool is the consumer and
-    // identifies its own tensors by pointer (see src/llama-expert-pool.cpp).
+    // fork-private observer: the sched reports every split's head node (and its backend)
+    // right before the split runs; the expert pool is the consumer (matched by pointer).
     typedef void (*ggml_backend_sched_split_head_fn)(void * user_data, struct ggml_tensor * head, struct ggml_backend * backend);
     GGML_API void                 ggml_backend_sched_set_split_head_observer(ggml_backend_sched_t sched, ggml_backend_sched_split_head_fn fn, void * user_data);
 
