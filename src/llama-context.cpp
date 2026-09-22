@@ -5044,15 +5044,12 @@ void llama_context::expert_pool_finalize() {
         st.route_stop = false;
     }
 
-    // segment-end flush: print the partial-segment average when the segment ended
-    // between two 64-step report boundaries
-    if (st.swap_sum > 0) {
-        const int32_t steps_in = st.settled_steps % 64;
-        if (steps_in > 0) {
-            LLAMA_LOG_INFV(LLAMA_LOG_VERBOSITY_INFO,
-                    "%s: swap avg %.1f expert slots/step (partial %d steps, segment end)\n",
-                    __func__, (float) st.swap_sum / (float) steps_in, steps_in);
-        }
+    // segment-end flush: the segment's swap average (swap_sum accumulates over
+    // the whole segment; the per-step detail sits at DEBUG)
+    if (st.swap_sum > 0 && st.settled_steps > 0) {
+        LLAMA_LOG_INFV(LLAMA_LOG_VERBOSITY_INFO,
+                "%s: swap avg %.1f expert slots/step (segment, %d steps)\n",
+                __func__, (float) st.swap_sum / (float) st.settled_steps, st.settled_steps);
         st.swap_sum = 0;
     }
 

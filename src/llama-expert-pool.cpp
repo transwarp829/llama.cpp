@@ -765,12 +765,6 @@ bool llama_expert_pool_worker_settle(llama_expert_pool_state & st) {
                     "%s: swap step %d: swapped %d\n",
                     __func__, st.settled_steps, delta);
         }
-        if (st.settled_steps > 0 && st.settled_steps % 64 == 0) {
-            LLAMA_LOG_INFV(LLAMA_LOG_VERBOSITY_INFO,
-                    "%s: swap avg %.1f expert slots/step (past 64 steps, step %d)\n",
-                    __func__, (float) st.swap_sum / 64.0f, st.settled_steps);
-            st.swap_sum = 0;
-        }
     }
     // the hit rate is printed once at segment end by expert_pool_finalize
     return true;
