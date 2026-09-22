@@ -274,19 +274,3 @@ int32_t llama_expert_pool_tab_build(llama_expert_pool_state & st);
 // publish the ready mirror (hook thread only, step boundary): one set_async to
 // tab_all and one sync set to tab_cpu - the single place the tensors are written
 void llama_expert_pool_tab_publish(llama_expert_pool_state & st);
-
-// per-context plumbing: the active pool of the current thread is marked around
-// llama_context::graph_compute
-llama_expert_pool_state * llama_expert_pool_set_current(llama_expert_pool_state * st);
-
-// scoped binding for that mark - an object restores by construction, a
-// hand-paired set/restore would not
-struct llama_expert_pool_bind {
-    explicit llama_expert_pool_bind(llama_expert_pool_state * st) : prev(llama_expert_pool_set_current(st)) {}
-    ~llama_expert_pool_bind() { llama_expert_pool_set_current(prev); }
-
-    llama_expert_pool_bind(const llama_expert_pool_bind &) = delete;
-    llama_expert_pool_bind & operator=(const llama_expert_pool_bind &) = delete;
-
-    llama_expert_pool_state * prev;
-};

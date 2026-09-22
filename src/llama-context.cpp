@@ -3201,13 +3201,6 @@ llm_graph_params llama_context::graph_params(
 ggml_status llama_context::graph_compute(
             ggml_cgraph * gf,
                    bool   batched) {
-    // the CPU MoE delegate is one process-wide hook and the model tensors are
-    // shared across contexts: bind this context's pool for the duration of the
-    // compute (the hook resolves its state from the binding). scoped, so any
-    // exit path - including an error return added later - restores the
-    // previous binding instead of leaving the hook pointed at this pool.
-    const llama_expert_pool_bind pool_bind(&expert_pool_state);
-
     int n_threads        = batched ? cparams.n_threads_batch : cparams.n_threads;
     ggml_threadpool_t tp = batched ? threadpool_batch        : threadpool;
 
