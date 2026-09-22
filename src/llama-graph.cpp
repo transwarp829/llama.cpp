@@ -2049,8 +2049,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             ggml_prec_set_acc(logits, GGML_PREC_F32);
         }
         cb(logits, "ffn_moe_logits", il);
+        ggml_backend_sched_set_node_role(sched, logits, GGML_BACKEND_SCHED_ROLE_LOGITS);
     } else {
         logits = probs_in;
+        // models that compute the router themselves hand the logits in: that
+        // node is the layer-front anchor for the early submit as well
+        ggml_backend_sched_set_node_role(sched, logits, GGML_BACKEND_SCHED_ROLE_LOGITS);
     }
 
     if (gate_inp_b) {
@@ -2301,6 +2305,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         // mount chain block head marker: the scheduler splits the GPU segment here so
         // the mount block becomes its own split, submitted right after the layer front
         cb(cur, "ffn_moe_mount_cur", il);
+        ggml_backend_sched_set_node_role(sched, cur, GGML_BACKEND_SCHED_ROLE_MOUNT_HEAD);
     }
 
     if (weight_before_ffn) {
@@ -2520,6 +2525,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             nullptr, mount_p->w_gate_up, nullptr, nullptr, nullptr, nullptr, ids_remap, weights,
             mount_scale_up, mount_scale_gate, true);
         cb(mount_out, "ffn_moe_mount", il);
+        ggml_backend_sched_set_node_role(sched, mount_out, GGML_BACKEND_SCHED_ROLE_MOUNT_TAIL);
     };
     // the miss columns are weighted once, on the merge result; the miss chain weights here only when the graph carries no mount block at all - keyed on the plan (mount_p), not on the built tensor: the mount is built after this point, and keying on mount_out would weight these columns twice.
     if (mount_p == nullptr) {

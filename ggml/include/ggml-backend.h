@@ -356,6 +356,18 @@ extern "C" {
     // Hand the graph's chunks to their backend ahead of the CPU splits
     GGML_API void                 ggml_backend_sched_set_layer_parallel(ggml_backend_sched_t sched, bool layer_parallel);
 
+    // fork-private node roles: the graph builder tags the nodes the
+    // layer-parallel split needs to recognize (mount block head/tail, the
+    // router's logits node). the scheduler asks by role instead of matching
+    // node names, so a rename on either side cannot silently disable the split.
+    enum ggml_backend_sched_node_role {
+        GGML_BACKEND_SCHED_ROLE_NONE       = 0,
+        GGML_BACKEND_SCHED_ROLE_MOUNT_HEAD = 1, // mount block head (the cur prep view)
+        GGML_BACKEND_SCHED_ROLE_MOUNT_TAIL = 2, // mount block tail (the mounted down output)
+        GGML_BACKEND_SCHED_ROLE_LOGITS     = 3, // the router's logits node (the layer front anchor)
+    };
+    GGML_API void                 ggml_backend_sched_set_node_role(ggml_backend_sched_t sched, struct ggml_tensor * node, enum ggml_backend_sched_node_role role);
+
     // fork-private observer: the sched reports every split's head node (and its backend)
     // right before the split runs; the expert pool is the consumer (matched by pointer).
     typedef void (*ggml_backend_sched_split_head_fn)(void * user_data, struct ggml_tensor * head, struct ggml_backend * backend);

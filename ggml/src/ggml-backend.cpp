@@ -807,30 +807,6 @@ static bool ggml_is_view_op(enum ggml_op op) {
 #define GGML_SCHED_MAX_COPIES 4
 #endif
 
-// layer-parallel split markers: the llama builder tags the mount block head/tail
-// and the moe gate via cb(); the sched splits on these names. a rename on one
-// side does not fail loudly - the mount block just stops becoming its own split
-// and the parallel form degrades to the serial delivery (ggml cannot include
-// the llama headers).
-#define SPLIT_MARK_MOUNT_CUR "ffn_moe_mount_cur"
-#define SPLIT_MARK_GATE      "ffn_moe_gate"
-#define SPLIT_MARK_LOGITS    "ffn_moe_logits"
-#define SPLIT_MARK_MOUNT     "ffn_moe_mount"
-
-static bool split_name_is(const struct ggml_tensor * t, const char * prefix) {
-    return t != NULL && t->name != NULL && strncmp(t->name, prefix, strlen(prefix)) == 0;
-}
-
-// exact match of "<marker>-<layer>": the mount tail marker prefixes the block
-// head, so a prefix test cannot tell them apart
-static bool split_name_is_marked(const struct ggml_tensor * t, const char * marker) {
-    if (t == NULL || t->name == NULL) {
-        return false;
-    }
-    const size_t len = strlen(marker);
-    return strncmp(t->name, marker, len) == 0 && t->name[len] == '-';
-}
-
 // env gates read once (they sit on the per-split hot path)
 static int split_op_min_batch() {
     static const int v = getenv("GGML_OP_OFFLOAD_MIN_BATCH") ? atoi(getenv("GGML_OP_OFFLOAD_MIN_BATCH")) : 32;
@@ -849,6 +825,12 @@ struct ggml_backend_sched_split {
   // this split was submitted ahead (the mount chain, while the CPU miss chain
   // computes): skip its copy+compute
     bool submitted_early = false;
+    // layer-parallel node roles recorded at split time (the role map is only
+    // valid while the graph is being split): the head's role, and whether this
+    // split carries the router's logits node / the mounted chain's tail
+    int  head_role      = 0;
+    bool has_logits     = false;
+    bool has_mount_tail = false;
 };
 
 struct ggml_backend_sched {
@@ -864,6 +846,7 @@ struct ggml_backend_sched {
     // hash map of the nodes in the graph
     struct ggml_hash_set  hash_set;
     int                 * hv_tensor_backend_ids; // [hash_set.size]
+    int                 * hv_tensor_roles;       // [hash_set.size] fork-private node roles
     struct ggml_tensor ** hv_tensor_copies;      // [hash_set.size][n_backends][n_copies]
 
     int * node_backend_ids; // [graph_size]
@@ -929,6 +912,7 @@ struct ggml_backend_sched {
 
 #define hash_id(tensor) ggml_hash_find_or_insert(&sched->hash_set, tensor)
 #define tensor_backend_id(tensor) sched->hv_tensor_backend_ids[hash_id(tensor)]
+#define tensor_role(tensor)       sched->hv_tensor_roles[hash_id(tensor)]
 #define tensor_id_copy(id, backend_id, copy_id) sched->hv_tensor_copies[(id) * sched->n_backends * sched->n_copies + (backend_id) * sched->n_copies + (copy_id)]
 #define tensor_copy(tensor, backend_id, copy_id) tensor_id_copy(hash_id(tensor), backend_id, copy_id)
 
@@ -1420,6 +1404,9 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         }
         split->i_start = 0;
         split->n_inputs = 0;
+        split->head_role      = tensor_role(graph->nodes[0]);
+        split->has_logits     = false;
+        split->has_mount_tail = false;
         int cur_backend_id = split->backend_id;
         for (; i < graph->n_nodes; i++) {
             struct ggml_tensor * node = graph->nodes[i];
@@ -1445,14 +1432,15 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             // it is a legal split. GPU segments only - the CPU miss chain must stay one
             // split; gated with the early submit (callback mode keeps the serial shape).
             if (sched->layer_parallel && !sched->callback_eval && node->name != NULL) {
-                const bool is_mount_head = split_name_is(node, SPLIT_MARK_MOUNT_CUR);
-                const bool is_mount_tail = split_name_is_marked(node, SPLIT_MARK_MOUNT);
+                const int  node_role     = tensor_role(node);
+                const bool is_mount_head = node_role == GGML_BACKEND_SCHED_ROLE_MOUNT_HEAD;
+                const bool is_mount_tail = node_role == GGML_BACKEND_SCHED_ROLE_MOUNT_TAIL;
                 saw_mount_tail = saw_mount_tail || is_mount_tail;
                 saw_mount_head = saw_mount_head || is_mount_head;
 
                 if (node_backend_id != sched->n_backends - 1 &&
                     (node_backend_id == cur_backend_id || ggml_is_view_op(node->op))) {
-                    if (is_mount_head || split_name_is(node, SPLIT_MARK_GATE)) {
+                    if (is_mount_head) {
                         layer_T = node->ne[2];
                     }
                     if (layer_T >= 0 && layer_T < split_op_min_batch()) {
@@ -1507,10 +1495,21 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 split->backend_id = node_backend_id != -1 ? node_backend_id : cur_backend_id;
                 split->i_start = i;
                 split->n_inputs = 0;
+                split->head_role      = tensor_role(node);
+                split->has_logits     = false;
+                split->has_mount_tail = false;
             // split slots are reused across graphs: a stale submitted_early would skip this
             // split's copy+compute - always re-arm here
                 split->submitted_early = false;
                 cur_backend_id = split->backend_id;
+            }
+
+            // this node's role facts land on the split it belongs to (after the
+            // boundary: a node that starts its own split lands on the new one)
+            if (sched->layer_parallel && !sched->callback_eval) {
+                const int r = tensor_role(node);
+                split->has_logits     = split->has_logits     || r == GGML_BACKEND_SCHED_ROLE_LOGITS;
+                split->has_mount_tail = split->has_mount_tail || r == GGML_BACKEND_SCHED_ROLE_MOUNT_TAIL;
             }
 
             // find inputs that are not on the same backend
@@ -1630,8 +1629,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     if (sched->layer_parallel && !sched->callback_eval) {
         for (int i = 0; i < sched->n_splits; i++) {
             ggml_backend_sched_split & sp = sched->splits[i];
-            if (sp.graph.n_nodes == 0 || sp.graph.nodes[0]->name == NULL ||
-                !split_name_is(sp.graph.nodes[0], SPLIT_MARK_MOUNT_CUR)) {
+            if (sp.graph.n_nodes == 0 || sp.head_role != GGML_BACKEND_SCHED_ROLE_MOUNT_HEAD) {
                 continue;
             }
             ggml_tensor * until = sp.graph.nodes[sp.graph.n_nodes - 1];
@@ -1647,15 +1645,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 if (fp.graph.n_nodes == 0) {
                     continue;
                 }
-                bool is_front = false;
-                for (int k = 0; k < fp.graph.n_nodes; k++) {
-                    if (fp.graph.nodes[k]->name != NULL &&
-                        split_name_is(fp.graph.nodes[k], SPLIT_MARK_LOGITS)) {
-                        is_front = true;
-                        break;
-                    }
-                }
-                if (!is_front) {
+                if (!fp.has_logits) {
                     continue;
                 }
                 for (int k = 0; k < fp.graph.n_nodes; k++) {
@@ -2162,15 +2152,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 split->graph.n_nodes > 0 &&
                 split_id + 1 < sched->n_splits) {
         // anchor: any node named ffn_moe_logits (the router A1 output - the true layer front)
-                bool has_gate = false;
-                for (int k = 0; k < split->graph.n_nodes; k++) {
-                    if (split->graph.nodes[k]->name != NULL &&
-                        split_name_is(split->graph.nodes[k], SPLIT_MARK_LOGITS)) {
-                        has_gate = true;
-                        break;
-                    }
-                }
-                if (has_gate) {
+                if (split->has_logits) {
         // the anchor's end mark on this stream (async, no host block): everything enqueued
         // up to the layer front is done when it fires. recorded BEFORE the mount is handed
         // over, so the anchor's successor can wait for the front alone instead of draining
@@ -2196,22 +2178,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         if (cand->backend_id == sched->n_backends - 1) {
                             continue; // CPU split (the miss chain) - not a mount candidate
                         }
-                        if (cand->graph.n_nodes == 0 || cand->graph.nodes[0]->name == NULL) {
-                            break;
-                        }
-                        if (!split_name_is(cand->graph.nodes[0], SPLIT_MARK_MOUNT_CUR)) {
+                        if (cand->graph.n_nodes == 0 ||
+                            cand->head_role != GGML_BACKEND_SCHED_ROLE_MOUNT_HEAD) {
                             break; // not a mount block head
                         }
             // only the mounted (pool) chain qualifies: the split must contain a ffn_moe_mount
             // node (plain MoE segments have gate nodes too)
-                        bool has_mount = false;
-                        for (int k = 0; k < cand->graph.n_nodes; k++) {
-                            if (split_name_is(cand->graph.nodes[k], SPLIT_MARK_MOUNT)) {
-                                has_mount = true;
-                                break;
-                            }
-                        }
-                        if (has_mount) {
+                        if (cand->has_mount_tail) {
                     // small-batch gate: at/above the offload threshold the miss chain runs on
                     // the GPU too and the mount rides inside the natural layer run - never
                     // submit ahead
@@ -2348,6 +2321,7 @@ ggml_backend_sched_t ggml_backend_sched_new(
     // FIXME: needs to be size*2 to account for leafs (do it in graph_split instead)
     sched->hash_set    = ggml_hash_set_new(graph_size);
     sched->hv_tensor_backend_ids = (int *) malloc(sched->hash_set.size * sizeof(sched->hv_tensor_backend_ids[0]));
+    sched->hv_tensor_roles       = (int *) calloc(sched->hash_set.size, sizeof(sched->hv_tensor_roles[0]));
     sched->hv_tensor_copies      = (ggml_tensor **) malloc(sched->hash_set.size * sched->n_backends * sched->n_copies * sizeof(struct ggml_tensor *));
 
     const size_t ggml_sched_max_splits = graph_size; // at most there is one split for each node in the graph
@@ -2413,6 +2387,7 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     free(sched->splits);
     free(sched->graph_inputs);
     free(sched->hv_tensor_backend_ids);
+    free(sched->hv_tensor_roles);
     free(sched->hv_tensor_copies);
     free(sched->node_backend_ids);
     free(sched->leaf_backend_ids);
@@ -2430,6 +2405,7 @@ void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
     if (!sched->is_reset) {
         ggml_hash_set_reset(&sched->hash_set);
         memset(sched->hv_tensor_backend_ids, -1, sched->hash_set.size * sizeof(sched->hv_tensor_backend_ids[0]));
+        memset(sched->hv_tensor_roles,         0, sched->hash_set.size * sizeof(sched->hv_tensor_roles[0]));
         memset(sched->hv_tensor_copies,       0, sched->hash_set.size * sched->n_backends * sched->n_copies * sizeof(struct ggml_tensor *));
         sched->is_reset = true;
     }
@@ -2579,6 +2555,11 @@ void ggml_backend_sched_set_tensor_backend(ggml_backend_sched_t sched, struct gg
     tensor_backend_id(node) = backend_index;
     SET_CAUSE(node, "usr");
     sched->is_reset = false;
+}
+
+void ggml_backend_sched_set_node_role(ggml_backend_sched_t sched, struct ggml_tensor * node, enum ggml_backend_sched_node_role role) {
+    GGML_ASSERT(sched);
+    tensor_role(node) = (int) role;
 }
 
 ggml_backend_t ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node) {
