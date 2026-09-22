@@ -971,17 +971,21 @@ void llama_context::expert_pool_build() {
         }
         llama_expert_pool_mount m = mreg;
         const llama_layer & L = model.layers[il];
-        // merged table: ONE contiguous [n_expert, n_layers] I32 tensor;
-        // each layer gets a 1KB view for remap (the inv half lives only in
-        // the CPU host mirror).
+        // merged table: ONE contiguous [n_expert, 2*n_layers] I32 tensor holding
+        // BOTH halves in the mirror's own layout (remap block, then inv block);
+        // each layer gets a 1KB view into either half, so a publish is a single
+        // stream-ordered copy of the mirror.
         if (st.tab_all == nullptr) {
             st.tab_all = ggml_new_tensor_2d(pool_tab_ctx, GGML_TYPE_I32, n_expert,
-                                            (int64_t) model.hparams.n_layer_all);
+                                            2 * (int64_t) model.hparams.n_layer_all);
             ggml_set_name(st.tab_all, "mnt_tab_all");
         }
-        const size_t i32sz = ggml_type_size(GGML_TYPE_I32);
+        const size_t  i32sz        = ggml_type_size(GGML_TYPE_I32);
+        const int64_t n_layers_all = (int64_t) model.hparams.n_layer_all;
         m.remap     = ggml_view_2d(pool_tab_ctx, st.tab_all, 1, n_expert, i32sz,
                                    il * n_expert * i32sz);
+        m.remap_inv = ggml_view_2d(pool_tab_ctx, st.tab_all, 1, n_expert, i32sz,
+                                   (n_layers_all + il) * n_expert * i32sz);
         // CPU-side view of the host table (remap_inv_host mirrors the inv
         // half of the tab_mirror; tab_cpu holds only the inv part)
         m.remap_inv_host = ggml_view_2d(pool_tab_cpu_ctx, st.tab_cpu, 1, n_expert, i32sz,
@@ -1000,6 +1004,8 @@ void llama_context::expert_pool_build() {
         ggml_set_name(m.remap, nm);
         snprintf(nm, sizeof(nm), "mnt_remap_inv_host_%d", il);
         ggml_set_name(m.remap_inv_host, nm);
+        snprintf(nm, sizeof(nm), "mnt_remap_inv_%d", il);
+        ggml_set_name(m.remap_inv, nm);
         if (m.scale != nullptr) {
             snprintf(nm, sizeof(nm), "mnt_scale_%d", il);
             ggml_set_name(m.scale, nm);

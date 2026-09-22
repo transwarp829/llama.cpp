@@ -2232,20 +2232,28 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             // so stream order reads it before any later reuse of its slot
             cb(ids_remap, "ffn_moe_ids_remap", il);
 
-            // inverse table for the CPU chain: resident -> -1, non-resident ->
-            // expert id, so the CPU mul_mat_id zeroes the hit columns natively
-            // (the -1 skip ids) and computes exactly the miss columns. the table
-            // read is the CPU-HOSTED copy (remap_inv_host) and runs ON the CPU
-            // segment (src0 on the CPU device): the GPU-side get_rows output
-            // slot is shared with the pool remap and is not A1-final, so a
-            // cross-side read races with the pool chain.
-            ggml_tensor * remap_inv_3d = ggml_reshape_3d(ctx0, mnt.remap_inv_host, 1, n_expert, 1);
+            // inverse table for the miss chain: resident -> -1, non-resident ->
+            // expert id, so the miss mul_mat_id zeroes the hit columns natively
+            // (the -1 skip ids) and computes exactly the miss columns. which
+            // copy is read follows the same threshold the scheduler uses for
+            // the miss mmids:
+            // - below it the miss chain runs on the CPU: read the CPU-HOSTED
+            //   copy and pin the gather there (on the raw output, before the
+            //   reshape view is created). the GPU-side output slot is shared
+            //   with the pool remap and is not A1-final, so a cross-side read
+            //   of it would race the pool chain.
+            // - at/above it the scheduler offloads the miss mmids to the pool
+            //   device: gather from the device-side inv half instead, so the
+            //   ids never leave the device (no CPU segment, no 32B H2D).
+            const bool miss_on_cpu = n_tokens < llama_expert_pool_offload_min_batch();
+            ggml_tensor * inv_tab = miss_on_cpu ? mnt.remap_inv_host : mnt.remap_inv;
+            ggml_tensor * remap_inv_3d = ggml_reshape_3d(ctx0, inv_tab, 1, n_expert, 1);
             ggml_tensor * ids_cpu = ggml_get_rows(ctx0, remap_inv_3d, ids_flat);
-            // pin the inverse remap to the CPU segment (on the raw output,
-            // before the reshape view is created): without the pin the sched's
-            // "most supported inputs" tie can place the get_rows on the GPU,
-            // which re-introduces the shared 32B id slot race
-            ggml_backend_sched_set_tensor_backend(sched, ids_cpu, backend_cpu);
+            if (miss_on_cpu) {
+                ggml_backend_sched_set_tensor_backend(sched, ids_cpu, backend_cpu);
+            }
+            // the miss chain's first node (cpu forms: this gather heads the CPU split)
+            llama_expert_pool_bind_split_head(*expert_pool, il, ids_cpu, /*lane=*/false);
             ids_cpu = ggml_reshape_2d(ctx0, ids_cpu, n_expert_used, n_tokens);
             cb(ids_cpu, "ffn_moe_ids_cpu", il);
             mount_ids_cpu = ids_cpu;
@@ -2286,10 +2294,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             cur_mount_in = cur;
             mount_p = &mnt;
 
-            // the mount block is expanded below, BEFORE the miss chain, so the
-            // graph order is gate/ids/gather -> GPU mount -> CPU miss -> merge.
-            // the miss chain tensors are built above but enter the graph at the
-            // expand that follows the mount block - build order is not graph order.
+            // the mount block is expanded at the end of this function, after the
+            // miss chain: the graph order is front -> CPU miss -> mount -> merge.
+            // build order is not graph order.
 
         }
     }
