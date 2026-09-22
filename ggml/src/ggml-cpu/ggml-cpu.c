@@ -98,17 +98,6 @@ struct ggml_riscv_arch_features_type {
 } ggml_riscv_arch_features = { 0 };
 #endif
 
-// moe routing-log hook (set by llama.cpp, see ggml-cpu.h)
-static ggml_cpu_moe_delegate_begin_fn g_moe_delegate_begin = 0;
-static void *                         g_moe_delegate_ud    = 0;
-
-void ggml_cpu_set_moe_delegate(
-        ggml_cpu_moe_delegate_begin_fn begin,
-        void * user_data) {
-    g_moe_delegate_begin = begin;
-    g_moe_delegate_ud    = user_data;
-}
-
 #if defined(_WIN32)
 
 #define WIN32_LEAN_AND_MEAN
@@ -1657,15 +1646,6 @@ static void ggml_compute_forward_mul_mat_id(
     }
 
     if (ith == 0) {
-        // moe routing-log hook: ids have already been remapped by the graph
-        // (-1 = skipped column, zeroed natively below), so the kernel never
-        // skips a row itself and no skip table is needed
-        if (g_moe_delegate_begin != 0) {
-            const int32_t * skip = 0;
-            g_moe_delegate_begin((struct ggml_tensor *) src0, (struct ggml_tensor *) src1,
-                                 (struct ggml_tensor *) ids, dst, &skip, g_moe_delegate_ud);
-        }
-
         // initialize matrix_row_counts
         memset(matrix_row_counts, 0, n_as*sizeof(int64_t));
 

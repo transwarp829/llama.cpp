@@ -24,42 +24,14 @@ llama_expert_pool_state * llama_expert_pool_set_current(llama_expert_pool_state 
     return prev;
 }
 
-// the delegate is registered while at least one pool lives (one process-wide
-// slot, refcounted across contexts)
-static std::atomic<int32_t> g_delegate_users{0};
-
-void llama_expert_pool_delegate_register() {
-    if (g_delegate_users.fetch_add(1) == 0) {
-        ggml_cpu_set_moe_delegate(llama_expert_pool_delegate_begin, nullptr);
-    }
-}
-
-void llama_expert_pool_delegate_unregister() {
-    if (g_delegate_users.fetch_sub(1) == 1) {
-        ggml_cpu_set_moe_delegate(nullptr, nullptr);
-    }
-}
-
-// route observer (llama-ext.h, fork-private): the ids served by the CPU MoE
-// delegate fan out to one observer; tools write their own routing files and
-// the library keeps no routing-log state. set once at tool init, read from
-// compute threads.
+// route observer (llama-ext.h, fork-private): the split-head observer forwards the
+// clean topk rows to it; set once at tool init, read from compute threads.
 static llama_expert_pool_route_fn g_route_cb = nullptr;
 static void *                     g_route_ud = nullptr;
-// capture-mode step detection (no direct-mount pool on the thread's context):
-// a layer index that does not advance begins a new decode step
-static thread_local int32_t       g_cap_prev_il = -1;
 
 void llama_expert_pool_set_route_observer(llama_expert_pool_route_fn cb, void * user_data) {
-    const bool had  = g_route_cb != nullptr;
-    const bool want = cb != nullptr;
     g_route_cb = cb;
     g_route_ud = user_data;
-    if (want && !had) {
-        llama_expert_pool_delegate_register();
-    } else if (!want && had) {
-        llama_expert_pool_delegate_unregister();
-    }
 }
 
 llama_expert_pool_params llama_expert_pool_default_params() {
@@ -95,7 +67,6 @@ void llama_expert_pool_state::reset() {
     mounts.clear();
     resident.clear();
     pooled_layers.clear();
-    tensor_refs.clear();
 
     step_done = false;
 
@@ -111,9 +82,6 @@ void llama_expert_pool_state::reset() {
     seq_ctr = 0;
     mirror_seq[0] = mirror_seq[1] = mirror_seq[2] = -1;
     pub_seq.store(-1);
-
-    // note: delegate_ref is not released here - the registration lives with the
-    // state (the context), not with one build of the pool
 
     pool_backend  = nullptr;
     mirror_ready.store(-1);

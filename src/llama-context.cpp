@@ -879,8 +879,6 @@ void llama_context::expert_pool_build() {
                 continue;
             }
             l.orig[k] = src[k];
-            // identity for the CPU hook: one entry per present expert tensor
-            st.tensor_refs.emplace(src[k], llama_expert_pool_state::tensor_ref{ il, (int32_t) ix });
             l.pool[k] = (k < PK_UP_B)
                 ? ggml_new_tensor_4d(pool_ctx, src[k]->type, src[k]->ne[0], src[k]->ne[1], s_il, 1)
                 : ggml_new_tensor_2d(pool_ctx, src[k]->type, src[k]->ne[0], s_il);
@@ -1209,9 +1207,7 @@ void llama_context::expert_pool_fill() {
     llama_expert_pool_tab_build(st);
     llama_expert_pool_tab_publish(st);
 
-    // --- moe delegate hook (feeds the route observer, llama-ext.h) ---
     if (st.direct_mount) {
-        st.delegate_ref.acquire();
         LLAMA_LOG_INFO("%s: direct mount active (%d layers), in-graph merge\n",
                 __func__, (int) st.pooled_layers.size());
     }
