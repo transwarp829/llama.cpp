@@ -408,10 +408,6 @@ extern "C" {
                           // try to disable when n_seq_max > 1 for improved performance when the sequences do not share a large prefix
                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363
 
-        // fork-specific expert pool configuration (defined in llama-ext.h); null = no pool.
-        // the struct must outlive the context's first reserve, like the other pointer fields here.
-        const struct llama_expert_pool_params * expert_pool;
-
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)
         // note: the samplers must be sampler chains (i.e. use llama_sampler_chain_init)
@@ -421,6 +417,11 @@ extern "C" {
         // a source/target/parent context
         // can be utilized in various ways, for example by sharing results or llama_memory between 2 contexts
         struct llama_context * ctx_other;
+
+        // fork-specific expert pool configuration (defined in llama-ext.h); null = no pool.
+        // the struct must outlive the context's first reserve, like the other pointer fields here.
+        // appended last: a field added mid-struct shifts the offsets of everything after it.
+        const struct llama_expert_pool_params * expert_pool;
     };
 
     struct llama_model_tensor_override {
