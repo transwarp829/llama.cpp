@@ -14,7 +14,7 @@
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
-#include "../../src/llama-ext.h" // fork-private ext API (expert pool segment stats)
+#include "llama-ext.h" // fork-private ext API (expert pool segment stats)
 #include "mtmd.h"
 #include "mtmd-helper.h"
 

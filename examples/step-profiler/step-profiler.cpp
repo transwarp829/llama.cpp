@@ -17,7 +17,7 @@
 #include <string>
 #include <vector>
 
-#include "../../src/llama-ext.h" // fork-private ext API (expert-pool route observer)
+#include "llama-ext.h" // fork-private ext API (expert-pool route observer)
 
 // --- expert-pool routing capture (GGML_EXPPOOL_ROUTING_LOG) ---
 // the library no longer writes routing files; this tool owns the CSV.
