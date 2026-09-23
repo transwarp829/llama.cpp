@@ -1,4 +1,4 @@
-# llama.cpp/examples/step-profiler
+# llama.cpp/tools/step-profiler
 
 Per-step (per-token) decode timing profiler based on the scheduler eval callback
 (`ggml_backend_sched_eval_callback`). No core changes: the callback is passed via
