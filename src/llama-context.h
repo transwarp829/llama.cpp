@@ -392,7 +392,6 @@ private:
     ggml_backend_buffer_ptr mount_tab_buf; // device buffer holding the remap tables
     ggml_backend_buffer_ptr mount_tab_cpu_buf; // CPU buffer holding the remap_inv mirror
 
-
     // Separate arenas give batches with and without outputs distinct CUDA graph cache keys.
     std::array<llm_graph_result_ptr, 2> gf_res_prev;
     llm_graph_result_ptr gf_res_reserve;
