@@ -713,8 +713,8 @@ struct llama_model {
     struct borrowed_copy {
         const ggml_tensor * src = nullptr;
         ggml_tensor * tensor = nullptr;
-        std::unique_ptr<ggml_context, decltype(&ggml_free)> ctx{nullptr, &ggml_free};
-        std::unique_ptr<ggml_backend_buffer, decltype(&ggml_backend_buffer_free)> buf{nullptr, &ggml_backend_buffer_free};
+        ggml_context * ctx = nullptr;                                      // freed in ~llama_model
+        ggml_backend_buffer_ptr buf;                                       // freed with the struct
     };
     mutable std::vector<borrowed_copy> borrowed_copies;
 

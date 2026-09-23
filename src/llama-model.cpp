@@ -1218,6 +1218,11 @@ llama_model::llama_model(const llama_model_params & params) : params(params), pi
 }
 
 llama_model::~llama_model() {
+    // borrow_tensor's ctxs are raw pointers (no smart-pointer alias exists for
+    // ggml_context upstream); the buffers are freed by their own unique_ptr
+    for (auto & c : borrowed_copies) {
+        ggml_free(c.ctx);
+    }
     for (auto * lora : loras) {
         delete lora;
     }
@@ -1915,6 +1920,8 @@ size_t llama_model::n_tensors() const {
 
 ggml_tensor * llama_model::borrow_tensor(const ggml_tensor * src) const {
     if (src == nullptr || src->buffer == nullptr || ggml_backend_buffer_is_host(src->buffer)) {
+        // a borrowed pointer stays borrowed: the graph needs a non-const tensor,
+        // the model that owns it is never mutated here
         return const_cast<ggml_tensor *>(src);
     }
     // a device this model can route: the graph references the tensor directly
@@ -1932,9 +1939,9 @@ ggml_tensor * llama_model::borrow_tensor(const ggml_tensor * src) const {
     }
     borrowed_copy c;
     c.src = src;
-    c.ctx.reset(ggml_init({ ggml_nbytes(src) + ggml_tensor_overhead(), nullptr, true }));
-    c.tensor = ggml_new_tensor(c.ctx.get(), src->type, GGML_MAX_DIMS, src->ne);
-    c.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(c.ctx.get(), ggml_backend_cpu_buffer_type()));
+    c.ctx = ggml_init({ ggml_nbytes(src) + ggml_tensor_overhead(), nullptr, true });
+    c.tensor = ggml_new_tensor(c.ctx, src->type, GGML_MAX_DIMS, src->ne);
+    c.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(c.ctx, ggml_backend_cpu_buffer_type()));
     if (c.buf == nullptr) {
         GGML_ABORT("%s: failed to allocate host copy of %s\n", __func__, src->name);
     }
