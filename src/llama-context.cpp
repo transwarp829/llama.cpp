@@ -5024,7 +5024,7 @@ void llama_context::expert_pool_finalize() {
         return;
     }
     // generation-segment hit rate (the counters accumulate across swaps)
-    LLAMA_LOG_INFV(LLAMA_LOG_VERBOSITY_INFO, "%s: pool hit rate %.1f%% (%llu/%llu rows, generation segment)\n", __func__,
+    LLAMA_LOG_INFO_V(LLAMA_LOG_VERBOSITY_INFO, "%s: pool hit rate %.1f%% (%llu/%llu rows, generation segment)\n", __func__,
             100.0 * st.seg.hit / (double) (st.seg.hit + st.seg.miss),
             (unsigned long long) st.seg.hit,
             (unsigned long long) (st.seg.hit + st.seg.miss));
@@ -5049,7 +5049,7 @@ void llama_context::expert_pool_finalize() {
     // segment-end flush: the segment's swap average (swap_sum accumulates over
     // the whole segment; the per-step detail sits at DEBUG)
     if (st.swap_sum > 0 && st.settled_steps > 0) {
-        LLAMA_LOG_INFV(LLAMA_LOG_VERBOSITY_INFO,
+        LLAMA_LOG_INFO_V(LLAMA_LOG_VERBOSITY_INFO,
                 "%s: swap avg %.1f expert slots/step (segment, %d steps)\n",
                 __func__, (float) st.swap_sum / (float) st.settled_steps, st.settled_steps);
         st.swap_sum = 0;
