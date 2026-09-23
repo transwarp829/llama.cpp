@@ -1,3 +1,14 @@
+> [!IMPORTANT]
+> **This is a fork** (`transwarp829/llama.cpp`) that adds an experimental **expert
+> pool**: an MoE offload mode that keeps a per-layer set of the hottest experts in
+> VRAM and runs the resident (device) and the non-resident (host) expert chains of
+> the same layer as two chains of one graph. Flags, constraints and measured
+> numbers: [docs/expert-pool.md](docs/expert-pool.md). The fork also carries one
+> unmerged upstream `ggml` change (a `-1` expert index skips that `MUL_MAT_ID` row,
+> the pool uses it as its serve-the-other-chain mask), a step profiler
+> (`tools/step-profiler`) and a scheduler sanitizer. Everything else is upstream
+> `llama.cpp` at the commit this fork is based on.
+
 # llama.cpp
 
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
