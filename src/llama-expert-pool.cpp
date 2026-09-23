@@ -582,7 +582,7 @@ static int32_t worker_decide_and_copy(llama_expert_pool_state & st) {
             }
             res[p.slot] = p.e;
             filled += 1;
-            LLAMA_LOG_INFV(LLAMA_LOG_VERBOSITY_TRACE,
+            LLAMA_LOG_INFO_V(LLAMA_LOG_VERBOSITY_TRACE,
                     "%s: fill layer %d slot %d (step %d): expert e=%d (cnt %d)",
                     __func__, p.il, p.slot, st.settled_steps, p.e, p.cnt);
         }
@@ -683,7 +683,7 @@ static int32_t worker_decide_and_copy(llama_expert_pool_state & st) {
         res[p.slot] = -1;
         st.pend_fill.push_back({ il, p.e, p.slot, 0, p.cnt });
         planned += 1;
-        LLAMA_LOG_INFV(LLAMA_LOG_VERBOSITY_TRACE,
+        LLAMA_LOG_INFO_V(LLAMA_LOG_VERBOSITY_TRACE,
                 "%s: unmap layer %d slot %d (step %d): evict e=%d, fill e=%d (cnt %d)",
                 __func__, il, p.slot, st.settled_steps, victim_e, p.e, p.cnt);
     }
@@ -698,7 +698,7 @@ static int32_t worker_decide_and_copy(llama_expert_pool_state & st) {
         st.swap_sum += filled;
     }
     if (deferred > 0) {
-        LLAMA_LOG_INFV(LLAMA_LOG_VERBOSITY_DEBUG,
+        LLAMA_LOG_INFO_V(LLAMA_LOG_VERBOSITY_DEBUG,
                 "%s: %d pair(s) deferred by the per-step swap limit (step %d)",
                 __func__, deferred, st.settled_steps);
     }
@@ -761,7 +761,7 @@ bool llama_expert_pool_worker_settle(llama_expert_pool_state & st) {
         // per-exchange lines at TRACE/DEBUG; INFO gets a periodic average
         // instead of per-step noise (print_timings-style, every 64 steps)
         if (delta > 0) {
-            LLAMA_LOG_INFV(LLAMA_LOG_VERBOSITY_DEBUG,
+            LLAMA_LOG_INFO_V(LLAMA_LOG_VERBOSITY_DEBUG,
                     "%s: swap step %d: swapped %d\n",
                     __func__, st.settled_steps, delta);
         }

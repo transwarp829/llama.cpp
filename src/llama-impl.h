@@ -36,7 +36,7 @@ void llama_log_verbose(int verbosity, ggml_log_level level, const char * format,
 #define LLAMA_LOG_DEBUG(...) llama_log_internal(GGML_LOG_LEVEL_DEBUG, __VA_ARGS__)
 #define LLAMA_LOG_CONT(...)  llama_log_internal(GGML_LOG_LEVEL_CONT , __VA_ARGS__)
 // verbosity-explicit info log: shown at -lv 3 (LLAMA_LOG_VERBOSITY_INFO)
-#define LLAMA_LOG_INFV(verbosity, ...) llama_log_verbose((verbosity), GGML_LOG_LEVEL_INFO, __VA_ARGS__)
+#define LLAMA_LOG_INFO_V(verbosity, ...) llama_log_verbose((verbosity), GGML_LOG_LEVEL_INFO, __VA_ARGS__)
 
 //
 // helpers
