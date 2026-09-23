@@ -342,8 +342,9 @@ void llama_expert_pool_observe_split_head(void * user_data, ggml_tensor * head, 
     int32_t n_tok = 0;
     const int32_t * ids = split_head_rows(st, head, backend, il, lane, registered, n_used, n_tok);
 
-    // route observer: one row per (step, layer), one-token batches only
-    if (ids != nullptr && g_route_cb != nullptr && n_tok == 1) {
+    // route observer: one row per (step, layer), ctx-level - all columns of the
+    // step, so a T > 1 row carries n_used * n_tok ids
+    if (ids != nullptr && g_route_cb != nullptr) {
         const int32_t prev = st.rtlog_prev_il;
         st.rtlog_prev_il = il;
         g_route_cb(g_route_ud, il, ids, n_used, prev >= 0 && il < prev ? 1 : 0);
