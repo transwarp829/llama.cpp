@@ -27,12 +27,12 @@ inline int32_t llama_expert_pool_offload_min_batch() {
     return v;
 }
 
-// miss method (llama_expert_pool_params::miss_method); the threshold above
-// which the miss chain goes to the pool device applies to every method.
+// miss method (llama_expert_pool_params::miss_method): how the non-resident chain
+// runs below the offload threshold. at and above it the scheduler's lane takes the
+// chain, so the method only picks the CPU-side form there.
 enum llama_expert_pool_miss_method {
     LLAMA_EXPERT_POOL_MISS_CPU_SERIAL   = 0, // CPU chain as one split (delivery)
     LLAMA_EXPERT_POOL_MISS_CPU_PARALLEL = 1, // mount chain submitted ahead of the CPU chain
-    LLAMA_EXPERT_POOL_MISS_GPU          = 2, // miss rows on the pool device at every batch size
 };
 
 // minimum slots per pooled layer (desert rule): below this width a mounted
@@ -155,7 +155,7 @@ struct llama_expert_pool_state {
     // steady-state rate sits well below it with the default half-life)
     bool swap_auto = false;
     int32_t swap_per_step = 40;            // max expert pairs swapped in per settled
-                                           // step, all layers (negative = unlimited)
+                                           // step, all layers (<= 0 freezes the set)
     int32_t n_expert = 0;                  // experts per layer (set at init)
     // step counter (only the worker owns the counters below)
     int32_t hook_step = 0;

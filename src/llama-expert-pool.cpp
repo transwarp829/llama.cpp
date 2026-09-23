@@ -725,7 +725,7 @@ static int32_t worker_decide_and_copy(llama_expert_pool_state & st) {
         }
     }
     // execute in count order, descending, until the per-step limit is passed
-    const int32_t limit = st.swap_per_step < 0 ? -1 : st.swap_per_step;
+    const int32_t limit = st.swap_per_step;
     std::sort(queue.begin(), queue.end(), [](const pair_t & a, const pair_t & b) {
         if (a.cnt != b.cnt) return a.cnt > b.cnt;
         if (a.ilx != b.ilx) return a.ilx < b.ilx;
