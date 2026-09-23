@@ -301,6 +301,50 @@ static const int32_t * split_head_rows(llama_expert_pool_state & st, ggml_tensor
     if (row == nullptr || row->type != GGML_TYPE_I32 || row->data == nullptr) {
         return nullptr;
     }
+    {
+        // a host weight mmid staged above the offload threshold hands its node a device-side ids
+        // copy, and above that threshold no pool is needed for this path to run: dereferencing the
+        // device pointer on the host crashes, so read it through the split's backend, in its
+        // stream (ordered after the kernels that produce those rows)
+        const ggml_backend_buffer_t row_buf = row->view_src != nullptr ? row->view_src->buffer : row->buffer;
+        if (row_buf == nullptr) {
+            return nullptr;
+        }
+        if (!ggml_backend_buffer_is_host(row_buf)) {
+            if (backend == nullptr) {
+                return nullptr;
+            }
+            auto dev_read = [&](void * dst, size_t off, size_t size) {
+                ggml_backend_tensor_get_async(backend, row, dst, off, size);
+                ggml_backend_synchronize(backend);
+            };
+            if (row->ne[1] == 1) {
+                if (row->ne[0] % n_used != 0) {
+                    return nullptr;
+                }
+                st.ids_buf.resize(ggml_nelements(row));
+                dev_read(st.ids_buf.data(), 0, ggml_nbytes(row));
+                n_tok = (int32_t) (row->ne[0] / n_used);
+                return st.ids_buf.data();
+            }
+            if (row->ne[0] != (int64_t) n_used || row->ne[1] <= 0) {
+                return nullptr;
+            }
+            const int64_t nt   = row->ne[1];
+            const size_t  span = (size_t) (nt - 1) * row->nb[1] + (size_t) n_used * row->nb[0];
+            std::vector<uint8_t> raw(span);
+            dev_read(raw.data(), 0, span);
+            st.ids_buf.resize((size_t) n_used * (size_t) nt);
+            for (int64_t s = 0; s < nt; ++s) {
+                for (int32_t j = 0; j < n_used; ++j) {
+                    st.ids_buf[(size_t) s * n_used + j] =
+                        *(const int32_t *) (raw.data() + (size_t) s * row->nb[1] + (size_t) j * row->nb[0]);
+                }
+            }
+            n_tok = (int32_t) nt;
+            return st.ids_buf.data();
+        }
+    }
     if (row->ne[1] == 1) {
         if (row->ne[0] % n_used != 0) {
             return nullptr;
@@ -340,7 +384,10 @@ void llama_expert_pool_observe_split_head(void * user_data, ggml_tensor * head, 
     const int32_t n_used = registered && 0 <= il && il < (int32_t) st.ids_n_used.size() ? st.ids_n_used[il]
                           : (head->op == GGML_OP_MUL_MAT_ID ? (int32_t) head->ne[1] : 0);
     int32_t n_tok = 0;
-    const int32_t * ids = split_head_rows(st, head, backend, il, lane, registered, n_used, n_tok);
+    // the rows are read for the pool's statistics (registered heads) or for the route observer;
+    // with neither there is nothing to read (and no device readback to pay for)
+    const int32_t * ids = (registered || g_route_cb != nullptr)
+        ? split_head_rows(st, head, backend, il, lane, registered, n_used, n_tok) : nullptr;
 
     // route observer: one row per (step, layer), ctx-level - all columns of the
     // step, so a T > 1 row carries n_used * n_tok ids
