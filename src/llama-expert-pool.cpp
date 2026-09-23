@@ -58,9 +58,22 @@ void llama_expert_pool_state::reset() {
     swap_auto = false;
     hook_step = 0;
     last_ilx = -1;
+    win_last_il = -1;
     settled_steps = 0;
     act_cnt.clear();
     swap_sum = 0;
+    swap_steps = 0;
+    swap_total.store(0);
+    step_slots.clear();
+    step_slots_hist.clear();
+    for (llama_expert_pool_state::slot_window & w : slot_windows) {
+        w.open.store(false);
+        w.pairs.store(0);
+        w.swap_base = 0;
+        w.steps = 0;
+        w.hit = 0;
+        w.miss = 0;
+    }
     stat.clear();
     seg = {};
     pend_fill.clear();
@@ -133,6 +146,13 @@ static void route_push_row(llama_expert_pool_state & st, int32_t step, int32_t i
 // the counters and the refresh, performs the H2D copies on its own thread (the
 // inference thread never waits), rebuilds the table mirror. drained by reset().
 namespace { void swap_copy_one_sync(ggml_backend_t, ggml_tensor *, ggml_tensor *, int32_t, int32_t, int); }
+
+void llama_expert_pool_set_step_slots(llama_expert_pool_state & st, const int32_t * seq_ids, int32_t n_seq_ids) {
+    if (st.phase == llama_expert_pool_state::PHASE_NONE) {
+        return;
+    }
+    st.step_slots.assign(seq_ids, seq_ids + n_seq_ids);
+}
 
 void llama_expert_pool_start_worker(llama_expert_pool_state & st) {
     if (st.cp_worker.joinable()) {
@@ -352,6 +372,33 @@ void llama_expert_pool_observe_split_head(void * user_data, ggml_tensor * head, 
             llama_expert_pool_tab_publish(st);
             llama_expert_pool_push_marker(st);
             st.hook_step += 1;
+            {
+                std::lock_guard<std::mutex> lk(st.route_mtx);
+                st.step_slots_hist.emplace_back(st.hook_step, st.step_slots);
+            }
+        }
+    }
+    // segment windows: open the windows of this step's slots and count the step
+    // in each (the layer index that does not advance starts a new step)
+    {
+        const bool win_new_step = st.win_last_il < 0 || ilx <= st.win_last_il;
+        st.win_last_il = ilx;
+        if (win_new_step) {
+            for (const int32_t s : st.step_slots) {
+                if (s < 0 || s >= LLAMA_MAX_SEQ) {
+                    continue;
+                }
+                llama_expert_pool_state::slot_window & w = st.slot_windows[s];
+                if (!w.open.load(std::memory_order_relaxed)) {
+                    w.swap_base = st.swap_total.load(std::memory_order_relaxed);
+                    w.pairs.store(0, std::memory_order_relaxed);
+                    w.steps = 0;
+                    w.hit = 0;
+                    w.miss = 0;
+                    w.open.store(true, std::memory_order_relaxed);
+                }
+                w.steps ++;
+            }
         }
     }
     st.last_ilx = ilx;
@@ -364,6 +411,8 @@ void llama_expert_pool_observe_split_head(void * user_data, ggml_tensor * head, 
     if (st.direct_mount && pub >= 0 && pub < 3 && !st.tab_mirror[pub].empty()) {
         const int32_t * inv = st.tab_mirror[pub].data() +
                               (size_t) st.n_expert * st.layers.size() + (size_t) il * st.n_expert;
+        uint64_t row_hit  = 0;
+        uint64_t row_miss = 0;
         for (int64_t i = 0; i < (int64_t) n_used * (int64_t) n_tok; ++i) {
             const int32_t e = ids[i];
             if (e < 0 || e >= st.n_expert) {
@@ -372,10 +421,25 @@ void llama_expert_pool_observe_split_head(void * user_data, ggml_tensor * head, 
             if (inv[e] == -1) {
                 st.stat[ilx].hit ++;
                 st.seg.hit ++;
+                row_hit ++;
             } else {
                 st.stat[ilx].miss ++;
                 st.seg.miss ++;
+                row_miss ++;
             }
+        }
+        // the window caliber is the pool's, so every slot taking part in this
+        // step sees the same rows (their windows differ only in which steps)
+        for (const int32_t s : st.step_slots) {
+            if (s < 0 || s >= LLAMA_MAX_SEQ) {
+                continue;
+            }
+            llama_expert_pool_state::slot_window & w = st.slot_windows[s];
+            if (!w.open.load(std::memory_order_relaxed)) {
+                continue;
+            }
+            w.hit  += row_hit;
+            w.miss += row_miss;
         }
     }
     // the LAST active-mount layer completes the step: a 0-slot layer has no mount
@@ -758,6 +822,28 @@ bool llama_expert_pool_worker_settle(llama_expert_pool_state & st) {
         // graph 1-2 steps later (the hook publishes at a step boundary)
         const int32_t delta = worker_decide_and_copy(st);
         st.settled_steps = t + 1;
+        st.swap_total.fetch_add(delta, std::memory_order_relaxed);
+        st.swap_steps += 1;
+        // attribute this settle's pairs to the windows of the step's slots (a
+        // window closed by a report simply misses its tail - the accepted +-1)
+        {
+            std::lock_guard<std::mutex> lk(st.route_mtx);
+            while (!st.step_slots_hist.empty() && st.step_slots_hist.front().first <= t) {
+                const std::pair<int32_t, std::vector<int32_t>> & e = st.step_slots_hist.front();
+                if (e.first == t) {
+                    for (const int32_t s : e.second) {
+                        if (s < 0 || s >= LLAMA_MAX_SEQ) {
+                            continue;
+                        }
+                        llama_expert_pool_state::slot_window & w = st.slot_windows[s];
+                        if (w.open.load(std::memory_order_relaxed)) {
+                            w.pairs.fetch_add(delta, std::memory_order_relaxed);
+                        }
+                    }
+                }
+                st.step_slots_hist.pop_front();
+            }
+        }
         // per-exchange lines at TRACE/DEBUG; INFO gets a periodic average
         // instead of per-step noise (print_timings-style, every 64 steps)
         if (delta > 0) {

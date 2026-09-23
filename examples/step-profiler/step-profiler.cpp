@@ -498,7 +498,7 @@ int main(int argc, char ** argv) {
     }
 
     // end of the generation segment: print the accumulated pool hit rate
-    llama_expert_pool_finalize(ctx);
+    llama_expert_pool_finalize(ctx, -1);
 
     // routing capture teardown (see llama-ext.h)
     if (g_route.fp != nullptr) {
