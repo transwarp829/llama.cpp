@@ -186,8 +186,10 @@ LLAMA_API uint32_t llama_expert_pool_get_stats(struct llama_context * ctx,
         struct llama_expert_pool_layer_stats * out, uint32_t max_layers);
 
 // end of a generation segment: print the accumulated hit rate at info verbosity and
-// reset the segment counters (call once after the decode loop).
-LLAMA_API void llama_expert_pool_finalize(struct llama_context * ctx);
+// reset the segment counters (call once after the decode loop). id_slot >= 0 reports
+// that sequence slot's own segment window (the steps it took part in) instead; -1
+// reports the pool's segment since the previous call.
+LLAMA_API void llama_expert_pool_finalize(struct llama_context * ctx, int32_t id_slot);
 
 //
 // verbosity-explicit logging (fork-private)

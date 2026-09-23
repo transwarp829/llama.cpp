@@ -1,9 +1,11 @@
 #pragma once
 
 #include "llama.h"
+#include "llama-cparams.h"  // LLAMA_MAX_SEQ
 #include "ggml.h"
 #include "ggml-backend.h"
 
+#include <array>
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
@@ -134,6 +136,9 @@ struct llama_expert_pool_state {
     mutable std::vector<const ggml_tensor *> ids_clean;   // [layer] clean topk ids
     mutable std::vector<int32_t>             ids_n_used;  // [layer]
     mutable std::vector<int32_t>             ids_buf;     // host scratch for a device read
+    // window-step detector (independent of the swap-side step_done: the first
+    // step of a run has no predecessor, so only the layer-index wrap can mark it)
+    int32_t win_last_il = -1;
     // route-observer step flag (the wrap is detected by the layer index)
     int32_t rtlog_prev_il = -1;
 
@@ -180,7 +185,27 @@ struct llama_expert_pool_state {
     float   swap_lambda   = 0.0f;          // per-step decay, lambda = 2^(-1/H)
     int32_t swap_decay_hl = 96;            // decay half-life in steps (default 96)
     std::vector<float> act_cnt;            // [pooled layers * n_expert] decayed counts
-    int32_t swap_sum = 0;                  // exchanges accumulated this period
+    int32_t swap_sum = 0;                  // exchanges accumulated this period (slot-less report)
+    int32_t swap_steps = 0;                // settled steps of that period (same reset as swap_sum)
+    // monotonic ctx-level swap total: the per-slot windows snapshot it (never reset)
+    std::atomic<int64_t> swap_total{0};
+    // per-slot segment window: the set of settled steps the slot took part in.
+    // the pool learns each ubatch's sequences (llama_expert_pool_set_step_slots),
+    // so the decision counters stay slot-agnostic - only the report is attributed,
+    // and the row caliber inside a window is the pool's (all slots' columns).
+    struct slot_window {
+        std::atomic<int64_t> pairs{0};    // swap pairs of the window's steps (worker writes)
+        std::atomic<bool>    open{false}; // written at the report, read by the worker
+        int64_t  swap_base = 0;           // swap_total when the window opened
+        int32_t  steps     = 0;           // steps the slot took part in
+        uint64_t hit       = 0;           // pool-caliber rows over those steps
+        uint64_t miss      = 0;
+    };
+    std::array<slot_window, LLAMA_MAX_SEQ> slot_windows;
+    // sequences of the ubatch being built (the report thread fills it per ubatch,
+    // the observer reads it), and the per-step slot sets the worker consumes
+    std::vector<int32_t> step_slots;
+    std::deque<std::pair<int32_t, std::vector<int32_t>>> step_slots_hist;
 
     // segment totals of the inference-side counters (the per-layer array is
     // cleared by each read)
@@ -255,6 +280,10 @@ void llama_expert_pool_random(int32_t n_layer, int32_t n_expert,
 void llama_expert_pool_bind_ids(const llama_expert_pool_state & st, int32_t il, int32_t n_used, const ggml_tensor * ids_clean);
 void llama_expert_pool_bind_split_head(const llama_expert_pool_state & st, int32_t il, const ggml_tensor * head, bool lane);
 void llama_expert_pool_observe_split_head(void * user_data, ggml_tensor * head, ggml_backend_t backend);
+
+// per-ubatch slot channel: the sequences (slots) that have columns in this
+// ubatch. the segment windows are per slot; the decision counters stay ctx-level.
+void llama_expert_pool_set_step_slots(llama_expert_pool_state & st, const int32_t * seq_ids, int32_t n_seq_ids);
 
 // swap worker: owns the counters, the refresh decisions and the weight copies
 void llama_expert_pool_start_worker(llama_expert_pool_state & st);

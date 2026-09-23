@@ -1970,6 +1970,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
+    // the pool attributes its per-slot segment windows with this ubatch's
+    // sequences (the decision counters stay ctx-level)
+    llama_expert_pool_set_step_slots(expert_pool_state, ubatch.seq_id_unq, (int32_t) ubatch.n_seqs_unq);
+
     auto * res = get_gf_res_prev();
     auto * gf  = res->get_gf();
 
@@ -5018,54 +5022,59 @@ uint32_t llama_context::expert_pool_stats_snapshot(llama_expert_pool_layer_stats
     return n;
 }
 
-void llama_context::expert_pool_finalize() {
+void llama_context::expert_pool_finalize(int32_t id_slot) {
     llama_expert_pool_state & st = expert_pool_state;
     if (st.seg.hit + st.seg.miss == 0) {
         return;
     }
-    // generation-segment hit rate (the counters accumulate across swaps)
-    LLAMA_LOG_INFO_V(LLAMA_LOG_VERBOSITY_INFO, "%s: pool hit rate %.1f%% (%llu/%llu rows, generation segment)\n", __func__,
-            100.0 * st.seg.hit / (double) (st.seg.hit + st.seg.miss),
-            (unsigned long long) st.seg.hit,
-            (unsigned long long) (st.seg.hit + st.seg.miss));
+    // a slot's segment window = the steps it took part in. the row caliber inside
+    // the window is the pool's (every slot's columns feed it), so overlapping slots
+    // see the same rows and differ only in which steps they cover.
+    llama_expert_pool_state::slot_window * win = nullptr;
+    if (id_slot >= 0 && id_slot < LLAMA_MAX_SEQ && st.slot_windows[id_slot].open.load(std::memory_order_relaxed)) {
+        win = &st.slot_windows[id_slot];
+    }
+    const uint64_t win_hit  = win != nullptr ? win->hit  : st.seg.hit;
+    const uint64_t win_miss = win != nullptr ? win->miss : st.seg.miss;
+    if (win != nullptr) {
+        const int64_t pairs = win->pairs.load(std::memory_order_relaxed);
+        LLAMA_LOG_INFO_V(LLAMA_LOG_VERBOSITY_INFO,
+                "%s: pool hit rate %.1f%% (%llu/%llu rows, %d steps, slot %d), swap avg %.1f pairs/step\n",
+                __func__, 100.0 * win_hit / (double) (win_hit + win_miss),
+                (unsigned long long) win_hit, (unsigned long long) (win_hit + win_miss),
+                win->steps, id_slot, win->steps > 0 ? (double) pairs / (double) win->steps : 0.0);
+        // close the window: this slot's next step opens a fresh one
+        win->open.store(false, std::memory_order_relaxed);
+        win->pairs.store(0, std::memory_order_relaxed);
+        win->swap_base = 0;
+        win->steps = 0;
+        win->hit = 0;
+        win->miss = 0;
+    } else {
+        LLAMA_LOG_INFO_V(LLAMA_LOG_VERBOSITY_INFO, "%s: pool hit rate %.1f%% (%llu/%llu rows, generation segment)\n", __func__,
+                100.0 * st.seg.hit / (double) (st.seg.hit + st.seg.miss),
+                (unsigned long long) st.seg.hit,
+                (unsigned long long) (st.seg.hit + st.seg.miss));
+    }
     st.seg = {};
 
-    // the segment-end accounting reads worker-owned state (settled_steps, swap_sum):
-    // settle the tail first, then stop the worker (the join is the barrier)
-    const bool had_worker = st.swap_auto && st.cp_worker.joinable();
-    if (had_worker) {
-        // tail drain: rows queued since the last step boundary have no marker - push
-        // one so the worker settles them before the join
-        llama_expert_pool_push_marker(st);
-        {
-            std::lock_guard<std::mutex> lk(st.route_mtx);
-            st.route_stop = true;
-        }
-        st.route_cv.notify_all();
-        st.cp_worker.join();
-        st.route_stop = false;
-    }
-
-    // segment-end flush: the segment's swap average (swap_sum accumulates over
-    // the whole segment; the per-step detail sits at DEBUG)
-    if (st.swap_sum > 0 && st.settled_steps > 0) {
+    // the swap average: per window for a slot report, per segment otherwise. the
+    // worker is NOT stopped here - the drain wait is the only sync this report
+    // would need, and a window tolerates a +-1 step tail
+    if (win == nullptr && st.swap_sum > 0 && st.swap_steps > 0) {
         LLAMA_LOG_INFO_V(LLAMA_LOG_VERBOSITY_INFO,
                 "%s: swap avg %.1f expert slots/step (segment, %d steps)\n",
-                __func__, (float) st.swap_sum / (float) st.settled_steps, st.settled_steps);
+                __func__, (float) st.swap_sum / (float) st.swap_steps, st.swap_steps);
         st.swap_sum = 0;
-    }
-
-    // the widths no longer change at segment end: restart the worker stopped above
-    if (had_worker) {
-        llama_expert_pool_start_worker(st);
+        st.swap_steps = 0;
     }
 }
 
-void llama_expert_pool_finalize(struct llama_context * ctx) {
+void llama_expert_pool_finalize(struct llama_context * ctx, int32_t id_slot) {
     if (ctx == nullptr) {
         return;
     }
-    ctx->expert_pool_finalize();
+    ctx->expert_pool_finalize(id_slot);
 }
 
 void llama_context::expert_pool_release() {
