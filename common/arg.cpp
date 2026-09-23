@@ -1738,7 +1738,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ));
     add_opt(common_arg(
         {"--expert-pool-swap-cap"}, "N",
-        "max expert pairs swapped in per decode step (0 = freeze the resident set, negative = unlimited)",
+        string_format("max expert pairs swapped in per decode step (0 or less = freeze the resident set; "
+                      "a value above the pool size never binds; default: %d)", params.expert_pool.swap_cap),
         [](common_params & params, int value) {
             params.expert_pool.swap_cap = value;
         }
@@ -1752,10 +1753,9 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ));
     add_opt(common_arg(
-        {"--expert-pool-miss-method"}, "{cpu-serial,cpu-parallel,gpu}",
-        "how the expert pool runs a miss (default: cpu-serial). "
-        "cpu-serial = the CPU chain stays one split, cpu-parallel = the mount chain is handed to the device ahead of the CPU chain, "
-        "gpu = the miss rows run on the pool device at every batch size (below the offload threshold the scheduler's split input copy stages the used expert rows)",
+        {"--expert-pool-miss-method"}, "{cpu-serial,cpu-parallel}",
+        "how the expert pool runs a miss below the offload batch threshold (default: cpu-serial). "
+        "cpu-serial = the CPU chain stays one split, cpu-parallel = the mount chain is handed to the device ahead of the CPU chain",
         [](common_params & params, const std::string & value) {
             if (value == "cpu-serial") {
                 params.expert_pool.miss_method = 0;
@@ -1763,10 +1763,6 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             if (value == "cpu-parallel") {
                 params.expert_pool.miss_method = 1;
-                return;
-            }
-            if (value == "gpu") {
-                params.expert_pool.miss_method = 2;
                 return;
             }
             throw std::invalid_argument(string_format("expert-pool-miss-method: unknown value '%s'", value.c_str()));

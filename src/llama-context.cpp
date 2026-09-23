@@ -665,24 +665,9 @@ void llama_context::expert_pool_init() {
     if (n_expert <= 0) {
         return;
     }
-    // miss method gpu needs a device-resident pool; a host pool would run the miss
-    // chain on the CPU - refuse loudly instead of degrading silently.
-    const bool miss_gpu = cparams.expert_pool_miss_method == LLAMA_EXPERT_POOL_MISS_GPU;
-    if (miss_gpu) {
-        bool have_device = false;
-        for (const ggml_backend_buffer_type_t bt : backend_buft) {
-            have_device = have_device || !ggml_backend_buft_is_host(bt);
-        }
-        if (!have_device) {
-            LLAMA_LOG_ERROR("%s: expert pool: miss method gpu needs a device pool, "
-                            "none in this context - expert pool disabled\n", __func__);
-            return;
-        }
-    }
     // the method governs the range below the offload threshold only: at/above it
-    // every method runs the miss chain on the pool device (upstream's lane)
+    // the scheduler's lane runs the miss chain on the pool device
     LLAMA_LOG_INFO("%s: expert pool: miss method %s, offload threshold %d\n", __func__,
-            miss_gpu ? "gpu" :
             cparams.expert_pool_miss_method == LLAMA_EXPERT_POOL_MISS_CPU_PARALLEL ? "cpu-parallel" : "cpu-serial",
             llama_expert_pool_offload_min_batch());
     // unified memory (iGPU / APUs, coherent CPU-GPU links): nothing to cache - the
@@ -706,7 +691,7 @@ void llama_context::expert_pool_init() {
     st.n_expert = n_expert;
     // 0 pairs/step freezes the resident set (the static A/B control arm)
     st.swap_per_step = cparams.expert_pool_swap_cap;
-    st.swap_auto     = st.swap_per_step != 0;
+    st.swap_auto     = st.swap_per_step > 0;
     // decaying activation counter (--expert-pool-swap-decay H): lambda = 2^(-1/H) per
     // settled step; a step's increment is its activation count divided by its token
     // columns

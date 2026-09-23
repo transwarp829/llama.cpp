@@ -143,9 +143,9 @@ LLAMA_API uint32_t llama_model_get_tok_embd(const struct llama_model * model, fl
 struct llama_expert_pool_params {
     int32_t slots;           // slot budget (0 = disabled)
     int32_t layers;          // spread the budget over the deepest N layers (0 = all eligible)
-    int32_t swap_cap;        // max expert pairs swapped in per decode step (0 = freeze, < 0 = unlimited)
+    int32_t swap_cap;        // max expert pairs swapped in per decode step (<= 0 freezes the set)
     int32_t swap_decay;      // decaying activation counter: half-life in decode steps (0 = library default)
-    int32_t miss_method;     // how a miss runs: 0 = cpu-serial, 1 = cpu-parallel, 2 = gpu
+    int32_t miss_method;     // how a miss runs: 0 = cpu-serial, 1 = cpu-parallel
     const char * init_file;  // csv file to seed the pool content, null = random
 };
 

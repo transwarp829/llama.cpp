@@ -2218,12 +2218,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
             // inverse table for the miss chain: resident -> -1, else the expert id, so
             // the miss mul_mat_id zeroes the hit columns natively. which copy is read
-            // follows the method, then the threshold: a cpu method below it reads the
-            // CPU-HOSTED copy (pinned there; the device slot is shared with the pool
-            // remap and would race), anything else reads the device-side half (the ids
-            // never leave the device).
-            const bool miss_on_cpu = cparams.expert_pool_miss_method != LLAMA_EXPERT_POOL_MISS_GPU &&
-                                     n_tokens < llama_expert_pool_offload_min_batch();
+            // follows the batch size: below the offload threshold the chain runs on the
+            // CPU and reads the CPU-HOSTED copy (pinned there; the device slot is shared
+            // with the pool remap and would race), at/above it the ids never leave the device.
+            const bool miss_on_cpu = n_tokens < llama_expert_pool_offload_min_batch();
             ggml_tensor * inv_tab = miss_on_cpu ? mnt.remap_inv_host : mnt.remap_inv;
             ggml_tensor * remap_inv_3d = ggml_reshape_3d(ctx0, inv_tab, 1, n_expert, 1);
             ggml_tensor * ids_cpu = ggml_get_rows(ctx0, remap_inv_3d, ids_flat);
@@ -2275,16 +2273,6 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     }
 
-    // miss method gpu: the miss chain's mmids run on the pool device at every batch
-    // size. the weights stay host-resident, so this is a node-level backend override
-    // around the scheduler's own rule (a host-weight op moves to the device only
-    // at/above the offload threshold). the split input copy is untouched: a
-    // host-weight mmid heading its split stages only the used rows.
-    auto pin_miss_mmid = [&](ggml_tensor * t) {
-        if (mount_p != nullptr && cparams.expert_pool_miss_method == LLAMA_EXPERT_POOL_MISS_GPU) {
-            ggml_backend_sched_set_tensor_backend(sched, t, ggml_backend_sched_get_backend(sched, 0));
-        }
-    };
 
     if (chain_weights_in != nullptr) {
         // the mounted chain (chain_only) skipped the routing section, so take the
@@ -2324,7 +2312,6 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         if (mount_p != nullptr) {
             // the miss chain's first node (lane form: this staged mmid heads its split)
             llama_expert_pool_bind_split_head(*expert_pool, il, gate_up, /*lane=*/true);
-            pin_miss_mmid(gate_up);
         }
         cb(gate_up, "ffn_moe_gate_up", il);
 
@@ -2356,7 +2343,6 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         up = build_lora_mm_id(up_exps, cur, selected_experts, up_exps_s); // [n_ff, n_expert_used, n_tokens]
         if (mount_p != nullptr) {
             llama_expert_pool_bind_split_head(*expert_pool, il, up, /*lane=*/true);
-            pin_miss_mmid(up);
         }
         cb(up, "ffn_moe_up", il);
 
@@ -2380,7 +2366,6 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             cur = build_lora_mm_id(gate_exps, cur, selected_experts, gate_exps_s); // [n_ff, n_expert_used, n_tokens]
             if (mount_p != nullptr) {
                 llama_expert_pool_bind_split_head(*expert_pool, il, cur, /*lane=*/true);
-                pin_miss_mmid(cur);
             }
             cb(cur, "ffn_moe_gate", il);
         } else {
@@ -2496,7 +2481,6 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     }
     if (mount_p != nullptr) {
         llama_expert_pool_bind_split_head(*expert_pool, il, experts, /*lane=*/true);
-        pin_miss_mmid(experts);
     }
     cb(experts, "ffn_moe_down", il);
 
