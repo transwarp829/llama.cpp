@@ -106,7 +106,7 @@ void llama_expert_pool_state::stop_worker() {
 void llama_expert_pool_push_marker(llama_expert_pool_state & st) {
     llama_expert_pool_state::route_block m;
     m.step = st.hook_step;
-    m.ilx  = -1;
+    m.il   = -1;
     {
         std::lock_guard<std::mutex> lk(st.route_mtx);
         st.route_q.push_back(std::move(m));
@@ -115,14 +115,14 @@ void llama_expert_pool_push_marker(llama_expert_pool_state & st) {
 }
 
 // push the layer's full activation row (clean topk ids). observer thread only.
-static void route_push_row(llama_expert_pool_state & st, int32_t step, int32_t ilx,
+static void route_push_row(llama_expert_pool_state & st, int32_t step, int32_t il,
                            const int32_t * ids, int32_t n_used, int32_t n_tok) {
     if (ids == nullptr || n_used <= 0 || n_tok <= 0) {
         return;
     }
     llama_expert_pool_state::route_block rb;
     rb.step  = step;
-    rb.ilx   = ilx;
+    rb.il   = il;
     rb.n_tok = n_tok;
     rb.ids.reserve((size_t) n_used * (size_t) n_tok);
     // the row is the contiguous [n_used*n_tok, 1] I32 copy of the topk output
@@ -452,7 +452,7 @@ void llama_expert_pool_observe_split_head(void * user_data, ggml_tensor * head, 
     st.last_ilx = ilx;
     // the layer's full activation row: one tick per step regardless of the tokens
     if (st.swap_auto) {
-        route_push_row(st, st.hook_step, ilx, ids, n_used, n_tok);
+        route_push_row(st, st.hook_step, il, ids, n_used, n_tok);
     }
     // hit/miss from the inverse half of the published table (what this graph read)
     const int32_t pub = st.mirror_pub.load(std::memory_order_acquire);
@@ -575,7 +575,7 @@ void llama_expert_pool_account_ids(llama_expert_pool_state & st) {
         st.stat[ilx].hit += rows;
         st.seg.hit       += rows;
         if (st.swap_auto) {
-            route_push_row(st, st.hook_step, (int32_t) ilx, st.ids_buf.data(), n_used, n_tok);
+            route_push_row(st, st.hook_step, il, st.ids_buf.data(), n_used, n_tok);
         }
         any = true;
     }
@@ -702,7 +702,7 @@ static int32_t worker_decide_and_copy(llama_expert_pool_state & st) {
         return 0;
     }
     struct pair_t {
-        int32_t ilx;
+        int32_t il;
         int32_t e;    // expert to swap in
         int32_t slot; // slot to fill
         float   cnt;  // decayed activation count of the incoming expert
@@ -764,7 +764,7 @@ static int32_t worker_decide_and_copy(llama_expert_pool_state & st) {
         std::vector<std::pair<float, int32_t>> hot; // (cnt, e)
         hot.reserve((size_t) n_expert);
         for (int32_t e = 0; e < n_expert; ++e) {
-            const float c = st.act_cnt[ilx * n_expert + e];
+            const float c = st.act_cnt[il * n_expert + e];
             if (c > 0) {
                 hot.emplace_back(c, e);
             }
@@ -803,7 +803,7 @@ static int32_t worker_decide_and_copy(llama_expert_pool_state & st) {
                     empty.push_back(s);
                 }
             } else if (!in_topk[e]) {
-                out.emplace_back(st.act_cnt[ilx * n_expert + e], s);
+                out.emplace_back(st.act_cnt[il * n_expert + e], s);
             }
         }
         std::sort(out.begin(), out.end(), [](const auto & a, const auto & b) {
@@ -814,14 +814,14 @@ static int32_t worker_decide_and_copy(llama_expert_pool_state & st) {
         for (int32_t i = 0; i < npairs; ++i) {
             const int32_t slot = i < (int32_t) empty.size()
                 ? empty[i] : out[i - (int32_t) empty.size()].second;
-            queue.push_back({ilx, in[i].second, slot, in[i].first});
+            queue.push_back({il, in[i].second, slot, in[i].first});
         }
     }
     // execute in count order, descending, until the per-step limit is passed
     const int32_t limit = st.swap_per_step;
     std::sort(queue.begin(), queue.end(), [](const pair_t & a, const pair_t & b) {
         if (a.cnt != b.cnt) return a.cnt > b.cnt;
-        if (a.ilx != b.ilx) return a.ilx < b.ilx;
+        if (a.il != b.il) return a.il < b.il;
         if (a.e != b.e)     return a.e < b.e;
         return a.slot < b.slot;
     });
@@ -833,7 +833,7 @@ static int32_t worker_decide_and_copy(llama_expert_pool_state & st) {
             deferred = total - planned;
             break;
         }
-        const int32_t il = st.pooled_layers[p.ilx];
+        const int32_t il = p.il;
         std::vector<int32_t> & res = st.resident[il];
         const int32_t victim_e = res[p.slot];
         // unmap the victim: once the mirror built below is published, no
@@ -872,7 +872,7 @@ bool llama_expert_pool_worker_settle(llama_expert_pool_state & st) {
         // find the first marker WITHOUT consuming: rows are only complete once
         // their marker arrives, so an early wake must leave the queue untouched
         size_t nrows = 0;
-        for (; nrows < st.route_q.size() && st.route_q[nrows].ilx >= 0; ++nrows) {
+        for (; nrows < st.route_q.size() && st.route_q[nrows].il >= 0; ++nrows) {
         }
         if (nrows >= st.route_q.size()) {
             return false; // no marker queued - nothing to settle
@@ -890,7 +890,7 @@ bool llama_expert_pool_worker_settle(llama_expert_pool_state & st) {
     }
     // lazy allocation of the counters
     if (st.act_cnt.empty() && !st.pooled_layers.empty()) {
-        st.act_cnt.assign((size_t) st.pooled_layers.size() * st.n_expert, 0.0f);
+        st.act_cnt.assign(st.layers.size() * (size_t) st.n_expert, 0.0f);
     }
     // count by the rows' own step id: a lagging worker may drain several old
     // steps at once, so each step gets one decay tick and then its rows land
@@ -908,7 +908,7 @@ bool llama_expert_pool_worker_settle(llama_expert_pool_state & st) {
             const llama_expert_pool_state::route_block & rb = rows[j];
             const float inc = 1.0f / (float) (rb.n_tok > 0 ? rb.n_tok : 1);
             for (const int32_t e : rb.ids) {
-                st.act_cnt[rb.ilx * st.n_expert + e] += inc;
+                st.act_cnt[rb.il * st.n_expert + e] += inc;
             }
         }
         i = j;

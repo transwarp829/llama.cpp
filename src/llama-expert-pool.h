@@ -190,7 +190,7 @@ struct llama_expert_pool_state {
     // (step, layer) carrying the layer's full activation ids
     struct route_block {
         int32_t step = 0;                  // decode step this row belongs to
-        int32_t ilx  = -1;                 // pooled layer index (-1 = step marker)
+        int32_t il   = -1;                 // the layer (-1 = step marker)
         int32_t n_tok = 1;                 // token columns (decay: increments are 1/n_tok)
         std::vector<int32_t> ids;          // full activation expert ids
     };
@@ -207,7 +207,8 @@ struct llama_expert_pool_state {
     // (1/n_tok per activation), so a batch of n columns is one step of evidence
     float   swap_lambda   = 0.0f;          // per-step decay, lambda = 2^(-1/H)
     int32_t swap_decay_hl = 96;            // decay half-life in steps (default 96)
-    std::vector<float> act_cnt;            // [pooled layers * n_expert] decayed counts
+    std::vector<float> act_cnt;            // [layers * n_expert] decayed counts (keyed by
+                                           // layer, so a layout switch keeps them)
     int32_t swap_sum = 0;                  // exchanges accumulated this period (slot-less report)
     int32_t swap_steps = 0;                // settled steps of that period (same reset as swap_sum)
     // monotonic ctx-level swap total: the per-slot windows snapshot it (never reset)
