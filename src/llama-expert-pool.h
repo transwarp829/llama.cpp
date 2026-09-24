@@ -144,8 +144,13 @@ struct llama_expert_pool_state {
     // resident expert lists, indexed by layer (diagnostics/serialization)
     std::vector<std::vector<int32_t>> resident;
 
-    // pooled layer indices (filled at init, consumed by the delayed fill)
+    // pooled layer indices (filled at init, consumed by the delayed fill). every eligible
+    // layer is a pool layer: the layout only picks its width ({0, .., n_expert}), so a
+    // layer stays observed (and its counters stay warm) even while nothing of it is
+    // resident
     std::vector<int32_t> pooled_layers;
+    // pool membership by layer (the graph asks before handing its rows over)
+    std::vector<uint8_t> pool_flag;
 
     // split-head registry, rebuilt per graph build (the builder registers each
     // pooled layer's clean topk ids and the miss chain's first node)
@@ -156,12 +161,15 @@ struct llama_expert_pool_state {
     };
     mutable std::unordered_map<const ggml_tensor *, split_head_ref> split_head_refs;
     mutable int32_t                          bind_last_il = -1;
-    mutable std::vector<const ggml_tensor *> ids_clean;   // [layer] clean topk ids
+    mutable std::vector<const ggml_tensor *> ids_clean;   // [layer] clean topk ids (a view
+                                                          // of the pool-side copy below)
     mutable std::vector<int32_t>             ids_n_used;  // [layer]
+    // [layer] pool-side copy of the layer's top-k rows: the graph writes it every ubatch
+    // and the pool reads it after the graph, so it must NOT live in the graph arena -
+    // the allocator reuses a short-lived tensor's memory as soon as its last consumer
+    // ran, and the values would be gone by the read
+    std::vector<ggml_tensor *> ids_shadow;
     mutable std::vector<int32_t>             ids_buf;     // host scratch for a device read
-    // window-step detector (independent of the swap-side step_done: the first
-    // step of a run has no predecessor, so only the layer-index wrap can mark it)
-    int32_t win_last_il = -1;
     // route-observer step flag (the wrap is detected by the layer index)
     int32_t rtlog_prev_il = -1;
 
@@ -182,9 +190,6 @@ struct llama_expert_pool_state {
     int32_t n_expert = 0;                  // experts per layer (set at init)
     // step counter (only the worker owns the counters below)
     int32_t hook_step = 0;
-    // once per (step, layer): the observer reports every mmid split head of a
-    // layer and the ids are identical across them
-    int32_t last_ilx = -1;                 // last layer handled this step
 
     // routing rows from the observer to the swap worker: one block per
     // (step, layer) carrying the layer's full activation ids
@@ -305,12 +310,22 @@ void llama_expert_pool_bind_ids(const llama_expert_pool_state & st, int32_t il, 
 void llama_expert_pool_bind_split_head(const llama_expert_pool_state & st, int32_t il, const ggml_tensor * head, bool lane);
 void llama_expert_pool_observe_split_head(void * user_data, ggml_tensor * head, ggml_backend_t backend);
 
-// ubatch-boundary accounting for the fully resident (plain-path) layers: the split-head
-// hook cannot see them (their plain path forces no split, so they have no observed
-// head), and the graph hands the pool a contiguous copy of each such layer's top-k rows
-// instead. called after each ubatch computes: the rows land as hits (every expert of
-// that layer is resident) and as activation counts, and one step marker closes the
-// ubatch - so the swap machinery keeps its evidence through the whole-layer phase.
+// the pool-side copy of a pool layer's top-k rows (null when the layer is not pooled)
+inline ggml_tensor * llama_expert_pool_ids_shadow(const llama_expert_pool_state & st, int32_t il) {
+    return il >= 0 && (size_t) il < st.ids_shadow.size() ? st.ids_shadow[il] : nullptr;
+}
+
+// is this layer a pool layer? (all eligible layers are: the layout only sets their width)
+inline bool llama_expert_pool_is_pool_layer(const llama_expert_pool_state & st, int32_t il) {
+    return il >= 0 && (size_t) il < st.pool_flag.size() && st.pool_flag[il] != 0;
+}
+
+// ubatch-boundary accounting for the pool's layers: the graph hands every pool layer's
+// top-k rows over (the mount chains their own contiguous copy, the plain-path layers a
+// direct view at one token and a copy beyond that), and this reads them back once per
+// ubatch - the counters, the hit/miss statistics and the step boundary all come from
+// here. the split-head hook cannot do it: the plain path forces no split, so a fully
+// resident or width-0 layer has no observed head.
 void llama_expert_pool_account_ids(llama_expert_pool_state & st);
 
 // per-ubatch slot channel: the sequences (slots) that have columns in this

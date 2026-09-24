@@ -2244,20 +2244,26 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // (upstream's lane) and keeps them on the CPU below it.
     if (expert_pool != nullptr && cparams.expert_pool > 0 && il >= 0) {
         const llama_expert_pool_mount & mnt = expert_pool->mount(il);
-        if (mnt.active && mnt.full) {
-            // fully resident layer: the graph below is the plain path and reads no ids
-            // table at all, but the pool's counters must keep running through the
-            // whole-layer phase (the swap machinery they feed decides the roster when
-            // the layout switches back). hand them the same contiguous copy of the
-            // top-k rows the mount path makes; the pool reads it back once per ubatch
-            // (llama_expert_pool_account_ids), so nothing in this layer's computation
-            // changes - the copy is a dead end for the graph.
-            ggml_tensor * ids_c    = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_expert_used, n_tokens);
-            ggml_tensor * ids_cpy  = ggml_cpy(ctx0, selected_experts, ids_c);
-            ggml_tensor * ids_flat = ggml_reshape_2d(ctx0, ids_cpy, n_expert_used * n_tokens, 1);
-            llama_expert_pool_bind_ids(*expert_pool, il, (int32_t) n_expert_used, ids_flat);
-            ggml_build_forward_expand(gf, ids_flat);
-        } else if (mnt.active) {
+        // the pool's accounting needs every pool layer's top-k rows. the mount chain
+        // below builds its own contiguous copy of them; a plain-path pool layer (fully
+        // resident, or at width 0) hands them over here: at one token the sorted output
+        // is a single contiguous row, beyond that a copy makes it so. either way the
+        // pool reads it back at the ubatch boundary, and for the plain path the copy is
+        // a dead end - nothing in the layer's own computation changes.
+        auto hand_rows = [&]() {
+            ggml_tensor * shadow = llama_expert_pool_ids_shadow(*expert_pool, il);
+            if (shadow == nullptr) {
+                return;
+            }
+            // the copy lands in the pool's own buffer: the pool reads it after the graph
+            // ran, and a graph-arena tensor's memory is reused by later nodes before that
+            ggml_tensor * ids_dst = ggml_view_2d(ctx0, shadow, n_expert_used, n_tokens,
+                                                 n_expert_used * ggml_type_size(GGML_TYPE_I32), 0);
+            ggml_tensor * ids_cpy = ggml_cpy(ctx0, selected_experts, ids_dst);
+            ggml_build_forward_expand(gf, ids_cpy);
+            llama_expert_pool_bind_ids(*expert_pool, il, (int32_t) n_expert_used, ids_dst);
+        };
+        if (mnt.active && !mnt.full) {
             // all tables live on the device, so every gather runs on the GPU segment
             // from the same topk ids (ids_cpu and the scale values reach the CPU
             // segment as 32B split inputs, keeping it lookup-free). the I32 tables
@@ -2267,7 +2273,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             // [n_used*T, 1] (an I32 REPEAT has no CUDA kernel) and copied contiguous
             // first (topk is a strided view; get_rows tolerates that, a reshape does
             // not) - one gather then serves every batch size.
-            ggml_tensor * ids_c = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_expert_used, n_tokens);
+            ggml_tensor * ids_shadow = llama_expert_pool_ids_shadow(*expert_pool, il);
+            ggml_tensor * ids_c = ids_shadow != nullptr
+                ? ggml_view_2d(ctx0, ids_shadow, n_expert_used, n_tokens,
+                               n_expert_used * ggml_type_size(GGML_TYPE_I32), 0)
+                : ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_expert_used, n_tokens);
             ggml_tensor * ids_cpy = ggml_cpy(ctx0, selected_experts, ids_c);
             ggml_tensor * ids_flat = ggml_reshape_2d(ctx0, ids_cpy, n_expert_used * n_tokens, 1);
             // register the layer's clean topk rows for the split-head observer
@@ -2328,6 +2338,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             // the mount block is expanded at the end of this function, after the miss
             // chain: build order is not graph order
 
+        } else if (llama_expert_pool_is_pool_layer(*expert_pool, il)) {
+            hand_rows();
         }
     }
 

@@ -57,8 +57,6 @@ void llama_expert_pool_state::reset() {
 
     swap_auto = false;
     hook_step = 0;
-    last_ilx = -1;
-    win_last_il = -1;
     settled_steps = 0;
     act_cnt.clear();
     swap_sum = 0;
@@ -384,9 +382,9 @@ void llama_expert_pool_observe_split_head(void * user_data, ggml_tensor * head, 
     const int32_t n_used = registered && 0 <= il && il < (int32_t) st.ids_n_used.size() ? st.ids_n_used[il]
                           : (head->op == GGML_OP_MUL_MAT_ID ? (int32_t) head->ne[1] : 0);
     int32_t n_tok = 0;
-    // the rows are read for the pool's statistics (registered heads) or for the route observer;
-    // with neither there is nothing to read (and no device readback to pay for)
-    const int32_t * ids = (registered || g_route_cb != nullptr)
+    // the rows are read for the route observer only: the pool's own accounting reads the
+    // copies the graph hands it, at the ubatch boundary (llama_expert_pool_account_ids)
+    const int32_t * ids = g_route_cb != nullptr
         ? split_head_rows(st, head, backend, il, lane, registered, n_used, n_tok) : nullptr;
 
     // route observer: one row per (step, layer), ctx-level - all columns of the
@@ -397,97 +395,17 @@ void llama_expert_pool_observe_split_head(void * user_data, ggml_tensor * head, 
         g_route_cb(g_route_ud, il, ids, n_used, prev >= 0 && il < prev ? 1 : 0);
     }
 
-    // pool statistics: registered heads of a direct-mount pool only
-    if (ids == nullptr || !registered || !st.direct_mount || st.pooled_layers.empty() || ilx < 0) {
+    // step boundary: splits run in layer order, so the first active-mount layer of a
+    // step is where the mirror that step's tables show has to be in place
+    if (!registered || !st.direct_mount || st.pooled_layers.empty() || ilx < 0) {
         return;
     }
-    if (st.last_ilx == ilx) {
-        // once per (step, layer): the lane form reports every miss mmid of the layer
-        return;
-    }
-
-    if (st.stat.empty()) {
-        st.stat.assign(st.pooled_layers.size(), llama_expert_pool_counts{});
-    }
-    // step-advance: splits run in layer order, so this follows the previous step's last
     const bool first_of_step = ilx == st.first_active_ilx && st.step_done;
     if (first_of_step) {
         st.step_done = false;
-        // new step: re-arm the per-layer gate (a single active layer would stick)
-        st.last_ilx = -1;
         if (st.swap_auto) {
             // publish the ready mirror (the only table write point; none ready = keep the old mapping)
             llama_expert_pool_tab_publish(st);
-            llama_expert_pool_push_marker(st);
-            st.hook_step += 1;
-            {
-                std::lock_guard<std::mutex> lk(st.route_mtx);
-                st.step_slots_hist.emplace_back(st.hook_step, st.step_slots);
-            }
-        }
-    }
-    // segment windows: open the windows of this step's slots and count the step
-    // in each (the layer index that does not advance starts a new step)
-    {
-        const bool win_new_step = st.win_last_il < 0 || ilx <= st.win_last_il;
-        st.win_last_il = ilx;
-        if (win_new_step) {
-            for (const int32_t s : st.step_slots) {
-                if (s < 0 || s >= LLAMA_MAX_SEQ) {
-                    continue;
-                }
-                llama_expert_pool_state::slot_window & w = st.slot_windows[s];
-                if (!w.open.load(std::memory_order_relaxed)) {
-                    w.swap_base = st.swap_total.load(std::memory_order_relaxed);
-                    w.pairs.store(0, std::memory_order_relaxed);
-                    w.steps = 0;
-                    w.hit = 0;
-                    w.miss = 0;
-                    w.open.store(true, std::memory_order_relaxed);
-                }
-                w.steps ++;
-            }
-        }
-    }
-    st.last_ilx = ilx;
-    // the layer's full activation row: one tick per step regardless of the tokens
-    if (st.swap_auto) {
-        route_push_row(st, st.hook_step, il, ids, n_used, n_tok);
-    }
-    // hit/miss from the inverse half of the published table (what this graph read)
-    const int32_t pub = st.mirror_pub.load(std::memory_order_acquire);
-    if (st.direct_mount && pub >= 0 && pub < 3 && !st.tab_mirror[pub].empty()) {
-        const int32_t * inv = st.tab_mirror[pub].data() +
-                              (size_t) st.n_expert * st.layers.size() + (size_t) il * st.n_expert;
-        uint64_t row_hit  = 0;
-        uint64_t row_miss = 0;
-        for (int64_t i = 0; i < (int64_t) n_used * (int64_t) n_tok; ++i) {
-            const int32_t e = ids[i];
-            if (e < 0 || e >= st.n_expert) {
-                continue;
-            }
-            if (inv[e] == -1) {
-                st.stat[ilx].hit ++;
-                st.seg.hit ++;
-                row_hit ++;
-            } else {
-                st.stat[ilx].miss ++;
-                st.seg.miss ++;
-                row_miss ++;
-            }
-        }
-        // the window caliber is the pool's, so every slot taking part in this
-        // step sees the same rows (their windows differ only in which steps)
-        for (const int32_t s : st.step_slots) {
-            if (s < 0 || s >= LLAMA_MAX_SEQ) {
-                continue;
-            }
-            llama_expert_pool_state::slot_window & w = st.slot_windows[s];
-            if (!w.open.load(std::memory_order_relaxed)) {
-                continue;
-            }
-            w.hit  += row_hit;
-            w.miss += row_miss;
         }
     }
     // the LAST active-mount layer completes the step: a 0-slot layer has no mount
@@ -541,47 +459,105 @@ void llama_expert_pool_bind_split_head(const llama_expert_pool_state & st, int32
     st.split_head_refs[head] = { il, ilx, lane };
 }
 
-// ubatch-boundary accounting for the fully resident (plain-path) layers (see the
-// declaration): the graph registered their contiguous top-k copy, this reads it back
-// once per ubatch and feeds the same counters the split-head hook feeds for the mount
-// path. every routed row of such a layer is a hit - its whole expert set is resident.
+// ubatch-boundary accounting for the pool's layers: the graph hands every pool layer's
+// top-k rows over, this reads them back once per ubatch and feeds everything the
+// split-head hook used to feed - the counters, the per-layer hit/miss, the slot windows
+// and the step marker. the hook keeps only the mirror publish (it has to happen before
+// the next step's graphs read the tables) and the route observer.
 void llama_expert_pool_account_ids(llama_expert_pool_state & st) {
     if (!st.direct_mount || st.pooled_layers.empty() || st.phase != llama_expert_pool_state::PHASE_FILLED) {
         return;
     }
+    const int32_t pub = st.mirror_pub.load(std::memory_order_acquire);
+    const bool have_mirror = pub >= 0 && pub < 3 && !st.tab_mirror[pub].empty();
+    const size_t n_half = (size_t) st.n_expert * st.layers.size();
+
+    // this ubatch is one step: open the windows of its slots and count it in each (the
+    // step boundary the mount path's hook used to detect by the layer order)
+    for (const int32_t s : st.step_slots) {
+        if (s < 0 || s >= LLAMA_MAX_SEQ) {
+            continue;
+        }
+        llama_expert_pool_state::slot_window & w = st.slot_windows[s];
+        if (!w.open.load(std::memory_order_relaxed)) {
+            w.swap_base = st.swap_total.load(std::memory_order_relaxed);
+            w.pairs.store(0, std::memory_order_relaxed);
+            w.steps = 0;
+            w.hit = 0;
+            w.miss = 0;
+            w.open.store(true, std::memory_order_relaxed);
+        }
+        w.steps ++;
+    }
+
     bool any = false;
     for (size_t ilx = 0; ilx < st.pooled_layers.size(); ++ilx) {
         const int32_t il = st.pooled_layers[ilx];
-        const llama_expert_pool_mount & m = st.mount(il);
-        if (!m.active || !m.full) {
-            continue;
-        }
         const ggml_tensor * ids = (size_t) il < st.ids_clean.size() ? st.ids_clean[il] : nullptr;
         const int32_t n_used = (size_t) il < st.ids_n_used.size() ? st.ids_n_used[il] : 0;
-        if (ids == nullptr || n_used <= 0 || ids->ne[1] != 1 || ids->ne[0] <= 0) {
+        if (ids == nullptr || n_used <= 0 || ids->type != GGML_TYPE_I32 || ids->ne[0] <= 0) {
             continue;
         }
-        const int64_t n_rows = ids->ne[0];
-        const int32_t n_tok  = (int32_t) (n_rows / n_used);
-        if (n_tok <= 0) {
+        const int64_t n_rows = ggml_nelements(ids);
+        if (n_rows <= 0 || n_rows % n_used != 0) {
             continue;
         }
+        const int32_t n_tok = (int32_t) (n_rows / n_used);
         st.ids_buf.resize((size_t) n_rows);
         ggml_backend_tensor_get(ids, st.ids_buf.data(), 0, ggml_nbytes(ids));
-        if (st.stat.size() != st.pooled_layers.size()) {
-            st.stat.assign(st.pooled_layers.size(), llama_expert_pool_counts{});
-        }
-        const uint64_t rows = (uint64_t) n_rows;
-        st.stat[ilx].hit += rows;
-        st.seg.hit       += rows;
+        LLAMA_LOG_INFO("%s: il %d rows %d n_used %d n_tok %d nb %zu full %d\n",
+                __func__, il, (int) n_rows, n_used, n_tok, ggml_nbytes(ids), (int) st.mount(il).full);
         if (st.swap_auto) {
             route_push_row(st, st.hook_step, il, st.ids_buf.data(), n_used, n_tok);
+        }
+        // hit/miss from the inverse half of the published table (what this graph read).
+        // a width-0 layer has no residents, so there is nothing to classify: its rows
+        // feed the counters alone (a later layout may pool it)
+        if (have_mirror && !st.resident[il].empty()) {
+            const int32_t * inv = st.tab_mirror[pub].data() + n_half + (size_t) il * st.n_expert;
+            uint64_t row_hit  = 0;
+            uint64_t row_miss = 0;
+            for (int64_t i = 0; i < n_rows; ++i) {
+                const int32_t e = st.ids_buf[i];
+                if (e < 0 || e >= st.n_expert) {
+                    continue;
+                }
+                if (inv[e] == -1) {
+                    row_hit ++;
+                } else {
+                    row_miss ++;
+                }
+            }
+            if (st.stat.size() != st.pooled_layers.size()) {
+                st.stat.assign(st.pooled_layers.size(), llama_expert_pool_counts{});
+            }
+            st.stat[ilx].hit  += row_hit;
+            st.stat[ilx].miss += row_miss;
+            st.seg.hit        += row_hit;
+            st.seg.miss       += row_miss;
+            // the window caliber is the pool's, so every slot taking part in this step
+            // sees the same rows (their windows differ only in which steps)
+            for (const int32_t s : st.step_slots) {
+                if (s < 0 || s >= LLAMA_MAX_SEQ) {
+                    continue;
+                }
+                llama_expert_pool_state::slot_window & w = st.slot_windows[s];
+                if (!w.open.load(std::memory_order_relaxed)) {
+                    continue;
+                }
+                w.hit  += row_hit;
+                w.miss += row_miss;
+            }
         }
         any = true;
     }
     if (any && st.swap_auto) {
-        // one step per ubatch, the same boundary the mount path's hook marks
+        // the ubatch's rows are complete: mark the step (the worker settles on it)
         llama_expert_pool_push_marker(st);
+        {
+            std::lock_guard<std::mutex> lk(st.route_mtx);
+            st.step_slots_hist.emplace_back(st.hook_step, st.step_slots);
+        }
         st.hook_step += 1;
     }
 }
