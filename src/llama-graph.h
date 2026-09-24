@@ -1184,11 +1184,11 @@ struct llm_graph_context {
              ggml_tensor * selected_experts_in = nullptr,
              ggml_tensor * chain_weights_in = nullptr,
              // the pooled chains read their per-expert tables through ids of their own:
-             // the scale lookup needs indexable rows (the clean topk, multiplication is
-             // 0-safe), the bias lookup needs add_id's -1 pass-through (the masked
-             // remap_b rows). null keeps the mtid ids the caller supplied.
+             // the scale lookup needs indexable rows (the clean topk - a multiplication
+             // is 0-safe), while the bias lookup rides the chain's own masked ids, which
+             // add_id's -1 pass-through keeps exact. null keeps the table ids the caller
+             // supplied.
              ggml_tensor * ids_for_scale_in = nullptr,
-             ggml_tensor * ids_for_bias_in  = nullptr,
                      bool   chain_only = false) const;
 
     //

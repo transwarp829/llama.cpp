@@ -60,15 +60,13 @@ struct llama_expert_pool_mount {
     ggml_tensor * w_down_s  = nullptr; // per-expert down scale source (staged into `scale`)
     ggml_tensor * w_gate_up_b = nullptr; // the model's fused per-expert bias [n_ff*2, n_expert],
     ggml_tensor * w_up_b      = nullptr; // the separate ones [n_ff, n_expert] / [n_embd, n_expert]:
-    ggml_tensor * w_gate_b    = nullptr; // device copies in the model's own expert order,
-    ggml_tensor * w_down_b    = nullptr; // indexed by remap_b (never swapped)
+    ggml_tensor * w_gate_b    = nullptr; // slot-compact pool copies [.., S], swapped with the
+    ggml_tensor * w_down_b    = nullptr; // weights, indexed by the chain's own masked ids
     ggml_tensor * remap     = nullptr; // I32 [1, n_expert] on the pool device: resident -> slot, else -1
     ggml_tensor * remap_inv_host = nullptr; // I32 [1, n_expert] on the CPU: resident -> -1, else expert id
                                             // (read when the miss mmids stay on the CPU)
     ggml_tensor * remap_inv = nullptr; // I32 [1, n_expert] on the pool device: the inv half, gathered
                                       // device-side when the miss mmids run there
-    ggml_tensor * remap_b   = nullptr; // I32 [1, n_expert]: resident -> expert id, else -1 - the bias
-                                      // lookups ride it (add_id needs the -1 pass-through)
     ggml_tensor * scale     = nullptr; // F32 [1, n_expert] on the pool device: per-expert down scale
     ggml_tensor * scale_up   = nullptr; // F32 [1, n_expert]: up scale, same form
     ggml_tensor * scale_gate = nullptr; // F32 [1, n_expert]: gate scale, same
@@ -82,26 +80,27 @@ struct llama_expert_pool_mount {
 
 // per-layer expert tensors the pool copies and the swap moves. the kind order
 // is the array index used everywhere (extend here and in the per-layer source
-// table of expert_pool_build when a tensor lands). weights are slot-compact
-// (slot s holds the s-th resident expert); the per-expert biases are copies of
-// the model's own tensors, expert order, written once and never swapped.
+// table of expert_pool_build when a tensor lands). the weights AND the
+// per-expert biases are slot-compact (slot s holds the s-th resident expert)
+// and move together - the slot is one expert. the per-expert scales are a 1D
+// scalar table: expert order, written once, never swapped (slot-ordering the
+// scale would need a second mask-free ids table for a 4-byte payload).
 enum llama_expert_pool_kind {
     PK_GATE_UP = 0, // fused gate+up [n_ff*2, n_embd, n_expert]; pool [.., S]
     PK_UP,          // separate up [n_ff, n_embd, n_expert]
     PK_GATE,        // separate gate [n_ff, n_embd, n_expert]
     PK_DOWN,        // down [n_embd, n_ff, n_expert]
-    PK_GATE_UP_B,   // per-expert fused bias [n_ff*2, n_expert]; pool copy as the model
-    PK_UP_B,        // per-expert bias [n_ff, n_expert]      has it, indexed by expert id
-    PK_GATE_B,      // per-expert bias [n_ff, n_expert]      (the masked remap_b rows)
-    PK_DOWN_B,      // per-expert bias [n_embd, n_expert]
+    PK_GATE_UP_B,   // per-expert fused bias [n_ff*2, n_expert]; pool [.., S],
+    PK_UP_B,        // per-expert bias [n_ff, n_expert]      slot-compact like
+    PK_GATE_B,      // per-expert bias [n_ff, n_expert]      the weights: the
+    PK_DOWN_B,      // per-expert bias [n_embd, n_expert]    chain's own ids index it
     PK_N,
 };
 
-// per-expert byte stride of a pool weight copy: nb[2] of the 4D slot tensors
-// (a 2D tensor's nb[2] would be the whole tensor, which is why the biases are
-// not slot-copied at all)
-inline size_t llama_expert_pool_stride(const ggml_tensor * t) {
-    return t->nb[2];
+// per-expert byte stride: ne[2] for the 4D weight copies, ne[1] for the
+// slot-compact 2D bias copies (nb[2] of a 2D tensor is the whole tensor size)
+inline size_t llama_expert_pool_stride(const ggml_tensor * t, int k) {
+    return k < PK_UP_B ? t->nb[2] : t->nb[1];
 }
 
 struct llama_expert_pool_layer {
@@ -255,11 +254,11 @@ struct llama_expert_pool_state {
     // backend owning the pool buft (the hook publishes the tables on its main stream)
     ggml_backend_t pool_backend = nullptr;
 
-    // merged mount tables: all three halves live in tab_all (remap, inv, remap_b
-    // blocks) in the mirror's own layout, so publishing is one stream-ordered
+    // merged mount tables: both halves live in tab_all (remap block, then inv
+    // block) in the mirror's own layout, so publishing is one stream-ordered
     // copy and each layer's tables are views. tab_cpu keeps the CPU-side copy
     // of the inv half for the host-segment reads below the offload threshold
-    ggml_tensor * tab_all = nullptr;             // [n_expert, 3*n_layers] remap|inv|remap_b (pool device)
+    ggml_tensor * tab_all = nullptr;             // [n_expert, 2*n_layers] remap|inv (pool device)
     ggml_tensor * tab_cpu = nullptr;             // [n_expert, n_layers] remap_inv (CPU buft)
     std::vector<int32_t> tab_mirror[3];          // host mirror slots (see mirror_ready/pub)
 

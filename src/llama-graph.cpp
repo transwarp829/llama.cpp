@@ -2054,7 +2054,6 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * selected_experts_in,
          ggml_tensor * chain_weights_in,
          ggml_tensor * ids_for_scale_in,
-         ggml_tensor * ids_for_bias_in,
                  bool   chain_only) const {
     const int64_t n_embd   = cur->ne[0];
     const int64_t n_tokens = cur->ne[1];
@@ -2311,11 +2310,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         // the CPU chain reads the inverse remap: resident columns are -1 (zeroed natively)
         selected_experts = mount_ids_cpu;
     }
-    // the bias lookups ride the chain's own ids unless the caller named a set: the miss
-    // chain reads the model's own tables through the masked inverse remap (a resident
-    // column stays -1, so add_id passes its zero through), the mount chain the pool's
-    // copies through the masked remap_b (a non-resident column stays -1)
-    ggml_tensor * ids_for_bias = ids_for_bias_in != nullptr ? ids_for_bias_in : selected_experts;
+    // the per-expert bias lookups ride the chain's own ids - slot ids for the mount
+    // chain (its bias tables are slot-compact, moving with the weights), the masked
+    // inverse remap for the miss chain (the model's own bias tensors). add_id's -1
+    // pass-through keeps the other chain's columns at zero, so no extra ids are
+    // needed here; only the scale lookup, which get_rows must index, needs its own.
 
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
     if (chain_only) {
@@ -2354,7 +2353,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }
 
         if (gate_up_exps_b) {
-            gate_up = ggml_add_id(ctx0, gate_up, gate_up_exps_b, ids_for_bias);
+            gate_up = ggml_add_id(ctx0, gate_up, gate_up_exps_b, selected_experts);
             cb(gate_up, "ffn_moe_gate_up_biased", il);
         }
 
@@ -2380,7 +2379,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }
 
         if (up_exps_b) {
-            up = ggml_add_id(ctx0, up, up_exps_b, ids_for_bias);
+            up = ggml_add_id(ctx0, up, up_exps_b, selected_experts);
             cb(up, "ffn_moe_up_biased", il);
         }
 
@@ -2407,7 +2406,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }
 
         if (gate_exps_b) {
-            cur = ggml_add_id(ctx0, cur, gate_exps_b, ids_for_bias);
+            cur = ggml_add_id(ctx0, cur, gate_exps_b, selected_experts);
             cb(cur, "ffn_moe_gate_biased", il);
         }
     }
@@ -2517,7 +2516,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     }
 
     if (down_exps_b) {
-        experts = ggml_add_id(ctx0, experts, down_exps_b, ids_for_bias);
+        experts = ggml_add_id(ctx0, experts, down_exps_b, selected_experts);
         cb(experts, "ffn_moe_down_biased", il);
     }
 
@@ -2536,7 +2535,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             n_expert, n_expert_used, type_op, norm_w, w_scale, gating_op, il,
             nullptr, mount_p->w_gate_up, mount_p->w_gate_up_b,
             mount_p->scale_up, mount_p->scale_gate, mount_p->scale, ids_remap, weights,
-            ids_for_scale, mount_p->remap_b, true);
+            ids_for_scale, true);
         cb(mount_out, "ffn_moe_mount", il);
         ggml_backend_sched_set_node_role(sched, mount_out, GGML_BACKEND_SCHED_ROLE_MOUNT_TAIL);
     };
