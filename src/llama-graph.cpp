@@ -1558,6 +1558,19 @@ ggml_tensor * llm_graph_context::build_lora_mm(
     return res;
 }
 
+// the scale half of build_lora_mm_id: identical ops, shapes and position (right after
+// the matmul), so a backend fusion keyed on the (matmul -> scale lookup -> mul) pattern
+// still matches. only the lookup ids differ: the pooled chains carry the -1 skip mask,
+// which get_rows cannot index, so the lookup rides the clean topk rows instead.
+ggml_tensor * llm_graph_context::moe_scale_mul(
+        ggml_context * ctx, ggml_tensor * res, ggml_tensor * w_s, ggml_tensor * ids_scale, int64_t n_tokens) {
+    const int64_t n_expert = w_s->ne[0];
+    ggml_tensor * s = ggml_reshape_3d(ctx, w_s, 1, n_expert, 1);
+    s = ggml_repeat_4d(ctx, s, 1, n_expert, n_tokens, 1);
+    s = ggml_get_rows(ctx, s, ids_scale);
+    return ggml_mul(ctx, res, s);
+}
+
 ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * w,   // ggml_tensor * as
           ggml_tensor * cur, // ggml_tensor * b
@@ -2040,8 +2053,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * down_exps_s,
          ggml_tensor * selected_experts_in,
          ggml_tensor * chain_weights_in,
-         ggml_tensor * chain_scale_up,
-         ggml_tensor * chain_scale_gate,
+         ggml_tensor * ids_for_scale_in,
+         ggml_tensor * ids_for_bias_in,
                  bool   chain_only) const {
     const int64_t n_embd   = cur->ne[0];
     const int64_t n_tokens = cur->ne[1];
@@ -2059,10 +2072,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     ggml_tensor * cur_mount_in = nullptr; // 2D cur for the mount chain (built at the end)
     const llama_expert_pool_mount * mount_p = nullptr; // mount tables for the mount chain
     ggml_tensor * ids_remap = nullptr; // remapped expert ids (pool chain), GPU segment
-    ggml_tensor * mount_scale = nullptr; // [1, n_used, T] down scale, gathered on
-                                         // the GPU segment, used by both chains
-    ggml_tensor * mount_scale_up = nullptr;   // factored up scale, pre-activation
-    ggml_tensor * mount_scale_gate = nullptr; // factored gate scale, same
+    ggml_tensor * ids_for_scale = ids_for_scale_in; // the scale lookups ride these ids
 
     if (!chain_only) {
         if (probs_in == nullptr) {
@@ -2243,6 +2253,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             // follows the batch size: below the offload threshold the chain runs on the
             // CPU and reads the CPU-HOSTED copy (pinned there; the device slot is shared
             // with the pool remap and would race), at/above it the ids never leave the device.
+            // below the offload threshold the miss chain runs on the CPU: the scales then
+            // read the model's host tables instead of the pool's device copies
             const bool miss_on_cpu = n_tokens < llama_expert_pool_offload_min_batch();
             ggml_tensor * inv_tab = miss_on_cpu ? mnt.remap_inv_host : mnt.remap_inv;
             ggml_tensor * remap_inv_3d = ggml_reshape_3d(ctx0, inv_tab, 1, n_expert, 1);
@@ -2256,31 +2268,25 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             cb(ids_cpu, "ffn_moe_ids_cpu", il);
             mount_ids_cpu = ids_cpu;
 
-            // per-expert down scale: same flat lookup, stays [1, n_used, T] (a 2D
-            // reshape would shift the broadcast and fail can_repeat for T>1)
-            if (mnt.scale != nullptr) {
-                ggml_tensor * sc3 = ggml_reshape_3d(ctx0, mnt.scale, 1, n_expert, 1);
-                mount_scale = ggml_get_rows(ctx0, sc3, ids_flat);
-                mount_scale = ggml_reshape_3d(ctx0, mount_scale, 1, n_expert_used, n_tokens);
-                cb(mount_scale, "ffn_moe_scale", il);
-                // call early so the scale lookup precedes the weighted mul (the CUDA
-                // MoE weighted-reduction matcher needs the two muls adjacent)
-                ggml_build_forward_expand(gf, mount_scale);
+            // the per-expert scales ride their native form (matmul -> scale lookup ->
+            // mul, see moe_scale_mul): the lookup indexes the table with the CLEAN topk
+            // rows, because the chain ids carry the -1 skip mask that get_rows cannot
+            // index. each chain reads the table that lives where it runs - the CPU miss
+            // chain the model's host copies, the lane and the mount chain the pool's
+            // device copies (same values) - so no scale crosses a backend.
+            if (!miss_on_cpu) {
+                if (mnt.scale != nullptr) {
+                    down_exps_s = mnt.scale;
+                }
+                if (mnt.scale_up != nullptr) {
+                    up_exps_s = mnt.scale_up;
+                }
+                if (mnt.scale_gate != nullptr) {
+                    gate_exps_s = mnt.scale_gate;
+                }
             }
-            // factored up/gate scales: same gather, consumed pre-activation on both
-            // chains (activation is nonlinear, so the scale cannot wait for the merge)
-            if (mnt.scale_up != nullptr) {
-                ggml_tensor * sc3 = ggml_reshape_3d(ctx0, mnt.scale_up, 1, n_expert, 1);
-                mount_scale_up = ggml_get_rows(ctx0, sc3, ids_flat);
-                mount_scale_up = ggml_reshape_3d(ctx0, mount_scale_up, 1, n_expert_used, n_tokens);
-                cb(mount_scale_up, "ffn_moe_scale_up", il);
-            }
-            if (mnt.scale_gate != nullptr) {
-                ggml_tensor * sc3 = ggml_reshape_3d(ctx0, mnt.scale_gate, 1, n_expert, 1);
-                mount_scale_gate = ggml_get_rows(ctx0, sc3, ids_flat);
-                mount_scale_gate = ggml_reshape_3d(ctx0, mount_scale_gate, 1, n_expert_used, n_tokens);
-                cb(mount_scale_gate, "ffn_moe_scale_gate", il);
-            }
+            // the 2D clean rows (get_rows requires the ids' ne[1] to match the table's ne[2])
+            ids_for_scale = ids_c;
 
             // keep the 2D cur for the mount block: the miss chain reshapes it to 3d
             // before its matmuls
@@ -2304,12 +2310,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     if (mount_ids_cpu != nullptr) {
         // the CPU chain reads the inverse remap: resident columns are -1 (zeroed natively)
         selected_experts = mount_ids_cpu;
-        // the scales would index ids that may contain -1 (get_rows cannot take that):
-        // they are re-applied per column via the factored mount_scale_*
-        down_exps_s = nullptr;
-        up_exps_s   = nullptr;
-        gate_exps_s = nullptr;
     }
+    // the bias lookups ride the chain's own ids unless the caller named a set: the miss
+    // chain reads the model's own tables through the masked inverse remap (a resident
+    // column stays -1, so add_id passes its zero through), the mount chain the pool's
+    // copies through the masked remap_b (a non-resident column stays -1)
+    ggml_tensor * ids_for_bias = ids_for_bias_in != nullptr ? ids_for_bias_in : selected_experts;
+
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
     if (chain_only) {
         // mount chain block head marker: the scheduler splits the GPU segment here so
@@ -2330,28 +2337,24 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     if (gate_up_exps) {
         // merged gate_up path: one mul_mat_id, then split into gate and up views
-        ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, selected_experts, up_exps_s); // [n_ff*2, n_expert_used, n_tokens]
+        ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, selected_experts, nullptr); // [n_ff*2, n_expert_used, n_tokens]
         if (mount_p != nullptr) {
             // the miss chain's first node (lane form: this staged mmid heads its split)
             llama_expert_pool_bind_split_head(*expert_pool, il, gate_up, /*lane=*/true);
         }
+        // per-expert up scale, applied where upstream applies it: right after the
+        // matmul, before the split (mm -> x scale -> +bias -> activation)
+        if (up_exps_s != nullptr) {
+            gate_up = moe_scale_mul(ctx0, gate_up, up_exps_s,
+                    ids_for_scale != nullptr ? ids_for_scale : selected_experts, n_tokens);
+        }
         cb(gate_up, "ffn_moe_gate_up", il);
-
         if (up_exps_s) {
             cb(gate_up, "ffn_moe_gate_up_scaled", il);
         }
-        // factored up scale: same point (post-mm, pre-split), so mm -> x scale -> +bias
-        // -> activation stays native on both chains
-        {
-            ggml_tensor * fu = chain_only ? chain_scale_up : mount_scale_up;
-            if (fu != nullptr) {
-                gate_up = ggml_mul(ctx0, gate_up, fu);
-                cb(gate_up, "ffn_moe_gate_up_fscale", il);
-            }
-        }
 
         if (gate_up_exps_b) {
-            gate_up = ggml_add_id(ctx0, gate_up, gate_up_exps_b, selected_experts);
+            gate_up = ggml_add_id(ctx0, gate_up, gate_up_exps_b, ids_for_bias);
             cb(gate_up, "ffn_moe_gate_up_biased", il);
         }
 
@@ -2362,51 +2365,49 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(up, "ffn_moe_up", il);
     } else {
         // separate gate and up path
-        up = build_lora_mm_id(up_exps, cur, selected_experts, up_exps_s); // [n_ff, n_expert_used, n_tokens]
+        up = build_lora_mm_id(up_exps, cur, selected_experts, nullptr); // [n_ff, n_expert_used, n_tokens]
         if (mount_p != nullptr) {
             llama_expert_pool_bind_split_head(*expert_pool, il, up, /*lane=*/true);
         }
+        if (up_exps_s != nullptr) {
+            // per-expert up scale, right after the matmul like upstream
+            up = moe_scale_mul(ctx0, up, up_exps_s,
+                    ids_for_scale != nullptr ? ids_for_scale : selected_experts, n_tokens);
+        }
         cb(up, "ffn_moe_up", il);
-
         if (up_exps_s) {
             cb(up, "ffn_moe_up_scaled", il);
         }
-        {
-            ggml_tensor * fu = chain_only ? chain_scale_up : mount_scale_up;
-            if (fu != nullptr) {
-                up = ggml_mul(ctx0, up, fu);
-                cb(up, "ffn_moe_up_fscale", il);
-            }
-        }
 
         if (up_exps_b) {
-            up = ggml_add_id(ctx0, up, up_exps_b, selected_experts);
+            up = ggml_add_id(ctx0, up, up_exps_b, ids_for_bias);
             cb(up, "ffn_moe_up_biased", il);
         }
 
         if (gate_exps) {
-            cur = build_lora_mm_id(gate_exps, cur, selected_experts, gate_exps_s); // [n_ff, n_expert_used, n_tokens]
+            cur = build_lora_mm_id(gate_exps, cur, selected_experts, nullptr); // [n_ff, n_expert_used, n_tokens]
             if (mount_p != nullptr) {
                 llama_expert_pool_bind_split_head(*expert_pool, il, cur, /*lane=*/true);
             }
-            cb(cur, "ffn_moe_gate", il);
         } else {
             cur = up;
         }
 
+        if (gate_exps_s != nullptr) {
+            // per-expert gate scale, right after the matmul like upstream
+            cur = moe_scale_mul(ctx0, cur, gate_exps_s,
+                    ids_for_scale != nullptr ? ids_for_scale : selected_experts, n_tokens);
+        }
+
+        if (gate_exps) {
+            cb(cur, "ffn_moe_gate", il);
+        }
         if (gate_exps_s) {
             cb(cur, "ffn_moe_gate_scaled", il);
         }
-        {
-            ggml_tensor * fg = chain_only ? chain_scale_gate : mount_scale_gate;
-            if (fg != nullptr) {
-                cur = ggml_mul(ctx0, cur, fg);
-                cb(cur, "ffn_moe_gate_fscale", il);
-            }
-        }
 
         if (gate_exps_b) {
-            cur = ggml_add_id(ctx0, cur, gate_exps_b, selected_experts);
+            cur = ggml_add_id(ctx0, cur, gate_exps_b, ids_for_bias);
             cb(cur, "ffn_moe_gate_biased", il);
         }
     }
@@ -2496,7 +2497,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             GGML_ABORT("fatal error");
     }
 
-    experts = build_lora_mm_id(down_exps, cur, selected_experts, down_exps_s); // [n_embd, n_expert_used, n_tokens]
+    experts = build_lora_mm_id(down_exps, cur, selected_experts, nullptr); // [n_embd, n_expert_used, n_tokens]
+    if (down_exps_s != nullptr) {
+        // per-expert down scale, right after the matmul like upstream
+        experts = moe_scale_mul(ctx0, experts, down_exps_s,
+                ids_for_scale != nullptr ? ids_for_scale : selected_experts, n_tokens);
+    }
     if (arch == LLM_ARCH_MISTRAL4) {
         // src1 can exceed F16 range
         ggml_prec_set_src(experts, GGML_PREC_F32, 1);
@@ -2511,7 +2517,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     }
 
     if (down_exps_b) {
-        experts = ggml_add_id(ctx0, experts, down_exps_b, selected_experts);
+        experts = ggml_add_id(ctx0, experts, down_exps_b, ids_for_bias);
         cb(experts, "ffn_moe_down_biased", il);
     }
 
@@ -2528,8 +2534,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         mount_out = build_moe_ffn(cur_mount_in, gate_inp, gate_inp_b,
             mount_p->w_up, mount_p->w_up_b, mount_p->w_gate, mount_p->w_gate_b, mount_p->w_down, mount_p->w_down_b, exp_probs_b,
             n_expert, n_expert_used, type_op, norm_w, w_scale, gating_op, il,
-            nullptr, mount_p->w_gate_up, nullptr, nullptr, nullptr, nullptr, ids_remap, weights,
-            mount_scale_up, mount_scale_gate, true);
+            nullptr, mount_p->w_gate_up, mount_p->w_gate_up_b,
+            mount_p->scale_up, mount_p->scale_gate, mount_p->scale, ids_remap, weights,
+            ids_for_scale, mount_p->remap_b, true);
         cb(mount_out, "ffn_moe_mount", il);
         ggml_backend_sched_set_node_role(sched, mount_out, GGML_BACKEND_SCHED_ROLE_MOUNT_TAIL);
     };
@@ -2538,13 +2545,6 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         if (!weight_before_ffn) {
             experts = ggml_mul(ctx0, experts, weights);
             cb(experts, "ffn_moe_weighted", il);
-        }
-
-        if (mount_scale != nullptr) {
-            // down scale: gathered on the GPU segment from the same ids and handed to the
-            // CPU segment; the -1 ids keep skipped columns at 0*scale = 0, exact
-            experts = ggml_mul(ctx0, experts, mount_scale);
-            cb(experts, "ffn_moe_scaled", il);
         }
     }
 
@@ -2567,10 +2567,6 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         // scale first, weights second: the plain path scales inside build_lora_mm_id and
         // applies the weights afterwards, so this keeps the per-column arithmetic
         // bit-equal to the no-pool path
-        if (mount_scale != nullptr) {
-            merged = ggml_mul(ctx0, merged, mount_scale);
-            cb(merged, "ffn_moe_scaled", il);
-        }
         if (!weight_before_ffn) {
             merged = ggml_mul(ctx0, merged, weights);
             cb(merged, "ffn_moe_weighted", il);

@@ -1075,6 +1075,19 @@ struct llm_graph_context {
               ggml_tensor * ids,
               ggml_tensor * w_s = nullptr) const;
 
+    // the scale half of build_lora_mm_id: reshape -> repeat -> get_rows -> mul, with the
+    // lookup riding its own ids. the pooled chains carry -1 in their ids (the skip
+    // mask), which get_rows cannot index, so the scale is looked up on the clean topk
+    // rows; the ops, the shapes and the position right after the matmul stay upstream's,
+    // so a backend fusion keyed on the (matmul -> scale lookup -> mul) pattern still
+    // matches.
+    static ggml_tensor * moe_scale_mul(
+            ggml_context * ctx,
+            ggml_tensor * res,
+            ggml_tensor * w_s,
+            ggml_tensor * ids_scale,
+            int64_t       n_tokens);
+
     ggml_tensor * build_norm(
              ggml_tensor * cur,
              ggml_tensor * mw,
@@ -1170,8 +1183,12 @@ struct llm_graph_context {
              ggml_tensor * down_exps_s = nullptr,
              ggml_tensor * selected_experts_in = nullptr,
              ggml_tensor * chain_weights_in = nullptr,
-             ggml_tensor * chain_scale_up = nullptr,
-             ggml_tensor * chain_scale_gate = nullptr,
+             // the pooled chains read their per-expert tables through ids of their own:
+             // the scale lookup needs indexable rows (the clean topk, multiplication is
+             // 0-safe), the bias lookup needs add_id's -1 pass-through (the masked
+             // remap_b rows). null keeps the mtid ids the caller supplied.
+             ggml_tensor * ids_for_scale_in = nullptr,
+             ggml_tensor * ids_for_bias_in  = nullptr,
                      bool   chain_only = false) const;
 
     //

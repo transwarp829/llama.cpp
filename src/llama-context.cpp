@@ -846,7 +846,7 @@ void llama_context::expert_pool_build() {
         // per-layer sources in llama_expert_pool_kind order
         ggml_tensor * src[PK_N] = {
             L.ffn_gate_up_exps, L.ffn_up_exps,      L.ffn_gate_exps, L.ffn_down_exps,
-            L.ffn_up_exps_b,    L.ffn_gate_exps_b,  L.ffn_down_exps_b,
+            L.ffn_gate_up_exps_b, L.ffn_up_exps_b,  L.ffn_gate_exps_b, L.ffn_down_exps_b,
         };
         llama_expert_pool_layer & l = st.layers[il];
         for (int k = 0; k < PK_N; ++k) {
@@ -854,9 +854,11 @@ void llama_context::expert_pool_build() {
                 continue;
             }
             l.orig[k] = src[k];
+            // weights: slot-compact copies [.., S]. biases: the model's own tensor in
+            // its expert order (the mount chain reads it with expert ids, remap_b)
             l.pool[k] = (k < PK_UP_B)
                 ? ggml_new_tensor_4d(pool_ctx, src[k]->type, src[k]->ne[0], src[k]->ne[1], s_il, 1)
-                : ggml_new_tensor_2d(pool_ctx, src[k]->type, src[k]->ne[0], s_il);
+                : ggml_new_tensor_2d(pool_ctx, src[k]->type, src[k]->ne[0], src[k]->ne[1]);
         }
     }
 
@@ -865,7 +867,7 @@ void llama_context::expert_pool_build() {
     // the first process_ubatch, and the mount adds nodes, so the probe must see the
     // same topology. the tables are plain pool-buffer tensors (created before the
     // alloc below); their content is written by expert_pool_fill().
-    // NOTE: the gates below only skip REGISTRATION, never the allocation above.
+    // NOTE: the check below only skips REGISTRATION, never the allocation above.
     // sized to n_layer_all before any mount is written, so a reference taken
     // here stays valid for the whole run
     st.mounts.assign(model.hparams.n_layer_all, llama_expert_pool_mount{});
@@ -873,15 +875,6 @@ void llama_context::expert_pool_build() {
     for (int32_t il : pooled_ils) {
         const int32_t s_il = (int32_t) st.resident[il].size();
         if (s_il <= 0) {
-            continue;
-        }
-        const llama_layer & L = model.layers[il];
-        if (L.ffn_gate_up_exps_b ||
-            (L.ffn_down_exps_s && L.ffn_down_exps_b)) {
-            // up/gate scales ride factored tables and separate biases compact pool copies;
-            // only the fused bias and the down scale+bias pair still refuse the mount
-            LLAMA_LOG_WARN("%s: per-expert scale/bias on layer %d, direct mount disabled for it\n",
-                    __func__, il);
             continue;
         }
         const llama_expert_pool_layer & l = st.layers[il];
@@ -894,7 +887,8 @@ void llama_context::expert_pool_build() {
         m.w_gate    = l.pool[PK_GATE];
         m.w_down    = l.pool[PK_DOWN];
         m.w_gate_up = l.pool[PK_GATE_UP];
-        m.w_down_s  = L.ffn_down_exps_s;
+        m.w_down_s  = model.layers[il].ffn_down_exps_s;
+        m.w_gate_up_b = l.pool[PK_GATE_UP_B];
         m.w_up_b    = l.pool[PK_UP_B];
         m.w_gate_b  = l.pool[PK_GATE_B];
         m.w_down_b  = l.pool[PK_DOWN_B];
@@ -934,12 +928,12 @@ void llama_context::expert_pool_build() {
         }
         llama_expert_pool_mount m = mreg;
         const llama_layer & L = model.layers[il];
-        // merged table: ONE [n_expert, 2*n_layers] I32 tensor holding both halves in the
-        // mirror's layout (remap, then inv); each layer gets a 1KB view, so a publish
-        // is one stream-ordered copy
+        // merged table: ONE [n_expert, 3*n_layers] I32 tensor holding all three blocks
+        // in the mirror's layout (remap, inv, remap_b); each layer gets a 1KB view, so
+        // a publish is one stream-ordered copy
         if (st.tab_all == nullptr) {
             st.tab_all = ggml_new_tensor_2d(pool_tab_ctx, GGML_TYPE_I32, n_expert,
-                                            2 * (int64_t) model.hparams.n_layer_all);
+                                            3 * (int64_t) model.hparams.n_layer_all);
             ggml_set_name(st.tab_all, "mnt_tab_all");
         }
         const size_t  i32sz        = ggml_type_size(GGML_TYPE_I32);
@@ -948,17 +942,19 @@ void llama_context::expert_pool_build() {
                                    il * n_expert * i32sz);
         m.remap_inv = ggml_view_2d(pool_tab_ctx, st.tab_all, 1, n_expert, i32sz,
                                    (n_layers_all + il) * n_expert * i32sz);
+        m.remap_b   = ggml_view_2d(pool_tab_ctx, st.tab_all, 1, n_expert, i32sz,
+                                   (2*n_layers_all + il) * n_expert * i32sz);
         // CPU-side view of the host table (tab_cpu holds only the inv part)
         m.remap_inv_host = ggml_view_2d(pool_tab_cpu_ctx, st.tab_cpu, 1, n_expert, i32sz,
                                        il * n_expert * i32sz);
         if (L.ffn_down_exps_s != nullptr) {
-            m.scale = ggml_new_tensor_2d(pool_tab_ctx, GGML_TYPE_F32, 1, n_expert);
+            m.scale = ggml_new_tensor_1d(pool_tab_ctx, GGML_TYPE_F32, n_expert);
         }
         if (L.ffn_up_exps_s != nullptr) {
-            m.scale_up = ggml_new_tensor_2d(pool_tab_ctx, GGML_TYPE_F32, 1, n_expert);
+            m.scale_up = ggml_new_tensor_1d(pool_tab_ctx, GGML_TYPE_F32, n_expert);
         }
         if (L.ffn_gate_exps_s != nullptr) {
-            m.scale_gate = ggml_new_tensor_2d(pool_tab_ctx, GGML_TYPE_F32, 1, n_expert);
+            m.scale_gate = ggml_new_tensor_1d(pool_tab_ctx, GGML_TYPE_F32, n_expert);
         }
         char nm[64];
         snprintf(nm, sizeof(nm), "mnt_remap_%d", il);
@@ -967,6 +963,8 @@ void llama_context::expert_pool_build() {
         ggml_set_name(m.remap_inv_host, nm);
         snprintf(nm, sizeof(nm), "mnt_remap_inv_%d", il);
         ggml_set_name(m.remap_inv, nm);
+        snprintf(nm, sizeof(nm), "mnt_remap_b_%d", il);
+        ggml_set_name(m.remap_b, nm);
         if (m.scale != nullptr) {
             snprintf(nm, sizeof(nm), "mnt_scale_%d", il);
             ggml_set_name(m.scale, nm);
@@ -1124,25 +1122,31 @@ void llama_context::expert_pool_fill() {
             fill_scale(m.scale_gate, L.ffn_gate_exps_s);
         }
 
-        auto copy_slots = [&](ggml_tensor * src, ggml_tensor * pw, int k) {
+        // weights: slot-compact copies (slot s holds the s-th resident expert)
+        auto copy_slots = [&](ggml_tensor * src, ggml_tensor * pw) {
             if (src == nullptr || pw == nullptr) {
                 return;
             }
-            // per-expert size: the kind decides (weights: ne[2], compact bias: ne[1])
-            const size_t sz = llama_expert_pool_stride(src, k);
+            const size_t sz = llama_expert_pool_stride(src);
             for (int32_t s = 0; s < (int32_t) res.size(); ++s) {
                 const int32_t e = res[s];
                 if (e < 0 || e >= n_expert) {
                     continue;
                 }
-                // compact layout: pool slot s holds expert res[s]
-                ggml_backend_tensor_set(pw, (const char *) src->data + e * llama_expert_pool_stride(src, k),
-                        s * llama_expert_pool_stride(pw, k), sz);
+                ggml_backend_tensor_set(pw, (const char *) src->data + e * llama_expert_pool_stride(src),
+                        s * llama_expert_pool_stride(pw), sz);
             }
         };
         const llama_expert_pool_layer & l = st.layers[il];
-        for (int k = 0; k < PK_N; ++k) {
-            copy_slots(l.orig[k], l.pool[k], k);
+        for (int k = 0; k < PK_UP_B; ++k) {
+            copy_slots(l.orig[k], l.pool[k]);
+        }
+        // biases: the model's tensor verbatim, expert order - one copy, and the swap
+        // never rewrites them (the ids pick the expert, not the slot)
+        for (int k = PK_UP_B; k < PK_N; ++k) {
+            if (l.orig[k] != nullptr && l.pool[k] != nullptr) {
+                ggml_backend_tensor_set(l.pool[k], l.orig[k]->data, 0, ggml_nbytes(l.orig[k]));
+            }
         }
     }
     st.phase = llama_expert_pool_state::PHASE_FILLED;

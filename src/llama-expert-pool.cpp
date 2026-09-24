@@ -546,14 +546,14 @@ void llama_expert_pool_bind_split_head(const llama_expert_pool_state & st, int32
 
 namespace {
 
-// copy one expert slice (kind k) into a pool slot (sync, worker's own thread)
-void swap_copy_one_sync(ggml_backend_t be, ggml_tensor * src, ggml_tensor * pw, int32_t e, int32_t slot, int k) {
+// copy one expert's weight slice into a pool slot (sync, worker's own thread)
+void swap_copy_one_sync(ggml_tensor * src, ggml_tensor * pw, int32_t e, int32_t slot) {
     if (src == nullptr || pw == nullptr) {
         return;
     }
-    const size_t sz = llama_expert_pool_stride(src, k);
-    const char * data = (const char *) src->data + e * llama_expert_pool_stride(src, k);
-    const size_t off  = slot * llama_expert_pool_stride(pw, k);
+    const size_t sz = llama_expert_pool_stride(src);
+    const char * data = (const char *) src->data + e * llama_expert_pool_stride(src);
+    const size_t off  = slot * llama_expert_pool_stride(pw);
     // SYNC copy: only the worker's thread blocks; the result reaches the tables
     // at the next hook publish, so no torn slot is ever readable by a graph.
     ggml_backend_tensor_set(pw, data, off, sz);
@@ -562,14 +562,15 @@ void swap_copy_one_sync(ggml_backend_t be, ggml_tensor * src, ggml_tensor * pw, 
 } // namespace
 
 // rebuild the merged host mirror from resident[] (worker thread only), mark it
-// ready, return its sequence number. layout: [2*n_expert, n_layers]; layer il =
-// [il*2*n_expert + e] remap, [+n_expert] remap_inv. no tensor writes here.
+// ready, return its sequence number. layout: [3*n_expert, n_layers]; layer il =
+// [il*3*n_expert + e] remap, [+n_expert] remap_inv, [+2*n_expert] remap_b.
+// no tensor writes here.
 int32_t llama_expert_pool_tab_build(llama_expert_pool_state & st) {
     if (st.tab_all == nullptr) {
         return st.seq_ctr;
     }
     const int32_t n_expert = st.n_expert;
-    // one half of the mirror; the tables live in one tensor of 2*n_layers
+    // one half of the mirror; the tables live in one tensor of 3*n_layers
     // columns, so derive the half from the layer count, not from its shape
     const size_t n_half = (size_t) st.n_expert * st.layers.size();
     // pick a free mirror slot: never the ready one (not published yet) nor the
@@ -588,8 +589,8 @@ int32_t llama_expert_pool_tab_build(llama_expert_pool_state & st) {
         return st.seq_ctr; // cannot happen: ready and pub occupy at most two of three
     }
     std::vector<int32_t> & mir = st.tab_mirror[k];
-    if (mir.size() != 2 * n_half) {
-        mir.assign(2 * n_half, -1);
+    if (mir.size() != 3 * n_half) {
+        mir.assign(3 * n_half, -1);
     }
     for (int32_t il : st.pooled_layers) {
         const llama_expert_pool_mount & m = st.mount(il);
@@ -599,16 +600,19 @@ int32_t llama_expert_pool_tab_build(llama_expert_pool_state & st) {
         const std::vector<int32_t> & res = st.resident[il];
         int32_t * rmp    = mir.data() + il * n_expert;
         int32_t * rmp_cu = mir.data() + n_half + il * n_expert;
-        // default: nothing resident (remap -1, inverse = its own id)
+        int32_t * rmp_b  = mir.data() + 2 * n_half + il * n_expert;
+        // default: nothing resident (remap -1, inverse = its own id, bias lookup -1)
         for (int32_t e = 0; e < n_expert; ++e) {
             rmp[e] = -1;
             rmp_cu[e] = e;
+            rmp_b[e] = -1;
         }
         for (int32_t s = 0; s < (int32_t) res.size(); ++s) {
             const int32_t e = res[s];
             if (e >= 0 && e < n_expert) {
                 rmp[e] = s;
                 rmp_cu[e] = -1;
+                rmp_b[e] = e;
             }
         }
     }
@@ -630,8 +634,8 @@ void llama_expert_pool_tab_publish(llama_expert_pool_state & st) {
         return;
     }
     const size_t n_half = (size_t) st.n_expert * st.layers.size();
-    // both halves in one stream-ordered copy (the table layout matches the mirror)
-    ggml_backend_tensor_set_async(st.pool_backend, st.tab_all, st.tab_mirror[r].data(), 0, 2 * n_half * sizeof(int32_t));
+    // all three halves in one stream-ordered copy (the table layout matches the mirror)
+    ggml_backend_tensor_set_async(st.pool_backend, st.tab_all, st.tab_mirror[r].data(), 0, 3 * n_half * sizeof(int32_t));
     if (st.tab_cpu != nullptr) {
         ggml_backend_tensor_set(st.tab_cpu, st.tab_mirror[r].data() + n_half, 0, n_half * sizeof(int32_t));
     }
@@ -689,8 +693,8 @@ static int32_t worker_decide_and_copy(llama_expert_pool_state & st) {
                 continue;
             }
             const llama_expert_pool_layer & l = st.layers[p.il];
-            for (int k = 0; k < PK_N; ++k) {
-                swap_copy_one_sync(st.pool_backend, l.orig[k], l.pool[k], p.e, p.slot, k);
+            for (int k = 0; k < PK_UP_B; ++k) { // weights only: the biases are static copies
+                swap_copy_one_sync(l.orig[k], l.pool[k], p.e, p.slot);
             }
             res[p.slot] = p.e;
             filled += 1;
