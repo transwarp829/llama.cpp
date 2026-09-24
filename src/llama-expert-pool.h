@@ -304,6 +304,14 @@ void llama_expert_pool_bind_ids(const llama_expert_pool_state & st, int32_t il, 
 void llama_expert_pool_bind_split_head(const llama_expert_pool_state & st, int32_t il, const ggml_tensor * head, bool lane);
 void llama_expert_pool_observe_split_head(void * user_data, ggml_tensor * head, ggml_backend_t backend);
 
+// ubatch-boundary accounting for the fully resident (plain-path) layers: the split-head
+// hook cannot see them (their plain path forces no split, so they have no observed
+// head), and the graph hands the pool a contiguous copy of each such layer's top-k rows
+// instead. called after each ubatch computes: the rows land as hits (every expert of
+// that layer is resident) and as activation counts, and one step marker closes the
+// ubatch - so the swap machinery keeps its evidence through the whole-layer phase.
+void llama_expert_pool_account_ids(llama_expert_pool_state & st);
+
 // per-ubatch slot channel: the sequences (slots) that have columns in this
 // ubatch. the segment windows are per slot; the decision counters stay ctx-level.
 void llama_expert_pool_set_step_slots(llama_expert_pool_state & st, const int32_t * seq_ids, int32_t n_seq_ids);

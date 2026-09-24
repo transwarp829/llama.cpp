@@ -2094,6 +2094,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
+    // the fully resident layers' routing rows arrive here, once per ubatch: their plain
+    // path has no observed split head, so the pool reads the registered copy instead
+    llama_expert_pool_account_ids(expert_pool_state);
+
     ret = GGML_STATUS_SUCCESS;
 
     return res;

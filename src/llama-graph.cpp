@@ -2244,7 +2244,20 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // (upstream's lane) and keeps them on the CPU below it.
     if (expert_pool != nullptr && cparams.expert_pool > 0 && il >= 0) {
         const llama_expert_pool_mount & mnt = expert_pool->mount(il);
-        if (mnt.active && !mnt.full) {
+        if (mnt.active && mnt.full) {
+            // fully resident layer: the graph below is the plain path and reads no ids
+            // table at all, but the pool's counters must keep running through the
+            // whole-layer phase (the swap machinery they feed decides the roster when
+            // the layout switches back). hand them the same contiguous copy of the
+            // top-k rows the mount path makes; the pool reads it back once per ubatch
+            // (llama_expert_pool_account_ids), so nothing in this layer's computation
+            // changes - the copy is a dead end for the graph.
+            ggml_tensor * ids_c    = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_expert_used, n_tokens);
+            ggml_tensor * ids_cpy  = ggml_cpy(ctx0, selected_experts, ids_c);
+            ggml_tensor * ids_flat = ggml_reshape_2d(ctx0, ids_cpy, n_expert_used * n_tokens, 1);
+            llama_expert_pool_bind_ids(*expert_pool, il, (int32_t) n_expert_used, ids_flat);
+            ggml_build_forward_expand(gf, ids_flat);
+        } else if (mnt.active) {
             // all tables live on the device, so every gather runs on the GPU segment
             // from the same topk ids (ids_cpu and the scale values reach the CPU
             // segment as 32B split inputs, keeping it lookup-free). the I32 tables

@@ -541,6 +541,51 @@ void llama_expert_pool_bind_split_head(const llama_expert_pool_state & st, int32
     st.split_head_refs[head] = { il, ilx, lane };
 }
 
+// ubatch-boundary accounting for the fully resident (plain-path) layers (see the
+// declaration): the graph registered their contiguous top-k copy, this reads it back
+// once per ubatch and feeds the same counters the split-head hook feeds for the mount
+// path. every routed row of such a layer is a hit - its whole expert set is resident.
+void llama_expert_pool_account_ids(llama_expert_pool_state & st) {
+    if (!st.direct_mount || st.pooled_layers.empty() || st.phase != llama_expert_pool_state::PHASE_FILLED) {
+        return;
+    }
+    bool any = false;
+    for (size_t ilx = 0; ilx < st.pooled_layers.size(); ++ilx) {
+        const int32_t il = st.pooled_layers[ilx];
+        const llama_expert_pool_mount & m = st.mount(il);
+        if (!m.active || !m.full) {
+            continue;
+        }
+        const ggml_tensor * ids = (size_t) il < st.ids_clean.size() ? st.ids_clean[il] : nullptr;
+        const int32_t n_used = (size_t) il < st.ids_n_used.size() ? st.ids_n_used[il] : 0;
+        if (ids == nullptr || n_used <= 0 || ids->ne[1] != 1 || ids->ne[0] <= 0) {
+            continue;
+        }
+        const int64_t n_rows = ids->ne[0];
+        const int32_t n_tok  = (int32_t) (n_rows / n_used);
+        if (n_tok <= 0) {
+            continue;
+        }
+        st.ids_buf.resize((size_t) n_rows);
+        ggml_backend_tensor_get(ids, st.ids_buf.data(), 0, ggml_nbytes(ids));
+        if (st.stat.size() != st.pooled_layers.size()) {
+            st.stat.assign(st.pooled_layers.size(), llama_expert_pool_counts{});
+        }
+        const uint64_t rows = (uint64_t) n_rows;
+        st.stat[ilx].hit += rows;
+        st.seg.hit       += rows;
+        if (st.swap_auto) {
+            route_push_row(st, st.hook_step, (int32_t) ilx, st.ids_buf.data(), n_used, n_tok);
+        }
+        any = true;
+    }
+    if (any && st.swap_auto) {
+        // one step per ubatch, the same boundary the mount path's hook marks
+        llama_expert_pool_push_marker(st);
+        st.hook_step += 1;
+    }
+}
+
 // ---------------------------------------------------------------
 // merged mount-table mirror and its publish point
 
