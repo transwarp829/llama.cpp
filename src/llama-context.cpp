@@ -868,6 +868,20 @@ void llama_context::expert_pool_build() {
     const std::vector<int32_t> & pooled_ils = st.pooled_layers;
     const int32_t n_pooled = (int32_t) pooled_ils.size();
 
+    // a layer whose width reaches the expert count is fully resident, so its slot order
+    // is free: put it in the model's own order and the graph runs the plain path over
+    // its pool tensors - the resident-only state is static, and paying the mount
+    // machinery for it names a tax with nothing left to save
+    for (int32_t il : pooled_ils) {
+        std::vector<int32_t> & res = st.resident[il];
+        if ((int32_t) res.size() != n_expert) {
+            continue;
+        }
+        for (int32_t e = 0; e < n_expert; ++e) {
+            res[e] = e;
+        }
+    }
+
     // reset the whole array so a zero-slot layer never keeps stale pointers
     st.layers.assign(model.hparams.n_layer_all, llama_expert_pool_layer{});
 
