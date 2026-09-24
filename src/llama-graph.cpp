@@ -2073,6 +2073,26 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     ggml_tensor * ids_remap = nullptr; // remapped expert ids (pool chain), GPU segment
     ggml_tensor * ids_for_scale = ids_for_scale_in; // the scale lookups ride these ids
 
+    // whole-layer layout: a layer that is fully resident in expert order runs the plain
+    // path over the pool's copies of the model's matrices - the rest of this function is
+    // then the no-pool graph node for node, only the weight addresses change
+    if (!chain_only && expert_pool != nullptr && cparams.expert_pool > 0 && il >= 0) {
+        const llama_expert_pool_mount & mnt = expert_pool->mount(il);
+        if (mnt.active && mnt.full) {
+            up_exps        = mnt.w_up        != nullptr ? mnt.w_up        : up_exps;
+            gate_exps      = mnt.w_gate      != nullptr ? mnt.w_gate      : gate_exps;
+            down_exps      = mnt.w_down      != nullptr ? mnt.w_down      : down_exps;
+            gate_up_exps   = mnt.w_gate_up   != nullptr ? mnt.w_gate_up   : gate_up_exps;
+            up_exps_b      = mnt.w_up_b      != nullptr ? mnt.w_up_b      : up_exps_b;
+            gate_exps_b    = mnt.w_gate_b    != nullptr ? mnt.w_gate_b    : gate_exps_b;
+            down_exps_b    = mnt.w_down_b    != nullptr ? mnt.w_down_b    : down_exps_b;
+            gate_up_exps_b = mnt.w_gate_up_b != nullptr ? mnt.w_gate_up_b : gate_up_exps_b;
+            up_exps_s      = mnt.scale_up    != nullptr ? mnt.scale_up    : up_exps_s;
+            gate_exps_s    = mnt.scale_gate  != nullptr ? mnt.scale_gate  : gate_exps_s;
+            down_exps_s    = mnt.scale       != nullptr ? mnt.scale       : down_exps_s;
+        }
+    }
+
     if (!chain_only) {
         if (probs_in == nullptr) {
         logits = build_lora_mm(gate_inp, cur); // [n_expert, n_tokens]
@@ -2224,7 +2244,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // (upstream's lane) and keeps them on the CPU below it.
     if (expert_pool != nullptr && cparams.expert_pool > 0 && il >= 0) {
         const llama_expert_pool_mount & mnt = expert_pool->mount(il);
-        if (mnt.active) {
+        if (mnt.active && !mnt.full) {
             // all tables live on the device, so every gather runs on the GPU segment
             // from the same topk ids (ids_cpu and the scale values reach the CPU
             // segment as 32B split inputs, keeping it lookup-free). the I32 tables

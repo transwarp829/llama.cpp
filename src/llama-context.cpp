@@ -751,13 +751,37 @@ void llama_context::expert_pool_init() {
         LLAMA_LOG_INFO("%s: pooling the deepest %d of %d eligible MoE layers (layer %d..%d)\n",
                 __func__, n_pooled, n_eligible, pooled_ils.front(), pooled_ils.back());
     }
+    // whole-layer layout (experiment): the shallowest k eligible layers (k = budget /
+    // n_expert) go fully resident in the model's own order, the rest are not pooled at
+    // all and keep the plain path (the leftover slots stay unused - one partial layer
+    // would add a third graph form and its rebuild, dearer than the remainder saves).
+    // refs prefill-whole-layer-mode-2026-09-24.md
+    const bool layout_whole = llama_expert_pool_layout_whole();
+    if (layout_whole) {
+        if (cparams.expert_pool_layers > 0) {
+            LLAMA_LOG_WARN("%s: GGML_EXPPOOL_LAYOUT=whole keeps the shallow layers; the -nep M,N layer set is ignored\n",
+                    __func__);
+        }
+        const int32_t n_full = cparams.expert_pool / n_expert;
+        if (n_full <= 0) {
+            LLAMA_LOG_WARN("%s: expert pool budget %d is below one full layer (%d experts), pool disabled\n",
+                    __func__, cparams.expert_pool, n_expert);
+            return;
+        }
+        pooled_ils.resize(std::min<int32_t>(n_pooled, n_full));
+        n_pooled = (int32_t) pooled_ils.size();
+        LLAMA_LOG_INFO("%s: whole-layer layout: %d full layers (layer %d..%d), %d slots unused\n",
+                __func__, n_pooled, pooled_ils.front(), pooled_ils.back(),
+                cparams.expert_pool - n_pooled * n_expert);
+    }
+
     // uniform width from the budget; the desert rule (llama_expert_pool_min_slots, 1%
     // of the expert count) trims the pooled set from the deep end instead of spreading
     // the budget thin - the total slot count stays at the budget (remainder deepest)
     const int32_t min_slots = llama_expert_pool_min_slots(n_expert);
-    int32_t n_slot = cparams.expert_pool / n_pooled;
-    int32_t rem    = cparams.expert_pool % n_pooled;
-    if (n_slot < min_slots) {
+    int32_t n_slot = layout_whole ? n_expert : cparams.expert_pool / n_pooled;
+    int32_t rem    = layout_whole ? 0 : cparams.expert_pool % n_pooled;
+    if (!layout_whole && n_slot < min_slots) {
         if (cparams.expert_pool_layers > 0) {
             // the M,N form names the layer count, so the floor only warns - it must not
             // trim the layer set behind the user's back
@@ -787,17 +811,36 @@ void llama_context::expert_pool_init() {
 
     // default: uniform-width random-content pool; --expert-pool-init overrides the
     // content with a csv seed (debug)
-    if (n_slot > n_expert) {
+    if (!layout_whole && n_slot > n_expert) {
         LLAMA_LOG_WARN("%s: expert pool request of %d slots exceeds capacity (%d pooled layers x %d experts), "
                        "saturating to full coverage per layer\n",
                 __func__, cparams.expert_pool, n_pooled, n_expert);
         n_slot = n_expert;
         rem    = 0;
     }
-    // per-layer widths: uniform n_slot, remainder to the deepest pooled layers
+    // per-layer widths: uniform n_slot (remainder to the deepest pooled layers), or
+    // n_expert for every kept layer in the whole-layer layout
     std::vector<int32_t> widths(n_layer_all, 0);
     for (size_t i = 0; i < pooled_ils.size(); ++i) {
-        widths[pooled_ils[i]] = n_slot + ((int32_t) i >= (int32_t) pooled_ils.size() - rem ? 1 : 0);
+        widths[pooled_ils[i]] = layout_whole ? n_expert
+                              : n_slot + ((int32_t) i >= (int32_t) pooled_ils.size() - rem ? 1 : 0);
+    }
+    if (layout_whole) {
+        // identity slot order: slot s holds expert s, so each layer's pool tensors are
+        // the model's own matrices, in its own order, and no remap table is needed
+        for (int32_t il : pooled_ils) {
+            std::vector<int32_t> & res = st.resident[il];
+            res.resize((size_t) n_expert);
+            for (int32_t e = 0; e < n_expert; ++e) {
+                res[e] = e;
+            }
+        }
+        if (cparams.expert_pool_init && cparams.expert_pool_init[0]) {
+            LLAMA_LOG_WARN("%s: GGML_EXPPOOL_LAYOUT=whole uses identity slots, the csv seed is ignored\n", __func__);
+        }
+        st.phase = llama_expert_pool_state::PHASE_BUILT;
+        expert_pool_build();
+        return;
     }
     if (cparams.expert_pool_init && cparams.expert_pool_init[0]) {
         // --- resident sets: csv seed or random ---
@@ -881,8 +924,16 @@ void llama_context::expert_pool_build() {
         if (l.pool[PK_DOWN] == nullptr) {
             continue;
         }
+        // a layer that is fully resident in expert order (whole-layer layout) keeps its
+        // pool tensors in the model's own layout: the graph runs the plain path over
+        // them, so it needs no mount chain, no remap and no merge
+        bool identity = s_il == n_expert;
+        for (int32_t s = 0; identity && s < n_expert; ++s) {
+            identity = st.resident[il][s] == s;
+        }
         llama_expert_pool_mount m;
         m.active    = true;
+        m.full      = identity;
         m.w_up      = l.pool[PK_UP];
         m.w_gate    = l.pool[PK_GATE];
         m.w_down    = l.pool[PK_DOWN];
@@ -1118,25 +1169,36 @@ void llama_context::expert_pool_fill() {
             fill_scale(m.scale_gate, L.ffn_gate_exps_s);
         }
 
-        // the whole expert payload moves: weights and per-expert biases are
-        // (expert -> slot) copies, the scales are a static expert-order table
-        auto copy_slots = [&](ggml_tensor * src, ggml_tensor * pw, int k) {
-            if (src == nullptr || pw == nullptr) {
-                return;
-            }
-            const size_t sz = llama_expert_pool_stride(src, k);
-            for (int32_t s = 0; s < (int32_t) res.size(); ++s) {
-                const int32_t e = res[s];
-                if (e < 0 || e >= n_expert) {
-                    continue;
-                }
-                ggml_backend_tensor_set(pw, (const char *) src->data + e * llama_expert_pool_stride(src, k),
-                        s * llama_expert_pool_stride(pw, k), sz);
-            }
-        };
         const llama_expert_pool_layer & l = st.layers[il];
-        for (int k = 0; k < PK_N; ++k) {
-            copy_slots(l.orig[k], l.pool[k], k);
+        if (m.full) {
+            // identity slots: the pool tensors already are the model's matrices in the
+            // model's order, so one whole-tensor copy per kind replaces the per-slot
+            // assembly (and there is nothing to swap later either)
+            for (int k = 0; k < PK_N; ++k) {
+                if (l.orig[k] != nullptr && l.pool[k] != nullptr) {
+                    ggml_backend_tensor_set(l.pool[k], l.orig[k]->data, 0, ggml_nbytes(l.orig[k]));
+                }
+            }
+        } else {
+            // the whole expert payload moves: weights and per-expert biases are
+            // (expert -> slot) copies, the scales are a static expert-order table
+            auto copy_slots = [&](ggml_tensor * src, ggml_tensor * pw, int k) {
+                if (src == nullptr || pw == nullptr) {
+                    return;
+                }
+                const size_t sz = llama_expert_pool_stride(src, k);
+                for (int32_t s = 0; s < (int32_t) res.size(); ++s) {
+                    const int32_t e = res[s];
+                    if (e < 0 || e >= n_expert) {
+                        continue;
+                    }
+                    ggml_backend_tensor_set(pw, (const char *) src->data + e * llama_expert_pool_stride(src, k),
+                            s * llama_expert_pool_stride(pw, k), sz);
+                }
+            };
+            for (int k = 0; k < PK_N; ++k) {
+                copy_slots(l.orig[k], l.pool[k], k);
+            }
         }
     }
     st.phase = llama_expert_pool_state::PHASE_FILLED;
@@ -1153,8 +1215,14 @@ void llama_context::expert_pool_fill() {
     llama_expert_pool_tab_publish(st);
 
     if (st.direct_mount) {
-        LLAMA_LOG_INFO("%s: direct mount active (%d layers), in-graph merge\n",
-                __func__, (int) st.pooled_layers.size());
+        int32_t n_full = 0;
+        for (int32_t il : st.pooled_layers) {
+            if (st.mount(il).full) {
+                n_full += 1;
+            }
+        }
+        LLAMA_LOG_INFO("%s: pool active: %d layers fully resident in expert order (plain path), %d mounted (dual chain)\n",
+                __func__, n_full, (int32_t) st.pooled_layers.size() - n_full);
     }
 }
 

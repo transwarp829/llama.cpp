@@ -44,6 +44,20 @@ inline int32_t llama_expert_pool_min_slots(int32_t n_expert) {
     return (n_expert + 99) / 100;
 }
 
+// whole-layer layout (experiment, GGML_EXPPOOL_LAYOUT=whole): every pooled layer is
+// either fully resident in the model's own expert order (identity slots) or not
+// pooled at all - a fully resident layer then runs the plain path over the pool's
+// matrices, so the batch regime that cannot use routing locality pays no dual-chain
+// tax at all. the layer set and the budget keep their -nep meaning (the budget still
+// picks how many layers can be covered), so the resident bytes match the budget.
+inline bool llama_expert_pool_layout_whole() {
+    static const bool v = [] {
+        const char * s = getenv("GGML_EXPPOOL_LAYOUT");
+        return s != nullptr && std::string(s) == "whole";
+    }();
+    return v;
+}
+
 // ---------------------------------------------------------------
 // direct mount (main-graph execution): per-layer tensors that let build_moe_ffn
 // run a second, device-resident chain over the pool weights inside the MAIN
@@ -53,6 +67,9 @@ inline int32_t llama_expert_pool_min_slots(int32_t n_expert) {
 // the id gathering needs no cast.
 struct llama_expert_pool_mount {
     bool active = false;
+    bool full   = false; // fully resident in the model's own order (identity slots): the
+                         // graph runs the plain path over these tensors - no mount chain,
+                         // no remap table, no merge, and the ids stay the top-k ids
     ggml_tensor * w_gate_up = nullptr; // [n_ff*2, n_embd, S] or null (pool copy)
     ggml_tensor * w_up      = nullptr; // [n_ff, n_embd, S] or null (pool copy)
     ggml_tensor * w_gate    = nullptr;
