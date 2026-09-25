@@ -774,36 +774,16 @@ void llama_context::expert_pool_init() {
                 cparams.expert_pool - n_full * n_expert, n_pooled - n_full);
     }
 
-    // uniform width from the budget; the desert rule (llama_expert_pool_min_slots, 1%
-    // of the expert count) trims the pooled set from the deep end instead of spreading
-    // the budget thin - the total slot count stays at the budget (remainder deepest)
+    // uniform width from the budget. below the floor (llama_expert_pool_min_slots, 1% of
+    // the expert count) the per-layer mount roundtrip costs more than the hits save, so
+    // warn - a budget this thin is a configuration error, and re-laying the layer set is
+    // the placement logic's job (--fit), never the pool's
     const int32_t min_slots = llama_expert_pool_min_slots(n_expert);
     int32_t n_slot = layout_whole ? n_expert : cparams.expert_pool / n_pooled;
     int32_t rem    = layout_whole ? 0 : cparams.expert_pool % n_pooled;
-    int32_t n_zero = 0; // the shallow prefix the desert rule leaves at width 0
     if (!layout_whole && n_slot < min_slots) {
-        if (cparams.expert_pool_layers > 0) {
-            // the M,N form names the layer count, so the floor only warns - it must not
-            // trim the layer set behind the user's back
-            LLAMA_LOG_WARN("%s: %d slots per layer is below the %d-slot floor: expect the per-layer mount roundtrip to cost more than the hits save\n",
-                    __func__, n_slot, min_slots);
-        } else {
-            const int32_t n_pooled_all = n_pooled;
-            const int32_t n_keep = std::min(n_pooled, cparams.expert_pool / min_slots);
-            if (n_keep <= 0) {
-                LLAMA_LOG_WARN("%s: expert pool budget %d too small for %d pooled layers (min %d slots each), pool disabled\n",
-                        __func__, cparams.expert_pool, n_pooled_all, min_slots);
-                return;
-            }
-            // the deepest n_keep layers carry the budget (loader order, il ascending); the
-            // shallow ones stay pool layers at width 0 - their routing still feeds the
-            // counters, and a longer budget or another layout may pool them
-            n_zero = n_pooled_all - n_keep;
-            n_slot = cparams.expert_pool / n_keep;
-            rem    = cparams.expert_pool % n_keep;
-            LLAMA_LOG_WARN("%s: budget %d < %d slots x %d pooled layers: the deepest %d layers (layer %d..%d) x ~%d slots, %d at width 0 (desert rule)\n",
-                    __func__, cparams.expert_pool, min_slots, n_pooled_all, n_keep, pooled_ils[n_zero], pooled_ils.back(), n_slot, n_zero);
-        }
+        LLAMA_LOG_WARN("%s: %d slots per layer is under 1%% of the layer's experts (floor %d of %d): the mount roundtrip may cost more than the hits save - consider fewer pooled layers (-nep M,N) or a bigger budget\n",
+                __func__, n_slot, min_slots, n_expert);
     }
 
     st.layers.assign(n_layer_all, llama_expert_pool_layer{});
@@ -824,15 +804,12 @@ void llama_context::expert_pool_init() {
         n_slot = n_expert;
         rem    = 0;
     }
-    // per-layer widths: the whole-layer layout covers the shallow end fully, the desert
-    // rule leaves the shallow prefix at width 0, otherwise uniform n_slot with the
-    // remainder going to the deepest pooled layers
+    // per-layer widths: the whole-layer layout covers the shallow end fully, otherwise
+    // uniform n_slot with the remainder going to the deepest pooled layers
     std::vector<int32_t> widths(n_layer_all, 0);
     for (size_t i = 0; i < pooled_ils.size(); ++i) {
         if (layout_whole) {
             widths[pooled_ils[i]] = (int32_t) i < n_full ? n_expert : 0;
-        } else if ((int32_t) i < n_zero) {
-            widths[pooled_ils[i]] = 0;
         } else {
             widths[pooled_ils[i]] = n_slot + ((int32_t) i >= (int32_t) pooled_ils.size() - rem ? 1 : 0);
         }

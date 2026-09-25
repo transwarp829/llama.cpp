@@ -35,10 +35,10 @@ enum llama_expert_pool_miss_method {
     LLAMA_EXPERT_POOL_MISS_CPU_PARALLEL = 1, // mount chain submitted ahead of the CPU chain
 };
 
-// minimum slots per pooled layer (desert rule): below this width a mounted
-// layer pays the per-layer roundtrip tax for near-zero hits, so an unnamed
-// layer count trims the layer set instead of spreading the budget thin (an
-// explicit count only warns). 1% of the expert count, which brackets the
+// minimum slots per pooled layer: below this width a mounted layer pays the
+// per-layer roundtrip tax for near-zero hits, so the pool warns. the budget is
+// still laid out as asked - re-cutting the layer set is the placement logic's
+// job (--fit), not the pool's. 1% of the expert count, which brackets the
 // measured net-zero widths.
 inline int32_t llama_expert_pool_min_slots(int32_t n_expert) {
     return (n_expert + 99) / 100;

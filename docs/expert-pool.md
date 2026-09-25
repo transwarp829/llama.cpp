@@ -33,8 +33,8 @@ least-VRAM to the most-VRAM end of the budget scale:
 1. VRAM is very small: `-ngl all` + `-cmoe` keeps every expert in system RAM.
 2. As soon as VRAM can hold at least ~1% of a layer's experts (below that the slot
    tables and the table lookups cost more than the residency buys), pool that layer.
-   Routing locality is stronger in the deeper layers, so layers are admitted from
-   the deepest one backwards - this is what the default budget split does.
+   A budget below that floor is warned about and laid out as asked; to keep the
+   widths above it, name the layer count (`-nep M,N` takes the deepest M layers).
 3. Keep adding pooled layers until every MoE layer is pooled.
 4. Exception: the hash layers of the `deepseek4` architecture (DeepSeek-V4-Flash /
    -Pro and their post-trained variants) pick their experts from a token-id lookup
