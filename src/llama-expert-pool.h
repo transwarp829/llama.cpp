@@ -58,6 +58,18 @@ inline bool llama_expert_pool_layout_whole() {
     return v;
 }
 
+// the layout follows the batch regime (GGML_EXPPOOL_LAYOUT=auto): a batch at or above
+// the offload threshold runs the whole-layer layout, below it the partial one, and only
+// a batch that crosses the threshold re-lays the pool. the static values above/below
+// stay for the A/B arms.
+inline bool llama_expert_pool_layout_auto() {
+    static const bool v = [] {
+        const char * s = getenv("GGML_EXPPOOL_LAYOUT");
+        return s != nullptr && std::string(s) == "auto";
+    }();
+    return v;
+}
+
 // ---------------------------------------------------------------
 // direct mount (main-graph execution): per-layer tensors that let build_moe_ffn
 // run a second, device-resident chain over the pool weights inside the MAIN
@@ -151,6 +163,13 @@ struct llama_expert_pool_state {
     std::vector<int32_t> pooled_layers;
     // pool membership by layer (the graph asks before handing its rows over)
     std::vector<uint8_t> pool_flag;
+    // current layout of the pool: true when the pooled layers sit fully resident in
+    // expert order (the whole-layer layout), false for the slot cache (partial)
+    bool layout_whole = false;
+    // the direction the last crossing asked for (-1 none): a refused target is not
+    // retried until the regime crosses again - the counts only improve as rows arrive,
+    // and re-attempting every batch costs a worker join per step
+    int8_t layout_tried = -1;
 
     // split-head registry, rebuilt per graph build (the builder registers each
     // pooled layer's clean topk ids and the miss chain's first node)

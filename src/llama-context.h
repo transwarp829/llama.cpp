@@ -258,6 +258,10 @@ public:
 
     // print-and-reset one slot's segment window, or the pool segment (public API support)
     void expert_pool_finalize(int32_t id_slot);
+    // the layout switch (GGML_EXPPOOL_LAYOUT=auto): re-lay the pool in the other
+    // layout, and the per-batch entry that decides whether this batch crosses
+    void expert_pool_relayout(bool whole);
+    void expert_pool_cross(int32_t n_tokens);
 
     // can reuse the llm_graph_result instance of the context (for example to update a memory module)
     llm_graph_result * get_gf_res_reserve() const;

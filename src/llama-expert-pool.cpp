@@ -112,6 +112,41 @@ void llama_expert_pool_push_marker(llama_expert_pool_state & st) {
     st.route_cv.notify_one();
 }
 
+// env-gated per-row route histogram dump (GGML_EXPPOOL_ROUTE_LOG=<path>): one line per
+// (step, layer, ubatch) with the expert hit counts, so an experiment can replay any decay
+// offline. the first line is a self-describing header, so a reader can tell this format
+// (v2, explicit step) from the earlier one that had no step column. no file is opened and
+// nothing is written unless the variable names a path.
+static void route_dump_row(const llama_expert_pool_state & st, int32_t il, int32_t n_used, int32_t n_tok) {
+    static FILE * f = []() -> FILE * {
+        const char * p = getenv("GGML_EXPPOOL_ROUTE_LOG");
+        if (p == nullptr || p[0] == '\0') {
+            return nullptr;
+        }
+        FILE * fp = fopen(p, "w");
+        if (fp != nullptr) {
+            fprintf(fp, "# v2 step,layer,n_tok,n_used,c0..cN\n");
+        }
+        return fp;
+    }();
+    if (f == nullptr) {
+        return;
+    }
+    std::vector<int32_t> cnt((size_t) st.n_expert, 0);
+    for (size_t i = 0; i < st.ids_buf.size(); ++i) {
+        const int32_t e = st.ids_buf[i];
+        if (e >= 0 && e < st.n_expert) {
+            cnt[(size_t) e] += 1;
+        }
+    }
+    fprintf(f, "%d,%d,%d,%d", st.hook_step, il, n_tok, n_used);
+    for (int32_t e = 0; e < st.n_expert; ++e) {
+        fprintf(f, ",%d", cnt[(size_t) e]);
+    }
+    fputc('\n', f);
+    fflush(f);
+}
+
 // push the layer's full activation row (clean topk ids). observer thread only.
 static void route_push_row(llama_expert_pool_state & st, int32_t step, int32_t il,
                            const int32_t * ids, int32_t n_used, int32_t n_tok) {
@@ -505,8 +540,7 @@ void llama_expert_pool_account_ids(llama_expert_pool_state & st) {
         const int32_t n_tok = (int32_t) (n_rows / n_used);
         st.ids_buf.resize((size_t) n_rows);
         ggml_backend_tensor_get(ids, st.ids_buf.data(), 0, ggml_nbytes(ids));
-        LLAMA_LOG_INFO("%s: il %d rows %d n_used %d n_tok %d nb %zu full %d\n",
-                __func__, il, (int) n_rows, n_used, n_tok, ggml_nbytes(ids), (int) st.mount(il).full);
+        route_dump_row(st, il, n_used, n_tok);
         if (st.swap_auto) {
             route_push_row(st, st.hook_step, il, st.ids_buf.data(), n_used, n_tok);
         }
@@ -558,6 +592,10 @@ void llama_expert_pool_account_ids(llama_expert_pool_state & st) {
             std::lock_guard<std::mutex> lk(st.route_mtx);
             st.step_slots_hist.emplace_back(st.hook_step, st.step_slots);
         }
+    }
+    if (any) {
+        // one drained ubatch is one step, swap or not: the dump and any future reader need
+        // the step to advance even in the frozen arm
         st.hook_step += 1;
     }
 }

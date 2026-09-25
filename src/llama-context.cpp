@@ -813,6 +813,7 @@ void llama_context::expert_pool_init() {
     for (int32_t il : pooled_ils) {
         st.pool_flag[il] = 1;
     }
+    st.layout_whole = layout_whole;
 
     // default: uniform-width random-content pool; --expert-pool-init overrides the
     // content with a csv seed (debug)
@@ -1167,6 +1168,10 @@ void llama_context::expert_pool_build() {
 
     // the weight/table fill is deferred to expert_pool_fill(), after graph_reserve: with
     // no_alloc model tensors the data is valid only once the scheduler placed them
+
+    // the tensors exist now: the fill may write them. a re-layout runs this again, so the
+    // phase belongs here - a caller that also set it would clobber the fill's FILLED
+    st.phase = llama_expert_pool_state::PHASE_BUILT;
 }
 
 void llama_context::expert_pool_fill() {
@@ -2186,6 +2191,7 @@ int llama_context::encode(const llama_batch_ext & batch_inp) {
         t_compute_start_us = ggml_time_us();
     }
 
+    expert_pool_cross((int32_t) std::min<uint32_t>(n_tokens, cparams.n_ubatch));
     sched_reserve();
 
     n_queued_tokens += n_tokens;
@@ -2474,6 +2480,9 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     output_swaps.clear();
     embd_batch_idxs.clear();
 
+    // the pool's layout follows the batch regime: a batch that crosses the offload
+    // threshold re-lays the pool before it runs (GGML_EXPPOOL_LAYOUT=auto)
+    expert_pool_cross((int32_t) std::min<uint32_t>(n_tokens_all, cparams.n_ubatch));
     sched_reserve();
 
     bool did_optimize = false;
@@ -5250,6 +5259,138 @@ void llama_expert_pool_finalize(struct llama_context * ctx, int32_t id_slot) {
         return;
     }
     ctx->expert_pool_finalize(id_slot);
+}
+
+// re-lay the pool in the other layout: the whole-layer target puts the budget into full
+// shallow layers, the partial one spreads it uniformly with the remainder on the deep
+// layers. then the worker is stopped (its join is the barrier) and the sched synchronized
+// before the old tensors are freed. the new tensors are built and filled like at init, at
+// the same total size - the budget is the invariant, only the widths change.
+void llama_context::expert_pool_relayout(bool whole) {
+    llama_expert_pool_state & st = expert_pool_state;
+    if (st.phase == llama_expert_pool_state::PHASE_NONE || st.pooled_layers.empty()) {
+        return;
+    }
+    const int32_t n_expert = model.hparams.n_expert;
+
+    // one exchange spans two settles: stop the worker first (its join is the barrier)
+    st.stop_worker();
+
+    std::vector<std::vector<int32_t>> resident;
+    if (whole) {
+        // the shallowest layers the budget covers go fully resident, in the model's own
+        // order (a full-width layer is laid out in expert order); the rest go to width 0
+        const int32_t n_full = std::min<int32_t>((int32_t) st.pooled_layers.size(),
+                                                 cparams.expert_pool / n_expert);
+        if (n_full <= 0) {
+            LLAMA_LOG_WARN("%s: expert pool budget %d is below one full layer (%d experts), keeping the current layout\n",
+                    __func__, cparams.expert_pool, n_expert);
+            llama_expert_pool_start_worker(st);
+            return;
+        }
+        resident.assign(st.pooled_layers.size(), {});
+        for (int32_t i = 0; i < n_full; ++i) {
+            resident[i].resize((size_t) n_expert);
+            for (int32_t e = 0; e < n_expert; ++e) {
+                resident[i][e] = e;
+            }
+        }
+    } else {
+        // uniform widths, the remainder on the DEEP layers: at the coverage ratios where the
+        // remainder is worth deciding (below ~13% of the experts per layer, see the routing
+        // baseline ref) the marginal expert sits in the deeper layers, so they take the spare
+        const int32_t P = (int32_t) st.pooled_layers.size();
+        const int32_t wu = cparams.expert_pool / P;
+        const int32_t rem = cparams.expert_pool % P;
+        resident.assign(P, {});
+        for (int32_t i = 0; i < P; ++i) {
+            const int32_t wi = wu + (i >= P - rem ? 1 : 0);
+            const float * row = st.act_cnt.data() + (size_t) st.pooled_layers[i] * n_expert;
+            std::vector<std::pair<float, int32_t>> top;
+            top.reserve((size_t) n_expert);
+            for (int32_t e = 0; e < n_expert; ++e) {
+                if (row[e] > 0.0f) {
+                    top.emplace_back(row[e], e);
+                }
+            }
+            std::sort(top.begin(), top.end(), [](const auto & a, const auto & b) {
+                return a.first > b.first || (a.first == b.first && a.second < b.second);
+            });
+            const int32_t take = std::min<int32_t>(wi, (int32_t) top.size());
+            for (int32_t k = 0; k < take; ++k) {
+                resident[i].push_back(top[k].second);
+            }
+        }
+    }
+
+    synchronize(); // the publish pipeline may still have async copies in flight
+    // the cached previous graph and the scheduler's own state still reference the pool
+    // tensors (their buffers are freed below): drop both, the next reserve rebuilds them
+    for (auto & res : gf_res_prev) {
+        res.reset();
+    }
+    gf_res_prev_active = nullptr;
+    ggml_backend_sched_reset(sched.get());
+    pool_buf.reset();
+    mount_tab_buf.reset();
+    mount_tab_cpu_buf.reset();
+    if (pool_ctx != nullptr) {
+        ggml_free(pool_ctx);
+        pool_ctx = nullptr;
+    }
+    if (pool_tab_ctx != nullptr) {
+        ggml_free(pool_tab_ctx);
+        pool_tab_ctx = nullptr;
+    }
+    if (pool_tab_cpu_ctx != nullptr) {
+        ggml_free(pool_tab_cpu_ctx);
+        pool_tab_cpu_ctx = nullptr;
+    }
+    st.tab_all = nullptr;
+    st.tab_cpu = nullptr;
+    for (auto & m : st.tab_mirror) {
+        m.clear();
+    }
+    st.mirror_ready.store(-1);
+    st.mirror_pub.store(-1);
+    st.resident.assign(model.hparams.n_layer_all, {});
+    for (size_t i = 0; i < st.pooled_layers.size() && i < resident.size(); ++i) {
+        st.resident[st.pooled_layers[i]] = std::move(resident[i]);
+    }
+    st.layout_whole = whole;
+    expert_pool_build();
+    expert_pool_fill(); // restarts the swap worker
+    sched_need_reserve = true;
+    LLAMA_LOG_INFO("%s: pool re-laid out (%s layout, %d layers, %d slots)\n",
+            __func__, whole ? "whole-layer" : "partial", (int) st.pooled_layers.size(), cparams.expert_pool);
+}
+
+// the layout follows the batch regime (GGML_EXPPOOL_LAYOUT=auto): at or above the
+// offload threshold the whole-layer layout serves the batch, below it the partial one.
+// only a batch that lands on the other side re-lays the pool; the same-side batches just
+// run. the caller passes the tokens this batch will actually hand to one graph, so the
+// decision follows the same threshold the scheduler uses to move a miss chain off the CPU.
+void llama_context::expert_pool_cross(int32_t n_tokens) {
+    llama_expert_pool_state & st = expert_pool_state;
+    if (!llama_expert_pool_layout_auto() || st.phase == llama_expert_pool_state::PHASE_NONE ||
+            st.pooled_layers.empty()) {
+        return;
+    }
+    const bool want_whole = n_tokens >= llama_expert_pool_offload_min_batch();
+    if (want_whole == st.layout_whole) {
+        // the regime's layout is in place: a later crossing may try again
+        st.layout_tried = -1;
+        return;
+    }
+    if ((int8_t) want_whole == st.layout_tried) {
+        // this regime's target was refused once; retrying every batch would cost a
+        // worker join per step for nothing
+        return;
+    }
+    st.layout_tried = (int8_t) want_whole;
+    LLAMA_LOG_INFO_V(LLAMA_LOG_VERBOSITY_INFO, "%s: batch of %d tokens crosses the %d-token threshold: re-laying the pool\n",
+            __func__, n_tokens, llama_expert_pool_offload_min_batch());
+    expert_pool_relayout(want_whole);
 }
 
 void llama_context::expert_pool_release() {
