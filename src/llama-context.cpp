@@ -153,7 +153,6 @@ llama_context::llama_context(
     cparams.expert_pool_swap_cap   = ep.swap_cap;
     cparams.expert_pool_swap_decay = ep.swap_decay;
     cparams.expert_pool_miss_method= ep.miss_method;
-    cparams.expert_pool_init       = ep.init_file;
 
     cparams.ctx_other = nullptr;
 
@@ -795,8 +794,6 @@ void llama_context::expert_pool_init() {
     }
     st.layout_whole = layout_whole;
 
-    // default: uniform-width random-content pool; --expert-pool-init overrides the
-    // content with a csv seed (debug)
     if (!layout_whole && n_slot > n_expert) {
         LLAMA_LOG_WARN("%s: expert pool request of %d slots exceeds capacity (%d pooled layers x %d experts), "
                        "saturating to full coverage per layer\n",
@@ -825,32 +822,13 @@ void llama_context::expert_pool_init() {
                 res[e] = e;
             }
         }
-        if (cparams.expert_pool_init && cparams.expert_pool_init[0]) {
-            LLAMA_LOG_WARN("%s: GGML_EXPPOOL_LAYOUT=whole uses identity slots, the csv seed is ignored\n", __func__);
-        }
-        st.phase = llama_expert_pool_state::PHASE_BUILT;
-        expert_pool_build();
-        return;
-    }
-    if (cparams.expert_pool_init && cparams.expert_pool_init[0]) {
-        // --- resident sets: csv seed or random ---
-        bool ok = llama_expert_pool_parse_init(cparams.expert_pool_init, n_layer_all, n_expert, st.resident);
-        if (!ok) {
-            LLAMA_LOG_WARN("%s: failed to read expert pool csv '%s', falling back to random\n",
-                    __func__, cparams.expert_pool_init);
-            llama_expert_pool_random(n_layer_all, n_expert, widths, st.resident);
-        }
-        // the csv names the residents itself; a desert-trimmed layer still goes to width 0
-        for (int32_t i = 0; i < n_zero; ++i) {
-            st.resident[pooled_ils[i]].clear();
-        }
         st.phase = llama_expert_pool_state::PHASE_BUILT;
         expert_pool_build();
         return;
     }
 
-    // default: uniform widths + random content (a random+swap pool beats a stale csv
-    // seed; the allocation shape costs <7% vs global top-N at the same budget)
+    // uniform widths + random content (a random+swap pool beats a static seed; the
+    // allocation shape costs <7% vs global top-N at the same budget)
     llama_expert_pool_random(n_layer_all, n_expert, widths, st.resident);
     st.phase = llama_expert_pool_state::PHASE_BUILT;
     expert_pool_build();

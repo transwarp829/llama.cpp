@@ -1733,13 +1733,6 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ));
     add_opt(common_arg(
-        {"--expert-pool-init"}, "FILE",
-        "csv file to seed the expert pool (\"il,e1,e2,...\"), default random",
-        [](common_params & params, const std::string & value) {
-            params.expert_pool_init = value;
-        }
-    ));
-    add_opt(common_arg(
         {"--expert-pool-swap-cap"}, "N",
         string_format("max expert pairs swapped in per decode step (0 or less = freeze the resident set; "
                       "a value above the pool size never binds; default: %d)", params.expert_pool.swap_cap),

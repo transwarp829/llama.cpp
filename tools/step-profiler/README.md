@@ -8,7 +8,7 @@ Per-step (per-token) decode timing profiler based on the scheduler eval callback
 
 ```bash
 llama-step-profiler -m model.gguf -p "prompt" -n 100 -t 48 -ngl 99
-llama-step-profiler -m model.gguf -p "prompt" -n 100 -t 48 --cpu-moe --expert-pool 768 --expert-pool-init pool.csv
+llama-step-profiler -m model.gguf -p "prompt" -n 100 -t 48 --cpu-moe --expert-pool 768
 ```
 
 All common CLI options are supported (`-t`, `-ngl`, `--cpu-moe`,

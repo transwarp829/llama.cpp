@@ -582,7 +582,6 @@ struct common_params {
     // fork-private expert pool knobs (llama-ext.h); common_context_params_to_llama
     // passes a pointer to this struct through llama_context_params
     llama_expert_pool_params expert_pool = llama_expert_pool_default_params();
-    std::string expert_pool_init;         // csv file to seed the pool (empty = random)
 
     bool input_prefix_bos  = false; // prefix BOS to user inputs, preceding input_prefix
     bool verbose_prompt    = false; // print prompt tokens before generation

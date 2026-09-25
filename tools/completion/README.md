@@ -148,7 +148,6 @@ llama-completion.exe -m models\gemma-1.1-7b-it.Q4_K_M.gguf --ignore-eos -n -1
 | `-ncmoe, --n-cpu-moe N` | keep the Mixture of Experts (MoE) weights of the first N layers in the CPU<br/>(env: LLAMA_ARG_N_CPU_MOE) |
 | `-ncffn, --n-cpu-ffn N` | keep the dense FFN weights of the first N layers in the CPU<br/>(dense models; for MoE expert weights use --n-cpu-moe)<br/>(env: LLAMA_ARG_N_CPU_FFN) |
 | `-nep, --expert-pool ARG` | keep the hottest MoE experts of the pooled layers in VRAM and compute a miss on the CPU (experimental)<br/>- N: slot budget spread over all pooled MoE layers, deepest first<br/>- M,N: the same budget, spread over the M deepest MoE layers<br/>- 0: disabled |
-| `--expert-pool-init FILE` | csv file to seed the pool content ("il,e1,e2,..."), default random |
 | `--expert-pool-swap-cap N` | max expert pairs swapped in per decode step (0 or less = freeze the resident set; a value above the pool size never binds; default: 40) |
 | `--expert-pool-swap-decay H` | activation counter half-life in decode steps for the swap refresh (default: 96) |
 | `--expert-pool-miss-method {cpu-serial,cpu-parallel}` | how the pool runs a miss below the offload batch threshold:<br/>- cpu-serial: the CPU miss chain stays one split (default)<br/>- cpu-parallel: the mount chain is handed to the device ahead of the CPU chain |

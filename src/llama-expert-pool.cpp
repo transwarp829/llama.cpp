@@ -6,9 +6,7 @@
 #include "ggml-backend.h"
 
 #include <algorithm>
-#include <fstream>
 #include <random>
-#include <sstream>
 
 // route observer (llama-ext.h, fork-private): gets the clean topk rows; set once at init.
 static llama_expert_pool_route_fn g_route_cb = nullptr;
@@ -212,52 +210,6 @@ void llama_expert_pool_start_worker(llama_expert_pool_state & st) {
         }
     });
 }
-
-// parse seed csv: one line per layer "il,e1,e2,..."; the line length is that
-// layer's slot count, missing layers get zero. false only on open failure.
-bool llama_expert_pool_parse_init(const std::string & path, int32_t n_layer,
-                                  int32_t n_expert,
-                                  std::vector<std::vector<int32_t>> & resident) {
-    std::ifstream f(path);
-    if (!f) {
-        return false;
-    }
-    resident.assign(n_layer, std::vector<int32_t>());
-    std::string line;
-    while (std::getline(f, line)) {
-        std::istringstream ss(line);
-        std::string tok;
-        std::getline(ss, tok, ',');
-        if (tok.empty() || tok[0] == '#') {
-            continue;
-        }
-        const int32_t il = std::atoi(tok.c_str());
-        if (il < 0 || il >= n_layer) {
-            continue;
-        }
-        std::vector<int32_t> experts;
-        while (std::getline(ss, tok, ',')) {
-            if (tok.empty()) {
-                continue;
-            }
-            int32_t e = std::atoi(tok.c_str());
-            if (e < 0 || e >= n_expert) {
-                continue;
-            }
-            experts.push_back(e);
-        }
-        // dedup, keep order (the file writer emits already-deduped lists)
-        std::vector<int32_t> dedup;
-        for (int32_t e : experts) {
-            if (std::find(dedup.begin(), dedup.end(), e) == dedup.end()) {
-                dedup.push_back(e);
-            }
-        }
-        resident[il] = dedup;
-    }
-    return true;
-}
-
 // random resident set (fixed seed); `widths` indexed by layer (0 = not pooled)
 void llama_expert_pool_random(int32_t n_layer, int32_t n_expert,
                               const std::vector<int32_t> & widths,

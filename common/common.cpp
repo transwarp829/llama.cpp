@@ -1704,9 +1704,8 @@ struct llama_context_params common_context_params_to_llama(common_params & param
     cparams.op_offload        = !params.no_op_offload;
     cparams.swa_full          = params.swa_full;
     cparams.kv_unified        = params.kv_unified;
-    // fork-private expert pool knobs: point the context params at the caller's
-    // struct and take the seed file from the string holder (both outlive the ctx)
-    params.expert_pool.init_file = params.expert_pool_init.empty() ? nullptr : params.expert_pool_init.c_str();
+    // fork-private expert pool knobs: point the context params at the caller's struct
+    // (it outlives the ctx)
     cparams.expert_pool = &params.expert_pool;
 
     cparams.type_k = params.cache_type_k;

@@ -104,8 +104,7 @@ struct llama_expert_pool_mount {
 // ---------------------------------------------------------------
 // model-level runtime state (direct-mount mode): per pooled layer the
 // device-resident pool weight tensors (compact: slot s holds the s-th resident
-// expert) plus the routing tables. content = csv seed (--expert-pool-init,
-// debug) or random, refreshed per step.
+// expert) plus the routing tables. content = random, refreshed per step.
 
 // per-layer expert tensors the pool copies and the swap moves. the kind order
 // is the array index used everywhere (extend here and in the per-layer source
@@ -309,13 +308,6 @@ struct llama_expert_pool_state {
     // worker running); shared by reset() and the ctx teardown
     void stop_worker();
 };
-
-// csv seed, one line per layer: "il,e1,e2,...". the line length sets that
-// layer's slot count; layers missing from the file get zero slots (full CPU
-// compute). returns false only if the file cannot be opened.
-bool llama_expert_pool_parse_init(const std::string & path, int32_t n_layer,
-                                  int32_t n_expert,
-                                  std::vector<std::vector<int32_t>> & resident);
 
 // random resident set (fixed seed, reproducible); `widths` indexed by layer (0 = not pooled)
 void llama_expert_pool_random(int32_t n_layer, int32_t n_expert,

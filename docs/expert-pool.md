@@ -81,7 +81,6 @@ override) there is nothing to pool and the option is inert.
 | `--expert-pool-miss-method {cpu-serial,cpu-parallel}` | how the non-resident chain runs below the offload threshold (see below); default `cpu-serial` |
 | `--expert-pool-swap-decay H` | half-life in decode steps of the per-layer activation counter that drives the swap decisions; default 96 |
 | `--expert-pool-swap-cap N` | maximum expert pairs swapped in per step; `0` or less freezes the resident set (a value above the pool size never binds, so a large number means "no burst fuse"); default 40 |
-| `--expert-pool-init FILE` | seed the resident sets from a csv (`il,e1,e2,...` per line); default random |
 | `-nepd N` / `--expert-pool-draft N` | slot budget for the draft context (MTP); `0` = no draft pool (default) |
 
 Debug/env switches (all off by default, all no-ops when unset):
