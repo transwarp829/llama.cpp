@@ -185,6 +185,14 @@ Two more numbers worth knowing before tuning:
 
 ## Constraints and limitations
 
+- The device that holds the pool must keep uploaded weight bytes as they are. A SYCL
+  device (Intel GPUs, K-quants) permutes expert weights in place on first use, so an
+  uploaded slice would be read in the wrong layout - the pool refuses SYCL devices and
+  logs a warning (no backend changes are made for this; the check is by backend name).
+- Repacked host weights (`CPU_REPACK`, i.e. `--no-host` with repacking enabled) do not
+  hold the model's layout, and the pool requires host-visible buffers, so such layers
+  are skipped with a per-layer warning. Reading the raw bytes from the GGUF file offsets
+  (as some third-party caches do) would lift that; it is not implemented.
 - The pool needs host-resident experts (`-cmoe`); it also needs exactly one device -
   with more than one device the pool disables itself and logs a warning (per-device
   pools are not *yet* implemented).

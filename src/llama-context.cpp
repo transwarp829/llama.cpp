@@ -716,9 +716,10 @@ void llama_context::expert_pool_init() {
                 continue;
             }
             ggml_tensor * ws[4] = {L.ffn_gate_up_exps, L.ffn_up_exps, L.ffn_gate_exps, L.ffn_down_exps};
-            bool any      = false;
-            bool any_host = false;
-            bool all_host = true;
+            bool any        = false;
+            bool any_host   = false;
+            bool all_host   = true;
+            bool any_repack = false; // a CPU-device buffer that is not host-visible: the pool cannot read it
             for (ggml_tensor * w : ws) {
                 if (w == nullptr) {
                     continue;
@@ -727,11 +728,22 @@ void llama_context::expert_pool_init() {
                 const bool host = w->buffer != nullptr && ggml_backend_buffer_is_host(w->buffer);
                 any_host = any_host || host;
                 all_host = all_host && host;
+                if (!host && w->buffer != nullptr &&
+                        ggml_backend_dev_type(ggml_backend_buft_get_device(ggml_backend_buffer_get_type(w->buffer))) ==
+                            GGML_BACKEND_DEVICE_TYPE_CPU) {
+                    any_repack = true;
+                }
             }
             if (any && all_host) {
                 pooled_ils.push_back(il);
             } else if (any_host) {
                 LLAMA_LOG_WARN("%s: layer %d has mixed CPU/GPU expert matrices, skipped by the pool (keep the whole layer on one device)\n",
+                        __func__, il);
+            } else if (any_repack) {
+                // repacked expert weights (CPU extra bufts, e.g. --no-host with repacking on) live in
+                // a layout that is not the model's: the pool copies raw host bytes, so it would read
+                // the repacked form. TODO: upload from the GGUF file offsets (pread) instead of host memory
+                LLAMA_LOG_WARN("%s: layer %d expert matrices sit in a repacked CPU buffer: the pool cannot read that layout, layer skipped\n",
                         __func__, il);
             }
         }
@@ -1068,6 +1080,22 @@ void llama_context::expert_pool_build() {
     }
     if (!pool_buft) {
         pool_buft = ggml_backend_cpu_buffer_type();
+    }
+    // the pool uploads weight bytes exactly as they sit in host memory, so a backend that
+    // reorders expert weights on the device side would read every uploaded slice wrong.
+    // SYCL does that lazily and in place (opt_for_reorder_id, K-quants on Intel GPUs) with
+    // no hook to re-apply, and there is no neutral way to ask for it - refuse the whole pool
+    {
+        ggml_backend_dev_t pool_dev = ggml_backend_buft_get_device(pool_buft);
+        if (pool_dev != nullptr &&
+                std::string(ggml_backend_reg_name(ggml_backend_dev_backend_reg(pool_dev))) == "SYCL") {
+            LLAMA_LOG_WARN("%s: %s reorders expert weights in place on first use; the pool uploads raw "
+                           "weights and would read them wrong - pool disabled\n",
+                    __func__, ggml_backend_dev_name(pool_dev));
+            expert_pool_release(); // free the partial allocations (pool ctx / tables)
+            st.reset();
+            return;
+        }
     }
     st.pool_buft = pool_buft;
     pool_buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(pool_ctx, pool_buft));
