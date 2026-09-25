@@ -89,7 +89,6 @@ Debug/env switches (all off by default, all no-ops when unset):
 |---|---|
 | `GGML_EXPPOOL_ROUTING_LOG=<path>` | per-step, per-layer routing rows as csv (written by `llama-step-profiler`) |
 | `GGML_EXPPOOL_STAGE_LOG=1` | print the expert count/bytes actually staged per node |
-| `GGML_SCHED_TIMELINE_CSV=<path>` | per-split enter/submit timeline of the scheduler |
 | `GGML_SCHED_SANITIZE=1` | scheduler async-race sanitizer |
 
 ## How it runs
@@ -229,6 +228,7 @@ Two more numbers worth knowing before tuning:
   the measurements above (fork-only tool).
 - `tools/cli/README.md`, `tools/server/README.md`, `tools/completion/README.md` - the
   pool flags listed next to the other MoE offload options.
-- Fork-side debug instruments: the split timeline (`GGML_SCHED_TIMELINE_CSV`) and the
-  scheduler race sanitizer (`GGML_SCHED_SANITIZE`), the latter vendored from upstream
-  PR 26167 (Aman Gupta).
+- Fork-side debug instruments: the scheduler race sanitizer (`GGML_SCHED_SANITIZE`,
+  vendored from upstream PR 26167, Aman Gupta) and the in-tree `llama-step-profiler`.
+  Segment-level timing is read from the tree's own `GGML_SCHED_DEBUG=2` print
+  (`sched_split #k: <backend> nodes [a,b) <head> X.XXX ms`; adds ~20-50 us/split).
