@@ -522,7 +522,9 @@ llama_context::~llama_context() {
 
     // stop the swap worker and free the pool (single teardown owner; the worker's
     // sync tensor_set calls reference the pool tensors)
-    expert_pool_release();
+    if (expert_pool != nullptr) {
+        expert_pool->expert_pool_release();
+    }
 }
 
 void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint32_t n_seqs) {
@@ -633,626 +635,6 @@ static int llama_graph_n_input_tensors(ggml_cgraph * gf) {
     return (int) users.size();
 }
 
-// expert pool initialization:
-// - find the host-resident MoE layers, allocate one pool weight copy per matrix
-//   (same type/layout, expert dim = S), seed the resident sets, fill the tables
-void llama_context::expert_pool_init() {
-    // already built (a reserve after a rebuild re-enters here): a reset() would
-    // wipe the fresh pool
-    if (expert_pool_state.phase != llama_expert_pool_state::PHASE_NONE) {
-        return;
-    }
-    llama_expert_pool_state & st = expert_pool_state;
-    st.reset();
-
-    if (cparams.expert_pool <= 0) {
-        return;
-    }
-    // multi-GPU (layer split) is not supported: per-device pools are the planned
-    // design, and a single-device pool would round-trip every pooled layer through
-    // card 0. keep the pure -cmoe.
-    if (model.n_devices() > 1) {
-        LLAMA_LOG_WARN("%s: multi-GPU layer split not supported for the expert pool yet, "
-                       "pool disabled (pure -cmoe)\n", __func__);
-        return;
-    }
-    const int32_t n_layer = model.hparams.n_layer();
-    const int32_t n_layer_all = (int32_t) model.hparams.n_layer_all;
-    const int32_t n_expert = model.hparams.n_expert;
-    if (n_expert <= 0) {
-        return;
-    }
-    // the method governs the range below the offload threshold only: at/above it
-    // the scheduler's lane runs the miss chain on the pool device
-    LLAMA_LOG_INFO("%s: expert pool: miss method %s, offload threshold %d\n", __func__,
-            cparams.expert_pool_miss_method == LLAMA_EXPERT_POOL_MISS_CPU_PARALLEL ? "cpu-parallel" : "cpu-serial",
-            llama_expert_pool_offload_min_batch());
-    // unified memory (iGPU / APUs, coherent CPU-GPU links): nothing to cache - the
-    // same memory already holds the experts, and -cmoe/-ncmoe would only serialize
-    // CPU and GPU work. informational only.
-    // GGML_CUDA_ENABLE_UNIFIED_MEMORY is the same case but the device still
-    // reports itself as discrete, so it is not detected here.
-    for (int32_t il = 0; il < n_layer_all; ++il) {
-        if (ggml_backend_dev_type(model.dev_layer(il)) == GGML_BACKEND_DEVICE_TYPE_IGPU) {
-            LLAMA_LOG_WARN("%s: expert pool is used on an integrated/unified-memory GPU (layer %d) - "
-                           "consider disabling the pool and running without CPU offload for better performance\n",
-                           __func__, il);
-            break;
-        }
-    }
-    // an MTP draft context executes only the appended NextN block(s): its pooled set
-    // is that range instead of the trunk
-    const bool    mtp_ctx  = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP;
-    const int32_t il_begin = mtp_ctx ? n_layer : 0;
-    const int32_t il_end   = mtp_ctx ? n_layer_all : n_layer;
-    st.n_expert = n_expert;
-    // 0 pairs/step freezes the resident set (the static A/B control arm)
-    st.swap_per_step = cparams.expert_pool_swap_cap;
-    st.swap_auto     = st.swap_per_step > 0;
-    // decaying activation counter (--expert-pool-swap-decay H): lambda = 2^(-1/H) per
-    // settled step; a step's increment is its activation count divided by its token
-    // columns
-    st.swap_decay_hl = cparams.expert_pool_swap_decay > 0 ? cparams.expert_pool_swap_decay : st.swap_decay_hl;
-    st.swap_lambda   = std::pow(2.0f, -1.0f / (float) st.swap_decay_hl);
-    LLAMA_LOG_INFO("%s: expert pool: decaying counter, half-life %d steps (lambda %.6f)\n",
-            __func__, st.swap_decay_hl, st.swap_lambda);
-
-    // --- find the pooled layers: every present expert matrix of the layer in a host
-    // buffer, the rest of the layer on a device ---
-    // the placement is read from the tensors themselves (the loader resolved
-    // -ot/-cmoe/-ncmoe into buffers, fallbacks included), never re-derived from the
-    // override patterns; one device-pinned matrix skips the whole layer.
-    // CPU-attn layers keep the pure -cmoe path (the pool chain reads the layer's
-    // FFN input after the GPU segment).
-    std::vector<int32_t> pooled_ils;
-    // pooling stays opt-in: without a host-placement override the pool has no reason
-    // to build chains, and a device that fell back to the host for mul_mat_id must
-    // not be handed a device-side pool
-    if (model.params.tensor_buft_overrides != nullptr) {
-        for (int32_t il = il_begin; il < il_end; ++il) {
-            const llama_layer & L = model.layers[il];
-            // CPU-attn layers are never pooled (see comment above)
-            if (ggml_backend_dev_type(model.dev_layer(il)) == GGML_BACKEND_DEVICE_TYPE_CPU) {
-                continue;
-            }
-            ggml_tensor * ws[4] = {L.ffn_gate_up_exps, L.ffn_up_exps, L.ffn_gate_exps, L.ffn_down_exps};
-            bool any        = false;
-            bool any_host   = false;
-            bool all_host   = true;
-            bool any_repack = false; // a CPU-device buffer that is not host-visible: the pool cannot read it
-            for (ggml_tensor * w : ws) {
-                if (w == nullptr) {
-                    continue;
-                }
-                any = true;
-                const bool host = w->buffer != nullptr && ggml_backend_buffer_is_host(w->buffer);
-                any_host = any_host || host;
-                all_host = all_host && host;
-                if (!host && w->buffer != nullptr &&
-                        ggml_backend_dev_type(ggml_backend_buft_get_device(ggml_backend_buffer_get_type(w->buffer))) ==
-                            GGML_BACKEND_DEVICE_TYPE_CPU) {
-                    any_repack = true;
-                }
-            }
-            if (any && all_host) {
-                pooled_ils.push_back(il);
-            } else if (any_host) {
-                LLAMA_LOG_WARN("%s: layer %d has mixed CPU/GPU expert matrices, skipped by the pool (keep the whole layer on one device)\n",
-                        __func__, il);
-            } else if (any_repack) {
-                // repacked expert weights (CPU extra bufts, e.g. --no-host with repacking on) live in
-                // a layout that is not the model's: the pool copies raw host bytes, so it would read
-                // the repacked form. TODO: upload from the GGUF file offsets (pread) instead of host memory
-                LLAMA_LOG_WARN("%s: layer %d expert matrices sit in a repacked CPU buffer: the pool cannot read that layout, layer skipped\n",
-                        __func__, il);
-            }
-        }
-    }
-    if (pooled_ils.empty()) {
-        LLAMA_LOG_WARN("%s: no CPU-resident MoE layers found, expert pool disabled\n", __func__);
-        return;
-    }
-
-    int32_t n_pooled = (int32_t) pooled_ils.size();
-    // explicit deep-first layer set (--pooled-layers N); -nep still sets the width over it
-    if (cparams.expert_pool_layers > 0 && n_pooled > cparams.expert_pool_layers) {
-        const int32_t n_eligible = n_pooled;
-        pooled_ils.erase(pooled_ils.begin(), pooled_ils.end() - cparams.expert_pool_layers);
-        n_pooled = (int32_t) pooled_ils.size();
-        LLAMA_LOG_INFO("%s: pooling the deepest %d of %d eligible MoE layers (layer %d..%d)\n",
-                __func__, n_pooled, n_eligible, pooled_ils.front(), pooled_ils.back());
-    }
-    // whole-layer layout (experiment): the shallowest k eligible layers (k = budget /
-    // n_expert) go fully resident in the model's own order, the rest stay pool layers at
-    // width 0: nothing of them is resident and the plain path computes them, but they
-    // are still observed. the layer set is the same in every layout - only the widths
-    // differ. the leftover slots stay unused. refs prefill-whole-layer-mode-2026-09-24.md
-    const bool layout_whole = llama_expert_pool_layout_whole();
-    int32_t n_full = n_pooled;
-    if (layout_whole) {
-        if (cparams.expert_pool_layers > 0) {
-            LLAMA_LOG_WARN("%s: GGML_EXPPOOL_LAYOUT=whole keeps the shallow layers; the -nep M,N layer set is ignored\n",
-                    __func__);
-        }
-        n_full = std::min(n_pooled, cparams.expert_pool / n_expert);
-        if (n_full <= 0) {
-            LLAMA_LOG_WARN("%s: expert pool budget %d is below one full layer (%d experts), pool disabled\n",
-                    __func__, cparams.expert_pool, n_expert);
-            return;
-        }
-        LLAMA_LOG_INFO("%s: whole-layer layout: %d full layers (layer %d..%d), %d slots unused, %d layers at width 0\n",
-                __func__, n_full, pooled_ils.front(), pooled_ils[n_full - 1],
-                cparams.expert_pool - n_full * n_expert, n_pooled - n_full);
-    }
-
-    // uniform width from the budget. below the floor (llama_expert_pool_min_slots, 1% of
-    // the expert count) the per-layer mount roundtrip costs more than the hits save, so
-    // warn - a budget this thin is a configuration error, and re-laying the layer set is
-    // the placement logic's job (--fit), never the pool's
-    const int32_t min_slots = llama_expert_pool_min_slots(n_expert);
-    int32_t n_slot = layout_whole ? n_expert : cparams.expert_pool / n_pooled;
-    int32_t rem    = layout_whole ? 0 : cparams.expert_pool % n_pooled;
-    if (!layout_whole && n_slot < min_slots) {
-        LLAMA_LOG_WARN("%s: %d slots per layer is under 1%% of the layer's experts (floor %d of %d): the mount roundtrip may cost more than the hits save - consider fewer pooled layers (-nep M,N) or a bigger budget\n",
-                __func__, n_slot, min_slots, n_expert);
-    }
-
-    st.layers.assign(n_layer_all, llama_expert_pool_layer{});
-    st.resident.resize(n_layer_all);
-    st.pooled_layers = pooled_ils;
-    st.pool_flag.assign((size_t) n_layer_all, 0);
-    for (int32_t il : pooled_ils) {
-        st.pool_flag[il] = 1;
-    }
-    st.layout_whole = layout_whole;
-
-    if (!layout_whole && n_slot > n_expert) {
-        LLAMA_LOG_WARN("%s: expert pool request of %d slots exceeds capacity (%d pooled layers x %d experts), "
-                       "saturating to full coverage per layer\n",
-                __func__, cparams.expert_pool, n_pooled, n_expert);
-        n_slot = n_expert;
-        rem    = 0;
-    }
-    // per-layer widths: the whole-layer layout covers the shallow end fully, otherwise
-    // uniform n_slot with the remainder going to the deepest pooled layers
-    std::vector<int32_t> widths(n_layer_all, 0);
-    for (size_t i = 0; i < pooled_ils.size(); ++i) {
-        if (layout_whole) {
-            widths[pooled_ils[i]] = (int32_t) i < n_full ? n_expert : 0;
-        } else {
-            widths[pooled_ils[i]] = n_slot + ((int32_t) i >= (int32_t) pooled_ils.size() - rem ? 1 : 0);
-        }
-    }
-    if (layout_whole) {
-        // identity slot order: slot s holds expert s, so a fully resident layer's pool
-        // tensors are the model's own matrices in its own order and no remap is needed;
-        // the width-0 ones stay empty (they have no pool tensors either)
-        for (int32_t i = 0; i < n_full; ++i) {
-            std::vector<int32_t> & res = st.resident[pooled_ils[i]];
-            res.resize((size_t) n_expert);
-            for (int32_t e = 0; e < n_expert; ++e) {
-                res[e] = e;
-            }
-        }
-        st.phase = llama_expert_pool_state::PHASE_BUILT;
-        expert_pool_build();
-        return;
-    }
-
-    // uniform widths + random content (a random+swap pool beats a static seed; the
-    // allocation shape costs <7% vs global top-N at the same budget)
-    llama_expert_pool_random(n_layer_all, n_expert, widths, st.resident);
-    st.phase = llama_expert_pool_state::PHASE_BUILT;
-    expert_pool_build();
-}
-
-void llama_context::expert_pool_build() {
-    llama_expert_pool_state & st = expert_pool_state;
-    const int32_t n_expert = model.hparams.n_expert;
-    const std::vector<int32_t> & pooled_ils = st.pooled_layers;
-    const int32_t n_pooled = (int32_t) pooled_ils.size();
-
-    // a layer whose width reaches the expert count is fully resident, so its slot order
-    // is free: put it in the model's own order and the graph runs the plain path over
-    // its pool tensors - the resident-only state is static, and paying the mount
-    // machinery for it names a tax with nothing left to save
-    for (int32_t il : pooled_ils) {
-        std::vector<int32_t> & res = st.resident[il];
-        if ((int32_t) res.size() != n_expert) {
-            continue;
-        }
-        for (int32_t e = 0; e < n_expert; ++e) {
-            res[e] = e;
-        }
-    }
-
-    // reset the whole array so a zero-slot layer never keeps stale pointers
-    st.layers.assign(model.hparams.n_layer_all, llama_expert_pool_layer{});
-
-    // --- create pool weight tensors ---
-    pool_ctx = ggml_init({ 4u*1024u*1024u, nullptr, true }); // no_alloc = true (allocated via buft)
-
-    for (size_t ix = 0; ix < pooled_ils.size(); ++ix) {
-        const int32_t il = pooled_ils[ix];
-        const llama_layer & L = model.layers[il];
-        // per-layer slot count = the pool file's line length; zero-slot layers get no
-        // pool tensors (the layer falls back to CPU). COMPACT layout: slot s holds
-        // resident expert res[s] (no zero padding), non-residents route to -1, so no
-        // sentinel slice is needed. ne2 = S keeps the ids compact (the layout A/B
-        // measured 2.65 vs 0.35 ms/token; the attributed cause is unverified).
-        const int32_t s_il = (int32_t) st.resident[il].size();
-        if (s_il <= 0) {
-            continue;
-        }
-        // per-layer sources in llama_expert_pool_kind order
-        ggml_tensor * src[PK_N] = {
-            L.ffn_gate_up_exps, L.ffn_up_exps,      L.ffn_gate_exps, L.ffn_down_exps,
-            L.ffn_gate_up_exps_b, L.ffn_up_exps_b,  L.ffn_gate_exps_b, L.ffn_down_exps_b,
-        };
-        llama_expert_pool_layer & l = st.layers[il];
-        for (int k = 0; k < PK_N; ++k) {
-            if (src[k] == nullptr) {
-                continue;
-            }
-            l.orig[k] = src[k];
-            // weights 4D, slot-compact biases 2D; both are (expert -> slot) copies,
-            // so the per-expert stride is ne[2] and ne[1] respectively
-            l.pool[k] = (k < PK_UP_B)
-                ? ggml_new_tensor_4d(pool_ctx, src[k]->type, src[k]->ne[0], src[k]->ne[1], s_il, 1)
-                : ggml_new_tensor_2d(pool_ctx, src[k]->type, src[k]->ne[0], s_il);
-        }
-    }
-
-    // --- direct-mount registration ---
-    // registered HERE, not at first fill: sched_reserve() builds probe graphs before
-    // the first process_ubatch, and the mount adds nodes, so the probe must see the
-    // same topology. the tables are plain pool-buffer tensors (created before the
-    // alloc below); their content is written by expert_pool_fill().
-    // NOTE: the check below only skips REGISTRATION, never the allocation above.
-    // sized to n_layer_all before any mount is written, so a reference taken
-    // here stays valid for the whole run
-    st.mounts.assign(model.hparams.n_layer_all, llama_expert_pool_mount{});
-    st.direct_mount = true;
-    for (int32_t il : pooled_ils) {
-        const int32_t s_il = (int32_t) st.resident[il].size();
-        if (s_il <= 0) {
-            continue;
-        }
-        const llama_expert_pool_layer & l = st.layers[il];
-        if (l.pool[PK_DOWN] == nullptr) {
-            continue;
-        }
-        // a layer that is fully resident in expert order (whole-layer layout) keeps its
-        // pool tensors in the model's own layout: the graph runs the plain path over
-        // them, so it needs no mount chain, no remap and no merge
-        bool identity = s_il == n_expert;
-        for (int32_t s = 0; identity && s < n_expert; ++s) {
-            identity = st.resident[il][s] == s;
-        }
-        llama_expert_pool_mount m;
-        m.active    = true;
-        m.full      = identity;
-        m.w_up      = l.pool[PK_UP];
-        m.w_gate    = l.pool[PK_GATE];
-        m.w_down    = l.pool[PK_DOWN];
-        m.w_gate_up = l.pool[PK_GATE_UP];
-        m.w_down_s  = model.layers[il].ffn_down_exps_s;
-        m.w_gate_up_b = l.pool[PK_GATE_UP_B];
-        m.w_up_b    = l.pool[PK_UP_B];
-        m.w_gate_b  = l.pool[PK_GATE_B];
-        m.w_down_b  = l.pool[PK_DOWN_B];
-        st.set_mount(il, m);
-    }
-    // step-boundary anchors: the first/last layer that actually has a mount (a 0-slot
-    // layer is never registered, so the pooled_layers edges would freeze the swap)
-    st.first_active_ilx = -1;
-    st.last_active_ilx  = -1;
-    for (int32_t ilx = 0; ilx < (int32_t) pooled_ils.size(); ++ilx) {
-        if (st.mount(pooled_ils[ilx]).active) {
-            if (st.first_active_ilx < 0) {
-                st.first_active_ilx = ilx;
-            }
-            st.last_active_ilx = ilx;
-        }
-    }
-
-    // --- mount routing tables, all on the pool device: every gather runs on the GPU
-    // segment; ids_cpu and the scale values reach the CPU segment as 32B inputs ---
-    if (st.direct_mount) {
-        pool_tab_ctx = ggml_init({ 4u*1024u*1024u, nullptr, true }); // no_alloc
-        // CPU-hosted copy of the inverse table: the miss chain's get_rows reads it HERE,
-        // so its ids are not tied to the pool segment's output slot
-        pool_tab_cpu_ctx = ggml_init({ 64u*1024u, nullptr, true });
-        st.tab_cpu = ggml_new_tensor_2d(pool_tab_cpu_ctx, GGML_TYPE_I32, n_expert,
-                                        (int64_t) model.hparams.n_layer_all);
-        ggml_set_name(st.tab_cpu, "mnt_tab_cpu");
-        // one pool-side copy of the top-k rows per pool layer (see the field comment):
-        // the graph writes it every ubatch, the pool reads it after the graph
-        st.ids_shadow.assign(model.hparams.n_layer_all, nullptr);
-        for (int32_t il : pooled_ils) {
-            st.ids_shadow[il] = ggml_new_tensor_1d(pool_tab_ctx, GGML_TYPE_I32,
-                    (int64_t) model.hparams.n_expert_used(il) * cparams.n_ubatch);
-            char nm[64];
-            snprintf(nm, sizeof(nm), "mnt_ids_shadow_%d", il);
-            ggml_set_name(st.ids_shadow[il], nm);
-        }
-    }
-    for (int32_t il : pooled_ils) {
-        if (!st.direct_mount) {
-            break;
-        }
-        const llama_expert_pool_mount & mreg = st.mount(il);
-        if (!mreg.active) {
-            continue;
-        }
-        llama_expert_pool_mount m = mreg;
-        const llama_layer & L = model.layers[il];
-        // merged table: ONE [n_expert, 2*n_layers] I32 tensor holding both halves in the
-        // mirror's layout (remap, then inv); each layer gets a 1KB view, so a publish
-        // is one stream-ordered copy
-        if (st.tab_all == nullptr) {
-            st.tab_all = ggml_new_tensor_2d(pool_tab_ctx, GGML_TYPE_I32, n_expert,
-                                            2 * (int64_t) model.hparams.n_layer_all);
-            ggml_set_name(st.tab_all, "mnt_tab_all");
-        }
-        const size_t  i32sz        = ggml_type_size(GGML_TYPE_I32);
-        const int64_t n_layers_all = (int64_t) model.hparams.n_layer_all;
-        m.remap     = ggml_view_2d(pool_tab_ctx, st.tab_all, 1, n_expert, i32sz,
-                                   il * n_expert * i32sz);
-        m.remap_inv = ggml_view_2d(pool_tab_ctx, st.tab_all, 1, n_expert, i32sz,
-                                   (n_layers_all + il) * n_expert * i32sz);
-        // CPU-side view of the host table (tab_cpu holds only the inv part)
-        m.remap_inv_host = ggml_view_2d(pool_tab_cpu_ctx, st.tab_cpu, 1, n_expert, i32sz,
-                                       il * n_expert * i32sz);
-        if (L.ffn_down_exps_s != nullptr) {
-            m.scale = ggml_new_tensor_1d(pool_tab_ctx, GGML_TYPE_F32, n_expert);
-        }
-        if (L.ffn_up_exps_s != nullptr) {
-            m.scale_up = ggml_new_tensor_1d(pool_tab_ctx, GGML_TYPE_F32, n_expert);
-        }
-        if (L.ffn_gate_exps_s != nullptr) {
-            m.scale_gate = ggml_new_tensor_1d(pool_tab_ctx, GGML_TYPE_F32, n_expert);
-        }
-        char nm[64];
-        snprintf(nm, sizeof(nm), "mnt_remap_%d", il);
-        ggml_set_name(m.remap, nm);
-        snprintf(nm, sizeof(nm), "mnt_remap_inv_host_%d", il);
-        ggml_set_name(m.remap_inv_host, nm);
-        snprintf(nm, sizeof(nm), "mnt_remap_inv_%d", il);
-        ggml_set_name(m.remap_inv, nm);
-        if (m.scale != nullptr) {
-            snprintf(nm, sizeof(nm), "mnt_scale_%d", il);
-            ggml_set_name(m.scale, nm);
-        }
-        if (m.scale_up != nullptr) {
-            snprintf(nm, sizeof(nm), "mnt_scale_up_%d", il);
-            ggml_set_name(m.scale_up, nm);
-        }
-        if (m.scale_gate != nullptr) {
-            snprintf(nm, sizeof(nm), "mnt_scale_gate_%d", il);
-            ggml_set_name(m.scale_gate, nm);
-        }
-        st.set_mount(il, m);
-    }
-    // --- allocate: device tables on the pool device, host tables on the CPU ---
-    ggml_backend_buffer_type_t tab_buft = ggml_backend_cpu_buffer_type();
-    for (const ggml_backend_buffer_type_t bt : backend_buft) {
-        if (!ggml_backend_buft_is_host(bt)) {
-            tab_buft = bt;
-            break;
-        }
-    }
-    if (st.direct_mount) {
-        ggml_backend_buffer_ptr tab_buf(ggml_backend_alloc_ctx_tensors_from_buft(
-                pool_tab_ctx, tab_buft));
-        if (!tab_buf) {
-            LLAMA_LOG_ERROR("%s: mount table allocation failed, direct mount disabled\n", __func__);
-            st.direct_mount = false;
-        } else {
-            tab_buf.swap(mount_tab_buf);
-        }
-        // CPU-side table: allocate with the CPU buft (host memory)
-        ggml_backend_buffer_ptr tab_cpu_buf(ggml_backend_alloc_ctx_tensors_from_buft(
-                pool_tab_cpu_ctx, ggml_backend_cpu_buffer_type()));
-        if (!tab_cpu_buf) {
-            LLAMA_LOG_ERROR("%s: CPU mount table allocation failed, direct mount disabled\n", __func__);
-            st.direct_mount = false;
-        } else {
-            tab_cpu_buf.swap(mount_tab_cpu_buf);
-        }
-        if (!st.direct_mount) {
-            // de-register the mounts so the graph builder never sees active=true with null tables
-            for (int32_t il : pooled_ils) {
-                llama_expert_pool_mount m = st.mount(il);
-                m.active = false;
-                st.set_mount(il, m);
-            }
-        }
-    }
-
-    // --- allocate the pool tensors on the fastest non-CPU buft, fallback CPU ---
-    ggml_backend_buffer_type_t pool_buft = nullptr;
-    for (const ggml_backend_buffer_type_t bt : backend_buft) {
-        if (!ggml_backend_buft_is_host(bt)) {
-            pool_buft = bt;
-            break;
-        }
-    }
-    if (!pool_buft) {
-        pool_buft = ggml_backend_cpu_buffer_type();
-    }
-    // the pool uploads weight bytes exactly as they sit in host memory, so a backend that
-    // reorders expert weights on the device side would read every uploaded slice wrong.
-    // SYCL does that lazily and in place (opt_for_reorder_id, K-quants on Intel GPUs) with
-    // no hook to re-apply, and there is no neutral way to ask for it - refuse the whole pool
-    {
-        ggml_backend_dev_t pool_dev = ggml_backend_buft_get_device(pool_buft);
-        if (pool_dev != nullptr &&
-                std::string(ggml_backend_reg_name(ggml_backend_dev_backend_reg(pool_dev))) == "SYCL") {
-            LLAMA_LOG_WARN("%s: %s reorders expert weights in place on first use; the pool uploads raw "
-                           "weights and would read them wrong - pool disabled\n",
-                    __func__, ggml_backend_dev_name(pool_dev));
-            expert_pool_release(); // free the partial allocations (pool ctx / tables)
-            st.reset();
-            return;
-        }
-    }
-    st.pool_buft = pool_buft;
-    pool_buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(pool_ctx, pool_buft));
-    if (!pool_buf) {
-        LLAMA_LOG_WARN("%s: pool allocation on %s failed, falling back to CPU\n",
-                __func__, ggml_backend_buft_name(pool_buft));
-        pool_buft = ggml_backend_cpu_buffer_type();
-        pool_buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(pool_ctx, pool_buft));
-    }
-    if (!pool_buf) {
-        LLAMA_LOG_ERROR("%s: expert pool allocation failed, pool disabled\n", __func__);
-        expert_pool_release(); // free the partial allocations (pool ctx / tables)
-        st.reset();
-        return;
-    }
-    // the backend owning the pool buft: the swap worker issues its copies async on this
-    // backend's stream (sync fallback when none matches, e.g. a CPU pool)
-    st.pool_backend = nullptr;
-    for (size_t i = 0; i < backend_buft.size() && i < backend_ptrs.size(); ++i) {
-        if (backend_buft[i] == pool_buft) {
-            st.pool_backend = backend_ptrs[i];
-            break;
-        }
-    }
-    LLAMA_LOG_INFO("%s: pool allocated on %s (host=%d, %zu bytes)\n",
-            __func__, ggml_backend_buft_name(pool_buft),
-            (int) ggml_backend_buffer_is_host(pool_buf.get()), ggml_backend_buffer_get_size(pool_buf.get()));
-    // mark the pool tensors as weights so the scheduler keeps the warm-path mat_mul_id
-    // (and its outputs) on the pool device
-    ggml_backend_buffer_set_usage(pool_buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-
-    // zero the pool buffer ONCE: fresh backend buffers are not guaranteed zeroed
-    ggml_backend_buffer_clear(pool_buf.get(), 0);
-
-    int32_t tot_slots = 0;
-    for (int32_t il : pooled_ils) {
-        tot_slots += (int32_t) st.resident[il].size();
-    }
-    LLAMA_LOG_INFO("%s: expert pool enabled: %d pooled layers, %d slots total (%d/layer if uniform)\n",
-            __func__, n_pooled, tot_slots, n_pooled > 0 ? tot_slots / n_pooled : 0);
-    {
-        size_t pool_bytes = 0;
-        for (int32_t il : pooled_ils) {
-            const llama_expert_pool_layer & l = st.layers[il];
-            for (int k = 0; k < PK_UP_B; ++k) { // weights only (biases excluded, as before)
-                if (l.pool[k]) { pool_bytes += ggml_nbytes(l.pool[k]); }
-            }
-        }
-        LLAMA_LOG_INFO("%s: pool weight bytes = %.2f GB (%.1f MiB per expert)\n",
-                __func__, pool_bytes / 1e9,
-                tot_slots > 0 ? pool_bytes / (double) tot_slots / 1.0e6 : 0.0);
-    }
-
-    // the weight/table fill is deferred to expert_pool_fill(), after graph_reserve: with
-    // no_alloc model tensors the data is valid only once the scheduler placed them
-
-    // the tensors exist now: the fill may write them. a re-layout runs this again, so the
-    // phase belongs here - a caller that also set it would clobber the fill's FILLED
-    st.phase = llama_expert_pool_state::PHASE_BUILT;
-}
-
-void llama_context::expert_pool_fill() {
-    llama_expert_pool_state & st = expert_pool_state;
-    if (st.phase != llama_expert_pool_state::PHASE_BUILT || st.layers.empty()) {
-        return;
-    }
-    const int32_t n_expert = model.hparams.n_expert;
-
-    // --- fill weights + routing tables (model tensor data is valid now) ---
-    for (size_t pi = 0; pi < st.pooled_layers.size(); ++pi) {
-        const int32_t il = st.pooled_layers[pi];
-        const llama_layer & L = model.layers[il];
-        const std::vector<int32_t> & res = st.resident[il];
-
-        // tables: write every element (sentinel -1), then residents override (same
-        // content as init; keeps them correct if fill() ever refreshes the set)
-        const llama_expert_pool_mount & m = st.mount(il);
-        const bool has_mount = st.direct_mount && m.active &&
-                               m.remap != nullptr && m.remap_inv_host != nullptr;
-        if (has_mount) {
-            // I32 tables: get_rows outputs the table type on every backend, so no cast;
-            // both halves are flushed once below (tab_build/tab_publish).
-            // flat scale tables: expert e -> its scale (indexed by clean ids, never
-            // changes on swap)
-            auto fill_scale = [&](ggml_tensor * tab, ggml_tensor * src) {
-                if (tab == nullptr || src == nullptr) {
-                    return;
-                }
-                GGML_ASSERT(src->type == GGML_TYPE_F32 && src->ne[0] == n_expert);
-                std::vector<float> vals(n_expert, 0.0f);
-                const float * src_s = (const float *) src->data;
-                for (int32_t e = 0; e < n_expert; ++e) {
-                    vals[e] = src_s[e];
-                }
-                ggml_backend_tensor_set(tab, vals.data(), 0, n_expert * sizeof(float));
-            };
-            fill_scale(m.scale,      L.ffn_down_exps_s);
-            fill_scale(m.scale_up,   L.ffn_up_exps_s);
-            fill_scale(m.scale_gate, L.ffn_gate_exps_s);
-        }
-
-        const llama_expert_pool_layer & l = st.layers[il];
-        if (m.full) {
-            // identity slots: the pool tensors already are the model's matrices in the
-            // model's order, so one whole-tensor copy per kind replaces the per-slot
-            // assembly (and there is nothing to swap later either)
-            for (int k = 0; k < PK_N; ++k) {
-                if (l.orig[k] != nullptr && l.pool[k] != nullptr) {
-                    ggml_backend_tensor_set(l.pool[k], l.orig[k]->data, 0, ggml_nbytes(l.orig[k]));
-                }
-            }
-        } else {
-            // the whole expert payload moves: weights and per-expert biases are
-            // (expert -> slot) copies, the scales are a static expert-order table
-            auto copy_slots = [&](ggml_tensor * src, ggml_tensor * pw, int k) {
-                if (src == nullptr || pw == nullptr) {
-                    return;
-                }
-                const size_t sz = llama_expert_pool_stride(src, k);
-                for (int32_t s = 0; s < (int32_t) res.size(); ++s) {
-                    const int32_t e = res[s];
-                    if (e < 0 || e >= n_expert) {
-                        continue;
-                    }
-                    ggml_backend_tensor_set(pw, (const char *) src->data + e * llama_expert_pool_stride(src, k),
-                            s * llama_expert_pool_stride(pw, k), sz);
-                }
-            };
-            for (int k = 0; k < PK_N; ++k) {
-                copy_slots(l.orig[k], l.pool[k], k);
-            }
-        }
-    }
-    st.phase = llama_expert_pool_state::PHASE_FILLED;
-
-    // start the swap-copy worker: all later H2D copies run off the inference thread and
-    // off the main graph stream; the step boundary publishes completed fills only
-    if (st.swap_auto && !st.pooled_layers.empty()) {
-        llama_expert_pool_start_worker(st);
-    }
-
-    // initial table mirror: the resident sets land on the device in ONE publish before
-    // the first decode (no worker running yet)
-    llama_expert_pool_tab_build(st);
-    llama_expert_pool_tab_publish(st);
-
-    if (st.direct_mount) {
-        int32_t n_full = 0;
-        for (int32_t il : st.pooled_layers) {
-            if (st.mount(il).full) {
-                n_full += 1;
-            }
-        }
-        LLAMA_LOG_INFO("%s: pool active: %d layers fully resident in expert order (plain path), %d mounted (dual chain)\n",
-                __func__, n_full, (int32_t) st.pooled_layers.size() - n_full);
-    }
-}
 
 void llama_context::sched_reserve() {
     if (!sched_need_reserve) {
@@ -1281,11 +663,13 @@ void llama_context::sched_reserve() {
     gf_res_prev_active = nullptr;
 
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+    // the pool owns its state, buffers and worker; the context hands it the handles it needs
+    expert_pool = std::make_unique<llama_expert_pool>(*this, model, cparams, backend_ptrs, backend_buft);
     ggml_backend_sched_set_layer_parallel(sched.get(), cparams.expert_pool_miss_method == LLAMA_EXPERT_POOL_MISS_CPU_PARALLEL);
     // serves the pool's statistics and the route observer: with or without a pool
-    ggml_backend_sched_set_split_head_observer(sched.get(), llama_expert_pool_observe_split_head, &expert_pool_state);
+    ggml_backend_sched_set_split_head_observer(sched.get(), llama_expert_pool_observe_split_head, &expert_pool->st);
 
-    expert_pool_init();
+    expert_pool->expert_pool_init();
 
     llama_memory_context_ptr mctx;
     if (memory) {
@@ -1327,7 +711,7 @@ void llama_context::sched_reserve() {
                 sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
                 ggml_backend_sched_set_layer_parallel(sched.get(), cparams.expert_pool_miss_method == LLAMA_EXPERT_POOL_MISS_CPU_PARALLEL);
                 // serves the pool's statistics and the route observer: with or without a pool
-                ggml_backend_sched_set_split_head_observer(sched.get(), llama_expert_pool_observe_split_head, &expert_pool_state);
+                ggml_backend_sched_set_split_head_observer(sched.get(), llama_expert_pool_observe_split_head, &expert_pool->st);
                 gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
             }
             if (!gf) {
@@ -2054,7 +1438,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     // the pool attributes its per-slot segment windows with this ubatch's
     // sequences (the decision counters stay ctx-level)
-    llama_expert_pool_set_step_slots(expert_pool_state, ubatch.seq_id_unq, (int32_t) ubatch.n_seqs_unq);
+    llama_expert_pool_set_step_slots(expert_pool->st, ubatch.seq_id_unq, (int32_t) ubatch.n_seqs_unq);
 
     auto * res = get_gf_res_prev();
     auto * gf  = res->get_gf();
@@ -2102,7 +1486,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         gf_res_prev_active = res;
 
         // first graph allocation places the model weight tensors: fill the pool now
-        expert_pool_fill();
+        expert_pool->expert_pool_fill();
     }
 
     // set the input data for the input tensors
@@ -2124,7 +1508,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     // the fully resident layers' routing rows arrive here, once per ubatch: their plain
     // path has no observed split head, so the pool reads the registered copy instead
-    llama_expert_pool_account_ids(expert_pool_state);
+    llama_expert_pool_account_ids(expert_pool->st);
 
     ret = GGML_STATUS_SUCCESS;
 
@@ -2174,7 +1558,7 @@ int llama_context::encode(const llama_batch_ext & batch_inp) {
         t_compute_start_us = ggml_time_us();
     }
 
-    expert_pool_cross((int32_t) std::min<uint32_t>(n_tokens, cparams.n_ubatch));
+    expert_pool->expert_pool_cross((int32_t) std::min<uint32_t>(n_tokens, cparams.n_ubatch));
     sched_reserve();
 
     n_queued_tokens += n_tokens;
@@ -2465,7 +1849,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     // the pool's layout follows the batch regime: a batch that crosses the offload
     // threshold re-lays the pool before it runs (GGML_EXPPOOL_LAYOUT=auto)
-    expert_pool_cross((int32_t) std::min<uint32_t>(n_tokens_all, cparams.n_ubatch));
+    expert_pool->expert_pool_cross((int32_t) std::min<uint32_t>(n_tokens_all, cparams.n_ubatch));
     sched_reserve();
 
     bool did_optimize = false;
@@ -3262,7 +2646,7 @@ llm_graph_params llama_context::graph_params(
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
         /*.prec_policy =*/ &model.prec_policy,
-        /*.expert_pool =*/ &expert_pool_state,
+        /*.expert_pool =*/ &expert_pool->st,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
@@ -5172,8 +4556,17 @@ uint32_t llama_expert_pool_get_stats(struct llama_context * ctx,
     return ctx->expert_pool_stats_snapshot(out, max_layers);
 }
 
+void llama_context::expert_pool_finalize(int32_t id_slot) {
+    if (expert_pool != nullptr) {
+        expert_pool->expert_pool_finalize(id_slot);
+    }
+}
+
 uint32_t llama_context::expert_pool_stats_snapshot(llama_expert_pool_layer_stats * out, uint32_t max_layers) {
-    llama_expert_pool_state & st = expert_pool_state;
+    if (expert_pool == nullptr) {
+        return 0;
+    }
+    llama_expert_pool_state & st = expert_pool->st;
     if (st.stat.empty()) {
         return 0;
     }
@@ -5189,54 +4582,6 @@ uint32_t llama_context::expert_pool_stats_snapshot(llama_expert_pool_layer_stats
     return n;
 }
 
-void llama_context::expert_pool_finalize(int32_t id_slot) {
-    llama_expert_pool_state & st = expert_pool_state;
-    if (st.seg.hit + st.seg.miss == 0) {
-        return;
-    }
-    // a slot's segment window = the steps it took part in. the row caliber inside
-    // the window is the pool's (every slot's columns feed it), so overlapping slots
-    // see the same rows and differ only in which steps they cover.
-    llama_expert_pool_state::slot_window * win = nullptr;
-    if (id_slot >= 0 && id_slot < LLAMA_MAX_SEQ && st.slot_windows[id_slot].open.load(std::memory_order_relaxed)) {
-        win = &st.slot_windows[id_slot];
-    }
-    const uint64_t win_hit  = win != nullptr ? win->hit  : st.seg.hit;
-    const uint64_t win_miss = win != nullptr ? win->miss : st.seg.miss;
-    if (win != nullptr) {
-        const int64_t pairs = win->pairs.load(std::memory_order_relaxed);
-        LLAMA_LOG_INFO_V(LLAMA_LOG_VERBOSITY_INFO,
-                "%s: pool hit rate %.1f%% (%llu/%llu rows, %d steps, slot %d), swap avg %.1f pairs/step\n",
-                __func__, 100.0 * win_hit / (double) (win_hit + win_miss),
-                (unsigned long long) win_hit, (unsigned long long) (win_hit + win_miss),
-                win->steps, id_slot, win->steps > 0 ? (double) pairs / (double) win->steps : 0.0);
-        // close the window: this slot's next step opens a fresh one
-        win->open.store(false, std::memory_order_relaxed);
-        win->pairs.store(0, std::memory_order_relaxed);
-        win->swap_base = 0;
-        win->steps = 0;
-        win->hit = 0;
-        win->miss = 0;
-    } else {
-        LLAMA_LOG_INFO_V(LLAMA_LOG_VERBOSITY_INFO, "%s: pool hit rate %.1f%% (%llu/%llu rows, generation segment)\n", __func__,
-                100.0 * st.seg.hit / (double) (st.seg.hit + st.seg.miss),
-                (unsigned long long) st.seg.hit,
-                (unsigned long long) (st.seg.hit + st.seg.miss));
-    }
-    st.seg = {};
-
-    // the swap average: per window for a slot report, per segment otherwise. the
-    // worker is NOT stopped here - the drain wait is the only sync this report
-    // would need, and a window tolerates a +-1 step tail
-    if (win == nullptr && st.swap_sum > 0 && st.swap_steps > 0) {
-        LLAMA_LOG_INFO_V(LLAMA_LOG_VERBOSITY_INFO,
-                "%s: swap avg %.1f expert slots/step (segment, %d steps)\n",
-                __func__, (float) st.swap_sum / (float) st.swap_steps, st.swap_steps);
-        st.swap_sum = 0;
-        st.swap_steps = 0;
-    }
-}
-
 void llama_expert_pool_finalize(struct llama_context * ctx, int32_t id_slot) {
     if (ctx == nullptr) {
         return;
@@ -5244,167 +4589,4 @@ void llama_expert_pool_finalize(struct llama_context * ctx, int32_t id_slot) {
     ctx->expert_pool_finalize(id_slot);
 }
 
-// re-lay the pool in the other layout: the whole-layer target puts the budget into full
-// shallow layers, the partial one spreads it uniformly with the remainder on the deep
-// layers. then the worker is stopped (its join is the barrier) and the sched synchronized
-// before the old tensors are freed. the new tensors are built and filled like at init, at
-// the same total size - the budget is the invariant, only the widths change.
-void llama_context::expert_pool_relayout(bool whole) {
-    llama_expert_pool_state & st = expert_pool_state;
-    if (st.phase == llama_expert_pool_state::PHASE_NONE || st.pooled_layers.empty()) {
-        return;
-    }
-    const int32_t n_expert = model.hparams.n_expert;
 
-    // one exchange spans two settles: stop the worker first (its join is the barrier)
-    st.stop_worker();
-
-    std::vector<std::vector<int32_t>> resident;
-    if (whole) {
-        // the shallowest layers the budget covers go fully resident, in the model's own
-        // order (a full-width layer is laid out in expert order); the rest go to width 0
-        const int32_t n_full = std::min<int32_t>((int32_t) st.pooled_layers.size(),
-                                                 cparams.expert_pool / n_expert);
-        if (n_full <= 0) {
-            LLAMA_LOG_WARN("%s: expert pool budget %d is below one full layer (%d experts), keeping the current layout\n",
-                    __func__, cparams.expert_pool, n_expert);
-            llama_expert_pool_start_worker(st);
-            return;
-        }
-        resident.assign(st.pooled_layers.size(), {});
-        for (int32_t i = 0; i < n_full; ++i) {
-            resident[i].resize((size_t) n_expert);
-            for (int32_t e = 0; e < n_expert; ++e) {
-                resident[i][e] = e;
-            }
-        }
-    } else {
-        // uniform widths, the remainder on the DEEP layers: at the coverage ratios where the
-        // remainder is worth deciding (below ~13% of the experts per layer, see the routing
-        // baseline ref) the marginal expert sits in the deeper layers, so they take the spare
-        const int32_t P = (int32_t) st.pooled_layers.size();
-        const int32_t wu = cparams.expert_pool / P;
-        const int32_t rem = cparams.expert_pool % P;
-        resident.assign(P, {});
-        for (int32_t i = 0; i < P; ++i) {
-            const int32_t wi = wu + (i >= P - rem ? 1 : 0);
-            const float * row = st.act_cnt.data() + (size_t) st.pooled_layers[i] * n_expert;
-            std::vector<std::pair<float, int32_t>> top;
-            top.reserve((size_t) n_expert);
-            for (int32_t e = 0; e < n_expert; ++e) {
-                if (row[e] > 0.0f) {
-                    top.emplace_back(row[e], e);
-                }
-            }
-            std::sort(top.begin(), top.end(), [](const auto & a, const auto & b) {
-                return a.first > b.first || (a.first == b.first && a.second < b.second);
-            });
-            const int32_t take = std::min<int32_t>(wi, (int32_t) top.size());
-            for (int32_t k = 0; k < take; ++k) {
-                resident[i].push_back(top[k].second);
-            }
-        }
-    }
-
-    synchronize(); // the publish pipeline may still have async copies in flight
-    // the cached previous graph and the scheduler's own state still reference the pool
-    // tensors (their buffers are freed below): drop both, the next reserve rebuilds them
-    for (auto & res : gf_res_prev) {
-        res.reset();
-    }
-    gf_res_prev_active = nullptr;
-    ggml_backend_sched_reset(sched.get());
-    pool_buf.reset();
-    mount_tab_buf.reset();
-    mount_tab_cpu_buf.reset();
-    if (pool_ctx != nullptr) {
-        ggml_free(pool_ctx);
-        pool_ctx = nullptr;
-    }
-    if (pool_tab_ctx != nullptr) {
-        ggml_free(pool_tab_ctx);
-        pool_tab_ctx = nullptr;
-    }
-    if (pool_tab_cpu_ctx != nullptr) {
-        ggml_free(pool_tab_cpu_ctx);
-        pool_tab_cpu_ctx = nullptr;
-    }
-    st.tab_all = nullptr;
-    st.tab_cpu = nullptr;
-    for (auto & m : st.tab_mirror) {
-        m.clear();
-    }
-    st.mirror_ready.store(-1);
-    st.mirror_pub.store(-1);
-    st.resident.assign(model.hparams.n_layer_all, {});
-    for (size_t i = 0; i < st.pooled_layers.size() && i < resident.size(); ++i) {
-        st.resident[st.pooled_layers[i]] = std::move(resident[i]);
-    }
-    st.layout_whole = whole;
-    expert_pool_build();
-    expert_pool_fill(); // restarts the swap worker
-    sched_need_reserve = true;
-    LLAMA_LOG_INFO("%s: pool re-laid out (%s layout, %d layers, %d slots)\n",
-            __func__, whole ? "whole-layer" : "partial", (int) st.pooled_layers.size(), cparams.expert_pool);
-}
-
-// the layout follows the batch regime (GGML_EXPPOOL_LAYOUT=auto): at or above the
-// offload threshold the whole-layer layout serves the batch, below it the partial one.
-// only a batch that lands on the other side re-lays the pool; the same-side batches just
-// run. the caller passes the tokens this batch will actually hand to one graph, so the
-// decision follows the same threshold the scheduler uses to move a miss chain off the CPU.
-void llama_context::expert_pool_cross(int32_t n_tokens) {
-    llama_expert_pool_state & st = expert_pool_state;
-    if (!llama_expert_pool_layout_auto() || st.phase == llama_expert_pool_state::PHASE_NONE ||
-            st.pooled_layers.empty()) {
-        return;
-    }
-    const bool want_whole = n_tokens >= llama_expert_pool_offload_min_batch();
-    if (want_whole == st.layout_whole) {
-        // the regime's layout is in place: a later crossing may try again
-        st.layout_tried = -1;
-        return;
-    }
-    if ((int8_t) want_whole == st.layout_tried) {
-        // this regime's target was refused once; retrying every batch would cost a
-        // worker join per step for nothing
-        return;
-    }
-    st.layout_tried = (int8_t) want_whole;
-    LLAMA_LOG_INFO_V(LLAMA_LOG_VERBOSITY_INFO, "%s: batch of %d tokens crosses the %d-token threshold: re-laying the pool\n",
-            __func__, n_tokens, llama_expert_pool_offload_min_batch());
-    expert_pool_relayout(want_whole);
-}
-
-void llama_context::expert_pool_release() {
-    llama_expert_pool_state & st = expert_pool_state;
-
-    // stop the swap worker first: its sync tensor_set calls reference the pool tensors
-    // freed below
-    st.stop_worker();
-
-    pool_buf.reset(); // release the pool buffer before freeing the ctx metadata
-    if (pool_ctx != nullptr) {
-        ggml_free(pool_ctx);
-        pool_ctx = nullptr;
-    }
-    mount_tab_buf.reset();
-    if (pool_tab_ctx != nullptr) {
-        ggml_free(pool_tab_ctx);
-        pool_tab_ctx = nullptr;
-    }
-    mount_tab_cpu_buf.reset();
-    if (pool_tab_cpu_ctx != nullptr) {
-        ggml_free(pool_tab_cpu_ctx);
-        pool_tab_cpu_ctx = nullptr;
-    }
-
-    // the merged tables lived in those contexts
-    st.tab_all = nullptr;
-    st.tab_cpu = nullptr;
-    for (auto & m : st.tab_mirror) {
-        m.clear();
-    }
-    st.mirror_ready.store(-1);
-    st.mirror_pub.store(-1);
-}

@@ -5,8 +5,11 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 
+#include "ggml-cpp.h"   // ggml_backend_buffer_ptr (RAII buffer holder)
+
 #include <array>
 #include <atomic>
+#include <memory>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
@@ -77,6 +80,9 @@ inline bool llama_expert_pool_layout_auto() {
 // slot, non-resident -> -1), so one add merges the two chains.
 // the tables are I32: ggml_get_rows keeps the table type on every backend, so
 // the id gathering needs no cast.
+struct llama_context;
+struct llama_model;
+
 struct llama_expert_pool_mount {
     bool active = false;
     bool full   = false; // fully resident in the model's own order (identity slots): the
@@ -320,6 +326,49 @@ void llama_expert_pool_random(int32_t n_layer, int32_t n_expert,
 void llama_expert_pool_bind_ids(const llama_expert_pool_state & st, int32_t il, int32_t n_used, const ggml_tensor * ids_clean);
 void llama_expert_pool_bind_split_head(const llama_expert_pool_state & st, int32_t il, const ggml_tensor * head, bool lane);
 void llama_expert_pool_observe_split_head(void * user_data, ggml_tensor * head, ggml_backend_t backend);
+
+// ---------------------------------------------------------------
+// the pool driver: owns the pool state, the pool weight context/buffers, the mount
+// tables and the engine entry points. llama_context holds one instance and hands it the
+// handles the engine needs; the engine reaches a few context-owned names (the scheduler,
+// the reserve flag, the cached graph result, synchronize()) through `ctx`, which the
+// friend declaration in llama-context.h makes accessible.
+struct llama_expert_pool {
+    llama_expert_pool(
+            llama_context & ctx,
+            const llama_model & model,
+            const llama_cparams & cparams,
+            const std::vector<ggml_backend_t> & backend_ptrs,
+            const std::vector<ggml_backend_buffer_type_t> & backend_buft);
+
+    llama_expert_pool_state st;
+
+    llama_context &       ctx;
+    const llama_model &   model;
+    const llama_cparams & cparams;
+
+    const std::vector<ggml_backend_t> &             backend_ptrs;
+    const std::vector<ggml_backend_buffer_type_t> & backend_buft;
+
+    // pooled weight context/buffer + mount-table ctx
+    // (kept alive as long as the pool; pointers also stored in st)
+    ggml_context *          pool_ctx         = nullptr;
+    ggml_context *          pool_tab_ctx     = nullptr; // direct-mount remap tables (pool device)
+    ggml_context *          pool_tab_cpu_ctx = nullptr; // direct-mount remap_inv table (CPU device)
+    ggml_backend_buffer_ptr pool_buf;
+    ggml_backend_buffer_ptr mount_tab_buf;     // device buffer holding the remap tables
+    ggml_backend_buffer_ptr mount_tab_cpu_buf; // CPU buffer holding the remap_inv mirror
+
+    void expert_pool_init();
+    void expert_pool_build();
+    void expert_pool_fill();
+    void expert_pool_release();
+    void expert_pool_finalize(int32_t id_slot);
+    void expert_pool_relayout(bool whole);
+    void expert_pool_cross(int32_t n_tokens);
+};
+
+using llama_expert_pool_ptr = std::unique_ptr<llama_expert_pool>;
 
 // the pool-side copy of a pool layer's top-k rows (null when the layer is not pooled)
 inline ggml_tensor * llama_expert_pool_ids_shadow(const llama_expert_pool_state & st, int32_t il) {

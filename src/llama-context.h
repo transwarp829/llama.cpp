@@ -42,6 +42,10 @@ struct llama_memory_buffer {
 using llama_memory_buffers = std::map<ggml_backend_buffer_type_t, llama_memory_buffer>;
 
 struct llama_context {
+    // the expert pool owns its state/buffers and reaches a few context-owned handles
+    // (the sched, the reserve flag, the cached graph result) - see llama-expert-pool.h
+    friend struct llama_expert_pool;
+
     // init scheduler and compute buffers, reserve worst-case graphs
     llama_context(
             const llama_model & model,
@@ -56,10 +60,6 @@ struct llama_context {
     //   - changing attention type
     //   - etc.
     void sched_reserve();
-    void expert_pool_init();
-    void expert_pool_build();
-    void expert_pool_fill();
-    void expert_pool_release();            // free the ctx-owned pool resources + stop the worker
 
     void synchronize();
 
@@ -258,10 +258,7 @@ public:
 
     // print-and-reset one slot's segment window, or the pool segment (public API support)
     void expert_pool_finalize(int32_t id_slot);
-    // the layout switch (GGML_EXPPOOL_LAYOUT=auto): re-lay the pool in the other
-    // layout, and the per-batch entry that decides whether this batch crosses
-    void expert_pool_relayout(bool whole);
-    void expert_pool_cross(int32_t n_tokens);
+
 
     // can reuse the llm_graph_result instance of the context (for example to update a memory module)
     llm_graph_result * get_gf_res_reserve() const;
@@ -390,18 +387,9 @@ private:
     std::vector<ggml_backend_buffer_type_t> backend_buft;
     std::vector<size_t>                     backend_buf_exp_size; // expected buffer sizes
 
-    // expert pool (per context): pool weights/tables/worker/stats all belong
-    // to this context; the pooled layer set is derived from the model at init
-    llama_expert_pool_state expert_pool_state;
-
-    // pooled weight context/buffer + mount-table ctx
-    // (kept alive as long as the context; pointers also stored in expert_pool_state)
-    ggml_context * pool_ctx  = nullptr;
-    ggml_context * pool_tab_ctx = nullptr; // direct-mount remap tables (pool device)
-    ggml_context * pool_tab_cpu_ctx = nullptr; // direct-mount remap_inv table (CPU device)
-    ggml_backend_buffer_ptr pool_buf;
-    ggml_backend_buffer_ptr mount_tab_buf; // device buffer holding the remap tables
-    ggml_backend_buffer_ptr mount_tab_cpu_buf; // CPU buffer holding the remap_inv mirror
+    // expert pool (per context): state, pool weights/tables, worker and stats all live
+    // in this object; the pooled layer set is derived from the model at init
+    llama_expert_pool_ptr expert_pool;
 
     // Separate arenas give batches with and without outputs distinct CUDA graph cache keys.
     std::array<llm_graph_result_ptr, 2> gf_res_prev;
