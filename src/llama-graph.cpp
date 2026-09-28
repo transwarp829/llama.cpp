@@ -2546,6 +2546,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         // per-expert down scale, right after the matmul like upstream
         experts = moe_scale_mul(ctx0, experts, down_exps_s,
                 ids_for_scale != nullptr ? ids_for_scale : selected_experts, n_tokens);
+        // the scale is part of the miss chain and must stay on its backend: a device-placed
+        // scale becomes a split of its own between the miss chain and the mount block (the
+        // mount is cut there and submitted early from the anchor)
+        if (mount_p != nullptr && n_tokens < llama_expert_pool_offload_min_batch()) {
+            ggml_backend_sched_set_tensor_backend(sched, experts, backend_cpu);
+        }
     }
     if (arch == LLM_ARCH_MISTRAL4) {
         // src1 can exceed F16 range
