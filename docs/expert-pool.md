@@ -59,7 +59,7 @@ overhead - that is what rule 5 is about.
 # keep the hottest ~2048 experts over all eligible MoE layers, in VRAM
 llama-server -m model.gguf -ngl 999 -cmoe -nep 2048 -t 48
 
-# same budget over exactly the 30 deepest MoE layers, 2040 slots each
+# same budget over exactly the 30 deepest MoE layers
 llama-server -m model.gguf -ngl 999 -cmoe -nep 30,2040 -t 48
 ```
 
@@ -77,7 +77,7 @@ override) there is nothing to pool and the option is inert.
 
 | flag | meaning |
 |---|---|
-| `-nep N` / `--expert-pool N` | slot budget over all eligible layers, deepest first; `M,N` = the `M` deepest layers with `N` slots each; `0` = disabled |
+| `-nep N` / `--expert-pool N` | slot budget over all eligible layers, deepest first; `M,N` = the same budget, spread over the `M` deepest layers; `0` = disabled |
 | `--expert-pool-miss-method {cpu-serial,cpu-parallel}` | how the non-resident chain runs below the offload threshold (see below); default `cpu-serial` |
 | `--expert-pool-swap-decay H` | half-life in decode steps of the per-layer activation counter that drives the swap decisions; default 96 |
 | `--expert-pool-swap-cap N` | maximum expert pairs swapped in per step; `0` or less freezes the resident set (a value above the pool size never binds, so a large number means "no burst fuse"); default 40 |

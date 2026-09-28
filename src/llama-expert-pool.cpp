@@ -1064,7 +1064,7 @@ void llama_expert_pool::expert_pool_init() {
     }
 
     int32_t n_pooled = (int32_t) pooled_ils.size();
-    // explicit deep-first layer set (--pooled-layers N); -nep still sets the width over it
+    // -nep M,N: keep the M deepest eligible layers; the budget spreads over them
     if (cparams.expert_pool_layers > 0 && n_pooled > cparams.expert_pool_layers) {
         const int32_t n_eligible = n_pooled;
         pooled_ils.erase(pooled_ils.begin(), pooled_ils.end() - cparams.expert_pool_layers);
