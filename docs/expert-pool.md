@@ -20,8 +20,7 @@ buys with a VRAM budget that is spent only on the experts that are actually used
 The fork carries one unmerged upstream `ggml` change that the pool relies on: an
 expert index of `-1` skips that row of a `MUL_MAT_ID`, which the pool uses as its
 "this column is served by the other chain" mask. It is vendored from upstream PR
-26631 (ngxson) - one squashed commit, original authorship kept - and is inert when
-the pool is off.
+26631 (ngxson) and is inert when the pool is off.
 
 ## When to use it
 
@@ -89,7 +88,7 @@ Debug/env switches (all off by default, all no-ops when unset):
 |---|---|
 | `GGML_EXPPOOL_ROUTING_LOG=<path>` | per-step, per-layer routing rows as csv (written by `llama-step-profiler`) |
 | `GGML_EXPPOOL_STAGE_LOG=1` | print the expert count/bytes actually staged per node |
-| `GGML_SCHED_SANITIZE=1` | scheduler async-race sanitizer |
+| `GGML_SCHED_SANITIZE=1` | scheduler async-race sanitizer (vendored from upstream) |
 
 ## How it runs
 

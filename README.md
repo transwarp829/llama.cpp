@@ -3,11 +3,11 @@
 > pool**: an MoE offload mode that keeps a per-layer set of the hottest experts in
 > VRAM and runs the resident (device) and the non-resident (host) expert chains of
 > the same layer as two chains of one graph. Flags, constraints and measured
-> numbers: [docs/expert-pool.md](docs/expert-pool.md). The fork also carries one
-> unmerged upstream `ggml` change (a `-1` expert index skips that `MUL_MAT_ID` row,
-> the pool uses it as its serve-the-other-chain mask), a step profiler
-> (`tools/step-profiler`) and a scheduler sanitizer. Everything else is upstream
-> `llama.cpp` at the commit this fork is based on.
+> numbers: [docs/expert-pool.md](docs/expert-pool.md). The fork also carries two
+> unmerged upstream `ggml` changes (a `-1` expert index skips that `MUL_MAT_ID` row,
+> the pool uses it as its serve-the-other-chain mask; and a scheduler async-race
+> sanitizer), plus a step profiler (`tools/step-profiler`). Everything else is
+> upstream `llama.cpp` at the commit this fork is based on.
 
 # llama.cpp
 
