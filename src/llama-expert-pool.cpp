@@ -718,7 +718,7 @@ static int32_t worker_decide_and_copy(llama_expert_pool_state & st) {
             res[p.slot] = p.e;
             filled += 1;
             LLAMA_LOG_INFO_V(LLAMA_LOG_VERBOSITY_TRACE,
-                    "%s: fill layer %d slot %d (step %d): expert e=%d (cnt %d)",
+                    "%s: fill layer %d slot %d (step %d): expert e=%d (cnt %.3f)\n",
                     __func__, p.il, p.slot, st.settled_steps, p.e, p.cnt);
         }
         st.pend_fill.swap(wait);
@@ -819,7 +819,7 @@ static int32_t worker_decide_and_copy(llama_expert_pool_state & st) {
         st.pend_fill.push_back({ il, p.e, p.slot, 0, p.cnt });
         planned += 1;
         LLAMA_LOG_INFO_V(LLAMA_LOG_VERBOSITY_TRACE,
-                "%s: unmap layer %d slot %d (step %d): evict e=%d, fill e=%d (cnt %d)",
+                "%s: unmap layer %d slot %d (step %d): evict e=%d, fill e=%d (cnt %.3f)\n",
                 __func__, il, p.slot, st.settled_steps, victim_e, p.e, p.cnt);
     }
     if (filled > 0 || planned > 0) {
