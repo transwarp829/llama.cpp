@@ -310,7 +310,7 @@ struct llama_expert_pool_state {
     std::vector<int32_t> tab_mirror[3];          // host mirror slots (see mirror_ready/pub)
 
     void reset();
-    // signal + drain the route queue + join the swap worker (safe with no
+    // signal + consume the route queue + join the swap worker (safe with no
     // worker running); shared by reset() and the ctx teardown
     void stop_worker();
 };
@@ -395,7 +395,7 @@ void llama_expert_pool_set_step_slots(llama_expert_pool_state & st, const int32_
 // swap worker: owns the counters, the refresh decisions and the weight copies
 void llama_expert_pool_start_worker(llama_expert_pool_state & st);
 // push one step marker: the rows queued before it are a complete step. hook use
-// plus the segment-end drain in llama_context::expert_pool_finalize
+// plus the segment-end read-back in llama_context::expert_pool_finalize
 void llama_expert_pool_push_marker(llama_expert_pool_state & st);
 // settle one queued step marker: run the fills whose unmap reached the tables,
 // count the rows, run the top-k refresh (one global queue, capped by the

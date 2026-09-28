@@ -1030,7 +1030,7 @@ struct ggml_backend_sched {
     ggml_backend_sched_split_head_fn obs_split_head    = nullptr;
     void *                           obs_split_head_ud = nullptr;
 
-    // the anchor split's end mark (layer-parallel): recorded before the mount chain is submitted, so the anchor's immediate successor can wait for the front alone instead of draining the stream (the timeline probe reads the same mark)
+    // the anchor split's end mark (layer-parallel): recorded before the mount chain is submitted, so the anchor's immediate successor can wait for the front alone instead of waiting for the whole stream (the timeline probe reads the same mark)
     ggml_backend_event_t anchor_event = nullptr;
     ggml_backend_t anchor_be = nullptr;
     bool anchor_valid = false;
@@ -2324,7 +2324,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 if (split->has_logits) {
         // the anchor's end mark on this stream (async, no host block): everything enqueued
         // up to the layer front is done when it fires. recorded BEFORE the mount is handed
-        // over, so the anchor's successor can wait for the front alone instead of draining
+        // over, so the anchor's successor can wait for the front alone instead of waiting for the whole stream
         // the stream.
                     if (split_backend->iface.event_record != NULL &&
                         ggml_backend_get_device(split_backend)->iface.event_synchronize != NULL) {

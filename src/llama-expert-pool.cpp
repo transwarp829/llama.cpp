@@ -101,7 +101,7 @@ void llama_expert_pool_state::stop_worker() {
 }
 
 // push a step marker: the queued rows are a complete step. hook thread only,
-// except the segment-end drain in llama_context::expert_pool_finalize.
+// except the segment-end read-back in llama_context::expert_pool_finalize.
 void llama_expert_pool_push_marker(llama_expert_pool_state & st) {
     llama_expert_pool_state::route_block m;
     m.step = st.hook_step;
@@ -178,7 +178,7 @@ static void route_push_row(llama_expert_pool_state & st, int32_t step, int32_t i
 
 // start the swap worker thread (one per pool): consumes the route rows, owns
 // the counters and the refresh, performs the H2D copies on its own thread (the
-// inference thread never waits), rebuilds the table mirror. drained by reset().
+// inference thread never waits), rebuilds the table mirror. consumed by reset().
 namespace { void swap_copy_one_sync(ggml_backend_t, ggml_tensor *, ggml_tensor *, int32_t, int32_t, int); }
 
 void llama_expert_pool_set_step_slots(llama_expert_pool_state & st, const int32_t * seq_ids, int32_t n_seq_ids) {
@@ -199,7 +199,7 @@ void llama_expert_pool_start_worker(llama_expert_pool_state & st) {
                 std::unique_lock<std::mutex> lk(st.route_mtx);
                 st.route_cv.wait(lk, [&st]() { return st.route_stop || !st.route_q.empty(); });
                 if (st.route_stop) {
-                    // drain before exit: settle every marker queued before the
+                    // consume the queue before exit: settle every marker queued before the
                     // stop so no counted step is lost (no-op on teardown paths)
                     lk.unlock();
                     while (llama_expert_pool_worker_settle(st)) {
@@ -207,7 +207,7 @@ void llama_expert_pool_start_worker(llama_expert_pool_state & st) {
                     return;
                 }
             }
-            // settle every marker queued so far (a slow worker drains the backlog)
+            // settle every marker queued so far (a slow worker works through the backlog)
             while (llama_expert_pool_worker_settle(st)) {
             }
         }
@@ -557,7 +557,7 @@ void llama_expert_pool_account_ids(llama_expert_pool_state & st) {
         }
     }
     if (any) {
-        // one drained ubatch is one step, swap or not: the dump and any future reader need
+        // one accounted ubatch is one step, swap or not: the dump and any future reader need
         // the step to advance even in the frozen arm
         st.hook_step += 1;
     }
@@ -840,7 +840,7 @@ static int32_t worker_decide_and_copy(llama_expert_pool_state & st) {
     return filled;
 }
 
-// settle one queued step marker: drain the rows pushed before it, decay and count
+// settle one queued step marker: consume the rows pushed before it, decay and count
 // them, run the refresh, rebuild the mirror. worker thread only.
 bool llama_expert_pool_worker_settle(llama_expert_pool_state & st) {
     std::vector<llama_expert_pool_state::route_block> rows;
@@ -869,7 +869,7 @@ bool llama_expert_pool_worker_settle(llama_expert_pool_state & st) {
     if (st.act_cnt.empty() && !st.pooled_layers.empty()) {
         st.act_cnt.assign(st.layers.size() * (size_t) st.n_expert, 0.0f);
     }
-    // count by the rows' own step id: a lagging worker may drain several old
+    // count by the rows' own step id: a lagging worker may settle several old
     // steps at once, so each step gets one decay tick and then its rows land
     size_t i = 0;
     while (i < rows.size()) {
@@ -1604,7 +1604,7 @@ void llama_expert_pool::expert_pool_finalize(int32_t id_slot) {
     st.seg = {};
 
     // the swap average: per window for a slot report, per segment otherwise. the
-    // worker is NOT stopped here - the drain wait is the only sync this report
+    // worker is NOT stopped here - the worker catch-up wait is the only sync this report
     // would need, and a window tolerates a +-1 step tail
     if (win == nullptr && st.swap_sum > 0 && st.swap_steps > 0) {
         LLAMA_LOG_INFO_V(LLAMA_LOG_VERBOSITY_INFO,
