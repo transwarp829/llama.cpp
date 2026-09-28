@@ -212,7 +212,11 @@ Two more numbers worth knowing before tuning:
   (it stages roughly half the bytes), which is the bar it must clear.
 - `--fit` does **NOT** know about the pool yet, so its estimate does not include the pool
   weights: **disable** `--fit` when the pool is on.
-- Only `llama-server` and `llama-step-profiler` print pool statistics.
+- `llama-server` prints the pool hit rate once per request (the steps that slot took part
+  in) - and so do the tools that embed it (`llama-cli`, `llama-completion`); a tool built on
+  `common` only (`llama-batched`, ...) prints its unclosed segment when the context is torn
+  down, so it reports the same numbers (the tool's own verbosity threshold applies - `llama-cli`
+  needs `-v` for either line).
 - Results are not bit-identical across backends or placements, and that is expected:
   the same expert computed on the CPU and on the GPU accumulates its dot products in a
   different order, so the result differs in the last bits. For the pool this means two

@@ -1751,6 +1751,25 @@ void llama_expert_pool::expert_pool_cross(int32_t n_tokens) {
 void llama_expert_pool::expert_pool_release() {
     llama_expert_pool_state & st = this->st;
 
+    // only a tool built on common that never calls finalize (llama-batched, ...) still has
+    // an unclosed segment here; a tool that reported per request (server, and the tools
+    // embedding it: cli / completion) already drained st.seg there. report the unclosed
+    // segment's rows and its swap average together - or not at all
+    const bool unclosed = st.seg.hit + st.seg.miss > 0;
+    if (unclosed) {
+        LLAMA_LOG_INFO_V(LLAMA_LOG_VERBOSITY_INFO, "%s: pool hit rate %.1f%% (%llu/%llu rows, generation segment)\n", __func__,
+                100.0 * st.seg.hit / (double) (st.seg.hit + st.seg.miss),
+                (unsigned long long) st.seg.hit,
+                (unsigned long long) (st.seg.hit + st.seg.miss));
+        st.seg = {};
+    }
+    if (unclosed && st.swap_sum > 0 && st.swap_steps > 0) {
+        LLAMA_LOG_INFO_V(LLAMA_LOG_VERBOSITY_INFO, "%s: swap avg %.1f expert slots/step (segment, %d steps)\n", __func__,
+                (float) st.swap_sum / (float) st.swap_steps, st.swap_steps);
+        st.swap_sum = 0;
+        st.swap_steps = 0;
+    }
+
     // stop the swap worker first: its sync tensor_set calls reference the pool tensors
     // freed below
     st.stop_worker();
