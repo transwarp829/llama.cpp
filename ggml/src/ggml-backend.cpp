@@ -2277,18 +2277,23 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             sched->anchor_valid = true;
                         }
                     }
-            // the mount split: the anchor's next non-CPU split (CPU splits live in a different
-            // pool), starting with the mount block head and containing the mounted chain -
-            // any other head means no early submit
+            // the mount split: the first GPU split after the anchor whose head is the mount
+            // block head. GPU splits that are not a mount head (the front's tail, the previous
+            // layer's merge) are skipped; the next layer's front ends the search.
                     ggml_backend_sched_split * nxt = nullptr;
                     for (int j = split_id + 1; j < sched->n_splits; j++) {
                         ggml_backend_sched_split * cand = &splits[j];
                         if (cand->backend_id == sched->n_backends - 1) {
                             continue; // CPU split (the miss chain) - not a mount candidate
                         }
-                        if (cand->graph.n_nodes == 0 ||
-                            cand->head_role != GGML_BACKEND_SCHED_ROLE_MOUNT_HEAD) {
-                            break; // not a mount block head
+                        if (cand->graph.n_nodes == 0) {
+                            continue;
+                        }
+                        if (cand->has_logits) {
+                            break; // the next layer's front: this layer has no mount split
+                        }
+                        if (cand->head_role != GGML_BACKEND_SCHED_ROLE_MOUNT_HEAD) {
+                            continue; // a GPU split that is not the mount block head
                         }
             // only the mounted (pool) chain qualifies: the split must contain a ffn_moe_mount
             // node (plain MoE segments have gate nodes too)
@@ -2297,12 +2302,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     // the GPU too and the mount rides inside the natural layer run - never
                     // submit ahead
                             const int64_t cand_T = cand->graph.nodes[0]->ne[2];
-                            if (cand_T >= split_op_min_batch()) {
-                                break;
+                            if (cand_T < split_op_min_batch()) {
+                                nxt = cand;
                             }
-                            nxt = cand;
                         }
-                        break;
+                        break; // the mount head is the only candidate
+                    }
+                    if (nxt == nullptr && sched->debug >= 2) {
+                        GGML_LOG_DEBUG("exppool: no mount split after the anchor (split %d)\n", split_id);
                     }
                     if (nxt != nullptr) {
                         bool all_gpu = true;
