@@ -493,6 +493,14 @@ void llama_expert_pool_account_ids(llama_expert_pool_state & st) {
             continue;
         }
         const int32_t n_tok = (int32_t) (n_rows / n_used);
+        // probe (GGML_EXPPOOL_IDS_LOG=1): which ids tensor the observer read, per layer per
+        // step - the last layer's prefill rows come back as a 1-token tensor
+        if (getenv("GGML_EXPPOOL_IDS_LOG") != nullptr && st.hook_step < 2) {
+            LLAMA_LOG_INFO_V(LLAMA_LOG_VERBOSITY_INFO, "exppool_ids: step=%d il=%d name=%s ne=[%lld,%lld,%lld,%lld] n_used=%d n_tok=%d\n",
+                    st.hook_step, il, ids->name,
+                    (long long) ids->ne[0], (long long) ids->ne[1], (long long) ids->ne[2], (long long) ids->ne[3],
+                    n_used, n_tok);
+        }
         st.ids_buf.resize((size_t) n_rows);
         ggml_backend_tensor_get(ids, st.ids_buf.data(), 0, ggml_nbytes(ids));
         route_dump_row(st, il, n_used, n_tok);
