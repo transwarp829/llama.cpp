@@ -683,6 +683,7 @@ static int32_t worker_decide_and_copy(llama_expert_pool_state & st) {
         int32_t e;    // expert to swap in
         int32_t slot; // slot to fill
         float   cnt;  // decayed activation count of the incoming expert
+        float   cnt_out; // decayed count of the evicted expert (0 when the slot is unmapped)
     };
     std::vector<pair_t> queue;
     queue.reserve(P);
@@ -769,36 +770,35 @@ static int32_t worker_decide_and_copy(llama_expert_pool_state & st) {
                 in.emplace_back(hot[i].first, e);
             }
         }
-        // outgoing slots: empty first (no incumbent to lose), then residents
-        // outside the new top-k, coldest first; the pool only fills, never shrinks
-        std::vector<int32_t> empty;
-        std::vector<std::pair<float, int32_t>> out; // (cnt, slot)
+        // victims in one list, coldest first: an unmapped slot counts as 0, so the old
+        // "empty first" preference falls out of the ordering. the pool only fills.
+        std::vector<std::pair<float, int32_t>> victim; // (cnt, slot)
         for (int32_t s = 0; s < K; ++s) {
             const int32_t e = res[s];
             if (e < 0) {
                 if (!slot_pending(il, s)) {
-                    empty.push_back(s);
+                    victim.emplace_back(0.0f, s);
                 }
             } else if (!in_topk[e]) {
-                out.emplace_back(st.act_cnt[il * n_expert + e], s);
+                victim.emplace_back(st.act_cnt[il * n_expert + e], s);
             }
         }
-        std::sort(out.begin(), out.end(), [](const auto & a, const auto & b) {
+        std::sort(victim.begin(), victim.end(), [](const auto & a, const auto & b) {
             return a.first < b.first || (a.first == b.first && a.second < b.second);
         });
-        const int32_t npairs = std::min<int32_t>((int32_t) in.size(),
-                (int32_t) (empty.size() + out.size()));
+        const int32_t npairs = std::min<int32_t>((int32_t) in.size(), (int32_t) victim.size());
         for (int32_t i = 0; i < npairs; ++i) {
-            const int32_t slot = i < (int32_t) empty.size()
-                ? empty[i] : out[i - (int32_t) empty.size()].second;
-            queue.push_back({il, in[i].second, slot, in[i].first});
+            queue.push_back({il, in[i].second, victim[i].second, in[i].first, victim[i].first});
         }
     }
-    // execute in count order, descending, until the per-step limit is passed
+    // spend the per-step limit on the largest gain first: a swap costs one payload, so
+    // rank by (in - out) rather than by the incoming count alone
     const int32_t limit = st.swap_per_step;
     std::sort(queue.begin(), queue.end(), [](const pair_t & a, const pair_t & b) {
-        if (a.cnt != b.cnt) return a.cnt > b.cnt;
-        if (a.il != b.il) return a.il < b.il;
+        const float ga = a.cnt - a.cnt_out;
+        const float gb = b.cnt - b.cnt_out;
+        if (ga != gb)       return ga > gb;
+        if (a.il != b.il)   return a.il < b.il;
         if (a.e != b.e)     return a.e < b.e;
         return a.slot < b.slot;
     });
@@ -819,8 +819,8 @@ static int32_t worker_decide_and_copy(llama_expert_pool_state & st) {
         st.pend_fill.push_back({ il, p.e, p.slot, 0, p.cnt });
         planned += 1;
         LLAMA_LOG_INFO_V(LLAMA_LOG_VERBOSITY_TRACE,
-                "%s: unmap layer %d slot %d (step %d): evict e=%d, fill e=%d (cnt %.3f)\n",
-                __func__, il, p.slot, st.settled_steps, victim_e, p.e, p.cnt);
+                "%s: unmap layer %d slot %d (step %d): evict e=%d, fill e=%d (cnt %.3f), evict cnt %.3f\n",
+                __func__, il, p.slot, st.settled_steps, victim_e, p.e, p.cnt, p.cnt_out);
     }
     if (filled > 0 || planned > 0) {
         // tag the fills queued above with this mirror's sequence so they wait for it
