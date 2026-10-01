@@ -198,7 +198,6 @@ struct llama_expert_pool_state {
     int32_t rtlog_prev_il = -1;
 
     bool direct_mount = false;                             // two-chain form active
-    ggml_backend_buffer_type_t pool_buft = nullptr;        // pool buft (device)
 
     // step boundary, single-layer-safe: set at the last active-mount layer of a
     // step, consumed at the first one of the next (anchors the swap publish)
@@ -215,31 +214,23 @@ struct llama_expert_pool_state {
     // step counter (only the worker owns the counters below)
     int32_t hook_step = 0;
 
-    // routing rows from the observer to the swap worker: one block per
-    // (step, layer) carrying the layer's full activation ids
     struct route_block {
         int32_t step = 0;                  // decode step this row belongs to
         int32_t il   = -1;                 // the layer (-1 = step marker)
         int32_t n_tok = 1;                 // token columns (decay: increments are 1/n_tok)
         std::vector<int32_t> ids;          // full activation expert ids
     };
-    std::mutex      route_mtx;
-    std::condition_variable route_cv;
-    std::deque<route_block> route_q;
-    bool route_stop = false;
+    // the row queue, its mutex/condvar and the worker thread live PER BUNDLE (pool_dev):
+    // one worker per pool consumes only that device's rows, so the decay, the swap
+    // decision (and its per-step cap) and the mirror build stay local to the device
 
-    // worker-owned swap state: the hook only pushes rows and publishes the
-    // mirror the worker hands over - it never reads these
-    int32_t settled_steps = 0;             // decode steps accounted so far
-    // decaying counter: per settled step every count is multiplied by
-    // swap_lambda and the step's rows land with per-token normalized increments
-    // (1/n_tok per activation), so a batch of n columns is one step of evidence
+    // decaying counter (shared storage, disjoint columns): every worker decays and
+    // increments ONLY its own bundle's layers, so the array needs no locking - but it
+    // must be allocated before the workers start
     float   swap_lambda   = 0.0f;          // per-step decay, lambda = 2^(-1/H)
     int32_t swap_decay_hl = 96;            // decay half-life in steps (default 96)
     std::vector<float> act_cnt;            // [layers * n_expert] decayed counts (keyed by
                                            // layer, so a layout switch keeps them)
-    int32_t swap_sum = 0;                  // exchanges accumulated this period (slot-less report)
-    int32_t swap_steps = 0;                // settled steps of that period (same reset as swap_sum)
     // monotonic ctx-level swap total: the per-slot windows snapshot it (never reset)
     std::atomic<int64_t> swap_total{0};
     // per-slot segment window: the set of settled steps the slot took part in.
@@ -255,31 +246,19 @@ struct llama_expert_pool_state {
         uint64_t miss      = 0;
     };
     std::array<slot_window, LLAMA_MAX_SEQ> slot_windows;
-    // sequences of the ubatch being built (the report thread fills it per ubatch,
-    // the observer reads it), and the per-step slot sets the worker consumes
+    // sequences of the ubatch being built (the report thread fills it per ubatch, the
+    // observer reads it); each worker keeps its own copy of the per-step slot sets it
+    // attributes its exchanges to
     std::vector<int32_t> step_slots;
-    std::deque<std::pair<int32_t, std::vector<int32_t>>> step_slots_hist;
 
     // segment totals of the inference-side counters (the per-layer array is
     // cleared by each read)
     llama_expert_pool_counts seg;
 
-    // swap worker: consumes the route rows, runs the top-k refresh, performs
-    // the H2D weight copies off the inference thread and rebuilds the mirror.
-    // the table tensors are only written by the hook at a step boundary
-    std::thread cp_worker;
-    // mirror handshake: the worker writes a slot only when it is neither the
-    // ready one nor the published one, so an async set's source is never
-    // overwritten inside the two-step distance
-    std::atomic<int32_t> mirror_ready{-1};
-    std::atomic<int32_t> mirror_pub{-1};
-
-    // sequence handshake of the two-phase swap: a pending fill runs only once
-    // the mirror that unmapped its slot has reached the tables - a slot's
-    // content may not change while an expert is still mapped onto it
-    int32_t seq_ctr = 0;                    // worker-owned mirror counter
-    int32_t mirror_seq[3] = { -1, -1, -1 }; // worker-owned, per mirror slot
-    std::atomic<int32_t> pub_seq{-1};       // observer-owned: sequence published
+    // sequence handshake of the two-phase swap: a pending fill runs only once the
+    // mirror that unmapped its slot has reached the tables - a slot's content may not
+    // change while an expert is still mapped onto it. The queue and the sequence counter
+    // are per bundle now: the handshake never crosses devices.
     struct pending_fill {
         int32_t il   = -1;
         int32_t e    = -1; // expert the fill writes into the slot
@@ -287,7 +266,6 @@ struct llama_expert_pool_state {
         int32_t seq  = 0;  // mirror sequence that unmapped the slot (0 = not built yet)
         float   cnt  = 0.0f;
     };
-    std::vector<pending_fill> pend_fill;    // worker-owned fill queue
 
     // NONE -> BUILT (build() ran) -> FILLED (weights and tables copied, first compute)
     enum phase_t : uint8_t { PHASE_NONE = 0, PHASE_BUILT, PHASE_FILLED };
@@ -298,16 +276,57 @@ struct llama_expert_pool_state {
     // chain computed the row); read and cleared via llama_expert_pool_get_stats
     std::vector<llama_expert_pool_counts> stat; // [pooled layers]
 
-    // backend owning the pool buft (the hook publishes the tables on its main stream)
-    ggml_backend_t pool_backend = nullptr;
+    // per device pool bundle: one entry per device that serves pooled layers.
+    // Nothing is shared between entries - no pool ever swaps with another one -
+    // so every bundle owns its tables, its mirror, its publication state and its
+    // backend. The tables keep the ABSOLUTE layer-column layout (n_layer_all
+    // columns, only this device's layers are written), so the per-layer views and
+    // their offsets are unchanged; the waste is a few KB per device.
+    struct pool_dev {
+        ggml_backend_buffer_type_t buft    = nullptr;
+        ggml_backend_t             backend = nullptr;
+        ggml_context *             w_ctx   = nullptr; // pool weight tensors (host-upload copies)
+        ggml_backend_buffer_ptr    w_buf;
+        ggml_context *             tab_ctx     = nullptr;
+        ggml_context *             tab_cpu_ctx = nullptr;
+        ggml_backend_buffer_ptr    tab_buf;      // device buffer holding the remap tables
+        ggml_backend_buffer_ptr    tab_cpu_buf;  // CPU buffer holding the remap_inv mirror
+        ggml_tensor *              tab_all = nullptr; // [n_expert, 2*n_layer_all] remap|inv
+        ggml_tensor *              tab_cpu = nullptr; // [n_expert, n_layer_all] remap_inv (host)
+        std::vector<int32_t>       mirror[3];         // host mirror slots
+        int32_t                    mirror_seq[3] = { -1, -1, -1 };
+        std::atomic<int32_t>       mirror_ready{-1};
+        std::atomic<int32_t>       mirror_pub{-1};
+        std::atomic<int32_t>       pub_seq{-1};
+        std::vector<int32_t>       layers;       // pooled layers served here, ascending
 
-    // merged mount tables: both halves live in tab_all (remap block, then inv
-    // block) in the mirror's own layout, so publishing is one stream-ordered
-    // copy and each layer's tables are views. tab_cpu keeps the CPU-side copy
-    // of the inv half for the host-segment reads below the offload threshold
-    ggml_tensor * tab_all = nullptr;             // [n_expert, 2*n_layers] remap|inv (pool device)
-    ggml_tensor * tab_cpu = nullptr;             // [n_expert, n_layers] remap_inv (CPU buft)
-    std::vector<int32_t> tab_mirror[3];          // host mirror slots (see mirror_ready/pub)
+        // --- the bundle's own worker state: no other bundle touches any of it ---
+        std::mutex              route_mtx;
+        std::condition_variable route_cv;
+        std::deque<route_block> route_q;
+        bool                    route_stop = false;
+        std::thread             cp_worker;          // consumes route_q, owns the counters
+        int32_t                 settled_steps = 0;  // decode steps this bundle accounted
+        std::vector<pending_fill> pend_fill;        // this bundle's two-phase fill queue
+        int32_t                 swap_sum   = 0;     // exchanges this bundle accumulated
+        int32_t                 swap_steps = 0;     // settled steps of that period
+        int32_t                 seq_ctr    = 0;     // this bundle's mirror sequence
+        std::deque<std::pair<int32_t, std::vector<int32_t>>> step_slots_hist;
+    };
+
+    // the pooled layers grouped by serving device; layer_dev[il] = index into devs
+    // (-1 = the layer is not pooled), the same order as --device. The bundles are
+    // held by pointer: they own atomics and buffers (neither movable nor copyable).
+    std::vector<std::unique_ptr<pool_dev>> devs;
+    std::vector<int32_t>  layer_dev;
+    // the per device budgets the bundles were built with: dev_slots[i] / dev_scope[i] belong
+    // to devs[i] (parallel arrays; the relayout path re-lays every pool with its OWN budget)
+    std::vector<int32_t>  dev_slots;
+    std::vector<int32_t>  dev_scope;
+
+    int32_t dev_of(int32_t il) const {
+        return il >= 0 && (size_t) il < layer_dev.size() ? layer_dev[il] : -1;
+    }
 
     void reset();
     // signal + consume the route queue + join the swap worker (safe with no
@@ -350,18 +369,20 @@ struct llama_expert_pool {
     const std::vector<ggml_backend_t> &             backend_ptrs;
     const std::vector<ggml_backend_buffer_type_t> & backend_buft;
 
-    // pooled weight context/buffer + mount-table ctx
-    // (kept alive as long as the pool; pointers also stored in st)
-    ggml_context *          pool_ctx         = nullptr;
-    ggml_context *          pool_tab_ctx     = nullptr; // direct-mount remap tables (pool device)
-    ggml_context *          pool_tab_cpu_ctx = nullptr; // direct-mount remap_inv table (CPU device)
-    ggml_backend_buffer_ptr pool_buf;
-    ggml_backend_buffer_ptr mount_tab_buf;     // device buffer holding the remap tables
-    ggml_backend_buffer_ptr mount_tab_cpu_buf; // CPU buffer holding the remap_inv mirror
-
     void expert_pool_init();
     void expert_pool_build();
+    // one bundle per selected serving device, in the given order, with the given layers and
+    // budgets - the single place the bundles are created. called by expert_pool_init (which
+    // resolves the budgets) and by the relayout path, which frees the bundles first because
+    // the widths, and with them the tensor shapes, change
+    void expert_pool_make_devs(const std::vector<ggml_backend_dev_t> &   dv_order,
+                               const std::vector<std::vector<int32_t>> & layers_by_dev,
+                               const std::vector<int32_t> &              slots_by_dev,
+                               const std::vector<int32_t> &              scope_by_dev);
     void expert_pool_fill();
+    // release the per-device bundles (weight context/buffer, tables, mirrors); shared by
+    // the relayout path and the ctx teardown
+    void release_devs();
     void expert_pool_release();
     void expert_pool_finalize(int32_t id_slot);
     void expert_pool_relayout(bool whole);
@@ -392,19 +413,23 @@ void llama_expert_pool_account_ids(llama_expert_pool_state & st);
 // ubatch. the segment windows are per slot; the decision counters stay ctx-level.
 void llama_expert_pool_set_step_slots(llama_expert_pool_state & st, const int32_t * seq_ids, int32_t n_seq_ids);
 
-// swap worker: owns the counters, the refresh decisions and the weight copies
+// swap worker: one thread PER BUNDLE, each owns its device's counters, refresh
+// decisions, weight copies and mirror publication
 void llama_expert_pool_start_worker(llama_expert_pool_state & st);
-// push one step marker: the rows queued before it are a complete step. hook use
-// plus the segment-end read-back in llama_context::expert_pool_finalize
+// push one step marker: the rows queued before it are a complete step. every bundle
+// gets its own copy of the marker (and of the step's slot set). hook use plus the
+// segment-end read-back in llama_context::expert_pool_finalize
 void llama_expert_pool_push_marker(llama_expert_pool_state & st);
-// settle one queued step marker: run the fills whose unmap reached the tables,
-// count the rows, run the top-k refresh (one global queue, capped by the
-// per-step swap limit, unmapping the victims), rebuild the mirror.
-// returns false when no marker is queued
-bool llama_expert_pool_worker_settle(llama_expert_pool_state & st);
-// rebuild the merged table mirror from resident[] (worker thread only; no
-// tensor writes): picks a free slot, writes it, sets mirror_ready, returns the
-// new sequence number
+// settle one queued step marker of ONE bundle: run the fills whose unmap reached
+// that bundle's tables, count the rows, run the top-k refresh over that bundle's
+// layers (capped by the per-step swap limit, unmapping the victims), rebuild its
+// mirror. returns false when no marker is queued for this bundle
+bool llama_expert_pool_worker_settle(llama_expert_pool_state & st, llama_expert_pool_state::pool_dev & d);
+// rebuild ONE bundle's merged table mirror from resident[] (that bundle's worker
+// only; no tensor writes): picks a free slot, writes it, sets mirror_ready,
+// returns the new sequence number
+int32_t llama_expert_pool_tab_build_dev(llama_expert_pool_state & st, llama_expert_pool_state::pool_dev & d);
+// rebuild every bundle's mirror (non-worker callers: the relayout path)
 int32_t llama_expert_pool_tab_build(llama_expert_pool_state & st);
 // publish the ready mirror (hook thread only, step boundary): one set_async to
 // tab_all and one sync set to tab_cpu - the single place the tensors are written

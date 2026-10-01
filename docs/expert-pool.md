@@ -33,7 +33,7 @@ least-VRAM to the most-VRAM end of the budget scale:
 2. As soon as VRAM can hold at least ~1% of a layer's experts (below that the slot
    tables and the table lookups cost more than the residency buys), pool that layer.
    A budget below that floor is warned about and laid out as asked; to keep the
-   widths above it, name the layer count (`-nep M,N` takes the deepest M layers).
+   widths above it, name the layer count (`-nep M:N` takes the deepest M layers).
 3. Keep adding pooled layers until every MoE layer is pooled.
 4. Exception: the hash layers of the `deepseek4` architecture (DeepSeek-V4-Flash /
    -Pro and their post-trained variants) pick their experts from a token-id lookup
@@ -59,14 +59,17 @@ overhead - that is what rule 5 is about.
 llama-server -m model.gguf -ngl 999 -cmoe -nep 2048 -t 48
 
 # same budget over exactly the 30 deepest MoE layers
-llama-server -m model.gguf -ngl 999 -cmoe -nep 30,2040 -t 48
+llama-server -m model.gguf -ngl 999 -cmoe -nep 30:2040 -t 48
+
+# per device (two cards): 1024 slots on the first, 2048 on the second
+llama-server -m model.gguf -ngl 999 -cmoe -nep 1024,2048 -t 48
 ```
 
 Two log lines confirm that the pool is running:
 
 ```
-expert pool enabled: N pooled layers
-direct mount active (N layers), in-graph merge
+expert pool enabled: N pooled layers, M slots total (K/layer if uniform)
+pool active: X layers fully resident in expert order (plain path), Y mounted (dual chain)
 ```
 
 The pool requires host-resident experts: without `-cmoe` (or an equivalent `-ot`
@@ -76,11 +79,39 @@ override) there is nothing to pool and the option is inert.
 
 | flag | meaning |
 |---|---|
-| `-nep N` / `--expert-pool N` | slot budget over all eligible layers, deepest first; `M,N` = the same budget, spread over the `M` deepest layers; `0` = disabled |
+| `-nep LIST` / `--expert-pool LIST` | slot budget, per device. `N` = N slots on the first device; `M:N` = the same budget over that device's deepest `M` MoE layers; `N=DEV` / `M:N=DEV` name the device (a device or buffer type name, e.g. `CUDA1`); `0` = disabled |
 | `--expert-pool-miss-method {cpu-serial,cpu-parallel}` | how the non-resident chain runs below the offload threshold (see below); default `cpu-serial` |
 | `--expert-pool-swap-decay H` | half-life in decode steps of the per-layer activation counter that drives the swap decisions; default 96 |
-| `--expert-pool-swap-cap N` | maximum expert pairs swapped in per step; `0` or less freezes the resident set (a value above the pool size never binds, so a large number means "no burst fuse"); default 40 |
+| `--expert-pool-swap-cap N` | maximum expert pairs swapped in per step, **per device**; `0` or less freezes the resident set (a value above the pool size never binds, so a large number means "no burst fuse"); default 40 |
 | `-nepd N` / `--expert-pool-draft N` | slot budget for the draft context (MTP); `0` = no draft pool (default) |
+
+### Per-device budgets
+
+The pool is one pool per serving device: each device gets its own bundle (weight
+buffer, tables, mirror, worker), its own layer set and its own widths. Nothing is
+shared between them except the rate flags above - every device has its own link, so
+only the miss chain's memory bandwidth is shared.
+
+`LIST` is a comma-separated list of device entries, in `--device` order:
+
+| form | meaning |
+|---|---|
+| `-nep 1024,2048` | 1024 slots on the first device, 2048 on the second (a single entry = the first device only) |
+| `-nep 1024:CUDA1` | 1024 slots over the deepest layers of `CUDA1` |
+| `-nep 512=CUDA0,2048=CUDA1` | named entries; a device named twice keeps its first entry (warned) |
+
+A list longer than the devices the pool serves is refused at startup. Note that the
+comma separates *devices*: `-nep 30,2040` is 30 slots on the first device and 2040 on
+the second, so the layer-scoped form is written with a colon (`-nep 30:2040`).
+
+Each bundle reports itself at startup, and the segment swap average is printed per
+bundle when there is more than one:
+
+```
+pool serves 30 layer(s) on 2 device bundle(s)
+bundle 0: CUDA0, 16 layer(s), 1024 slots (-nep)
+bundle 1: CUDA1, 14 layer(s), 2048 slots (-nep)
+```
 
 Debug/env switches (all off by default, all no-ops when unset):
 

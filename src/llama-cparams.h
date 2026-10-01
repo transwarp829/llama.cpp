@@ -55,9 +55,20 @@ struct llama_cparams {
     bool pipeline_parallel;
     bool training;           // set by llama_opt_init()
 
-    int32_t expert_pool;       // expert-pool slot budget (0 = disabled)
+    int32_t expert_pool;       // total slot budget across devices: a BOOLEAN PROXY for "a pool is
+                               // configured" (sum > 0 iff some entry > 0) and a log number -
+                               // NEVER a budget: every budget comes from expert_pool_devs below
     int32_t expert_pool_swap_cap; // max expert pairs swapped in per decode step (<= 0 freezes the set)
-    int32_t expert_pool_layers; // spread the budget over the deepest N MoE layers (0 = all eligible)
+    int32_t expert_pool_layers; // spread the budget over the deepest N MoE layers (0 = all eligible);
+                                // the first device's value - the per-device entries below win
+    // per device budget entries, in device order (an empty name = the i-th device). the pool
+    // resolves them against the bundles it serves, first entry wins per device.
+    struct expert_pool_dev_budget {
+        char    dev[32];
+        int32_t slots;
+        int32_t layers;
+    };
+    std::vector<expert_pool_dev_budget> expert_pool_devs;
     int32_t expert_pool_swap_decay;  // decaying activation counter: half-life in decode steps (default 96)
     int32_t expert_pool_miss_method; // miss path: 0 = cpu-serial, 1 = cpu-parallel
 

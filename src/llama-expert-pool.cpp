@@ -58,13 +58,9 @@ void llama_expert_pool_state::reset() {
 
     swap_auto = false;
     hook_step = 0;
-    settled_steps = 0;
     act_cnt.clear();
-    swap_sum = 0;
-    swap_steps = 0;
     swap_total.store(0);
     step_slots.clear();
-    step_slots_hist.clear();
     for (llama_expert_pool_state::slot_window & w : slot_windows) {
         w.open.store(false);
         w.pairs.store(0);
@@ -75,42 +71,62 @@ void llama_expert_pool_state::reset() {
     }
     stat.clear();
     seg = {};
-    pend_fill.clear();
-    seq_ctr = 0;
-    mirror_seq[0] = mirror_seq[1] = mirror_seq[2] = -1;
-    pub_seq.store(-1);
-
-    pool_backend  = nullptr;
-    mirror_ready.store(-1);
-    mirror_pub.store(-1);
+    for (std::unique_ptr<pool_dev> & dp : devs) {
+        pool_dev & d = *dp;
+        d.mirror_seq[0] = d.mirror_seq[1] = d.mirror_seq[2] = -1;
+        d.mirror_ready.store(-1);
+        d.mirror_pub.store(-1);
+        d.pub_seq.store(-1);
+        // the bundle's own worker state
+        {
+            std::lock_guard<std::mutex> lk(d.route_mtx);
+            d.route_q.clear();
+        }
+        d.route_stop  = false;
+        d.settled_steps = 0;
+        d.pend_fill.clear();
+        d.swap_sum   = 0;
+        d.swap_steps = 0;
+        d.seq_ctr    = 0;
+        d.step_slots_hist.clear();
+    }
 
     stop_worker();
 }
 
+// stop and join EVERY bundle's worker (one per pool): clearing a queue drops rows whose
+// step will never be settled, which is what teardown wants
 void llama_expert_pool_state::stop_worker() {
-    {
-        std::lock_guard<std::mutex> lk(route_mtx);
-        route_stop = true;
-        route_q.clear();
+    for (std::unique_ptr<pool_dev> & dp : devs) {
+        pool_dev & d = *dp;
+        {
+            std::lock_guard<std::mutex> lk(d.route_mtx);
+            d.route_stop = true;
+            d.route_q.clear();
+        }
+        d.route_cv.notify_all();
+        if (d.cp_worker.joinable()) {
+            d.cp_worker.join();
+        }
+        d.route_stop = false;
     }
-    route_cv.notify_all();
-    if (cp_worker.joinable()) {
-        cp_worker.join();
-    }
-    route_stop = false;
 }
 
-// push a step marker: the queued rows are a complete step. hook thread only,
-// except the segment-end read-back in llama_context::expert_pool_finalize.
+// push a step marker to EVERY bundle: the queued rows are a complete step, and each pool
+// settles its own copy of the step (its own decay tick, decision and mirror publish).
+// hook thread only, except the segment-end read-back in llama_context::expert_pool_finalize.
 void llama_expert_pool_push_marker(llama_expert_pool_state & st) {
-    llama_expert_pool_state::route_block m;
-    m.step = st.hook_step;
-    m.il   = -1;
-    {
-        std::lock_guard<std::mutex> lk(st.route_mtx);
-        st.route_q.push_back(std::move(m));
+    for (std::unique_ptr<llama_expert_pool_state::pool_dev> & dp : st.devs) {
+        llama_expert_pool_state::pool_dev & d = *dp;
+        llama_expert_pool_state::route_block m;
+        m.step = st.hook_step;
+        m.il   = -1;
+        {
+            std::lock_guard<std::mutex> lk(d.route_mtx);
+            d.route_q.push_back(std::move(m));
+        }
+        d.route_cv.notify_one();
     }
-    st.route_cv.notify_one();
 }
 
 // env-gated per-row route histogram dump (GGML_EXPPOOL_ROUTE_LOG=<path>): one line per
@@ -169,11 +185,18 @@ static void route_push_row(llama_expert_pool_state & st, int32_t step, int32_t i
     if (rb.ids.empty()) {
         return;
     }
-    {
-        std::lock_guard<std::mutex> lk(st.route_mtx);
-        st.route_q.push_back(std::move(rb));
+    // every row goes to the bundle that serves its layer: one pool never sees another
+    // device's traffic (the row's device is the layer's serving device)
+    const int32_t di = st.dev_of(il);
+    if (di < 0 || (size_t) di >= st.devs.size()) {
+        return;
     }
-    st.route_cv.notify_one();
+    llama_expert_pool_state::pool_dev & d = *st.devs[di];
+    {
+        std::lock_guard<std::mutex> lk(d.route_mtx);
+        d.route_q.push_back(std::move(rb));
+    }
+    d.route_cv.notify_one();
 }
 
 // start the swap worker thread (one per pool): consumes the route rows, owns
@@ -188,30 +211,37 @@ void llama_expert_pool_set_step_slots(llama_expert_pool_state & st, const int32_
     st.step_slots.assign(seq_ids, seq_ids + n_seq_ids);
 }
 
+// one worker per pool: each bundle consumes only its own rows, so the decay, the swap
+// decision (with its own per-step cap) and the mirror build are device-local. the cap is
+// the same configured value for every pool (a per-device PCIe link does not contend with
+// the others; only the miss chain's memory bandwidth is shared).
 void llama_expert_pool_start_worker(llama_expert_pool_state & st) {
-    if (st.cp_worker.joinable()) {
-        return;
-    }
-    st.route_stop = false;
-    st.cp_worker = std::thread([&st]() {
-        for (;;) {
-            {
-                std::unique_lock<std::mutex> lk(st.route_mtx);
-                st.route_cv.wait(lk, [&st]() { return st.route_stop || !st.route_q.empty(); });
-                if (st.route_stop) {
-                    // consume the queue before exit: settle every marker queued before the
-                    // stop so no counted step is lost (no-op on teardown paths)
-                    lk.unlock();
-                    while (llama_expert_pool_worker_settle(st)) {
+    for (std::unique_ptr<llama_expert_pool_state::pool_dev> & dp : st.devs) {
+        llama_expert_pool_state::pool_dev & d = *dp;
+        if (d.cp_worker.joinable()) {
+            continue;
+        }
+        d.route_stop = false;
+        d.cp_worker = std::thread([&st, &d]() {
+            for (;;) {
+                {
+                    std::unique_lock<std::mutex> lk(d.route_mtx);
+                    d.route_cv.wait(lk, [&d]() { return d.route_stop || !d.route_q.empty(); });
+                    if (d.route_stop) {
+                        // consume the queue before exit: settle every marker queued before
+                        // the stop so no counted step is lost (no-op on teardown paths)
+                        lk.unlock();
+                        while (llama_expert_pool_worker_settle(st, d)) {
+                        }
+                        return;
                     }
-                    return;
+                }
+                // settle every marker queued so far (a slow worker works through the backlog)
+                while (llama_expert_pool_worker_settle(st, d)) {
                 }
             }
-            // settle every marker queued so far (a slow worker works through the backlog)
-            while (llama_expert_pool_worker_settle(st)) {
-            }
-        }
-    });
+        });
+    }
 }
 // random resident set (fixed seed); `widths` indexed by layer (0 = not pooled)
 void llama_expert_pool_random(int32_t n_layer, int32_t n_expert,
@@ -458,10 +488,6 @@ void llama_expert_pool_account_ids(llama_expert_pool_state & st) {
     if (!st.direct_mount || st.pooled_layers.empty() || st.phase != llama_expert_pool_state::PHASE_FILLED) {
         return;
     }
-    const int32_t pub = st.mirror_pub.load(std::memory_order_acquire);
-    const bool have_mirror = pub >= 0 && pub < 3 && !st.tab_mirror[pub].empty();
-    const size_t n_half = (size_t) st.n_expert * st.layers.size();
-
     // this ubatch is one step: open the windows of its slots and count it in each (the
     // step boundary the mount path's hook used to detect by the layer order)
     for (const int32_t s : st.step_slots) {
@@ -510,8 +536,12 @@ void llama_expert_pool_account_ids(llama_expert_pool_state & st) {
         // hit/miss from the inverse half of the published table (what this graph read).
         // a width-0 layer has no residents, so there is nothing to classify: its rows
         // feed the counters alone (a later layout may pool it)
+        const int32_t di       = st.dev_of(il);
+        const int32_t pub      = di >= 0 ? st.devs[di]->mirror_pub.load(std::memory_order_acquire) : -1;
+        const bool have_mirror = di >= 0 && pub >= 0 && pub < 3 && !st.devs[di]->mirror[pub].empty();
         if (have_mirror && !st.resident[il].empty()) {
-            const int32_t * inv = st.tab_mirror[pub].data() + n_half + (size_t) il * st.n_expert;
+            const size_t n_half = (size_t) st.n_expert * st.layers.size();
+            const int32_t * inv = st.devs[di]->mirror[pub].data() + n_half + (size_t) il * st.n_expert;
             uint64_t row_hit  = 0;
             uint64_t row_miss = 0;
             for (int64_t i = 0; i < n_rows; ++i) {
@@ -549,11 +579,12 @@ void llama_expert_pool_account_ids(llama_expert_pool_state & st) {
         any = true;
     }
     if (any && st.swap_auto) {
-        // the ubatch's rows are complete: mark the step (the worker settles on it)
+        // the ubatch's rows are complete: mark the step in EVERY bundle (each pool settles
+        // its own copy of it) and hand every worker the step's slot set for attribution
         llama_expert_pool_push_marker(st);
-        {
-            std::lock_guard<std::mutex> lk(st.route_mtx);
-            st.step_slots_hist.emplace_back(st.hook_step, st.step_slots);
+        for (std::unique_ptr<llama_expert_pool_state::pool_dev> & dp : st.devs) {
+            std::lock_guard<std::mutex> lk(dp->route_mtx);
+            dp->step_slots_hist.emplace_back(st.hook_step, st.step_slots);
         }
     }
     if (any) {
@@ -584,60 +615,72 @@ void swap_copy_one_sync(ggml_tensor * src, ggml_tensor * pw, int32_t e, int32_t 
 
 } // namespace
 
-// rebuild the merged host mirror from resident[] (worker thread only), mark it
-// ready, return its sequence number. layout: [2*n_expert, n_layers]; layer il =
-// [il*2*n_expert + e] remap, [+n_expert] remap_inv. no tensor writes here.
-int32_t llama_expert_pool_tab_build(llama_expert_pool_state & st) {
-    if (st.tab_all == nullptr) {
-        return st.seq_ctr;
+// rebuild ONE bundle's merged host mirror from resident[] (that bundle's worker only),
+// mark it ready, return its sequence number. layout: [2*n_expert, n_layers]; layer il =
+// [il*2*n_expert + e] remap, [+n_expert] remap_inv. no tensor writes here. the sequence
+// counter is the bundle's own: the unmap -> publish -> fill handshake never crosses devices.
+int32_t llama_expert_pool_tab_build_dev(llama_expert_pool_state & st, llama_expert_pool_state::pool_dev & d) {
+    if (d.tab_all == nullptr) {
+        return d.seq_ctr;
     }
     const int32_t n_expert = st.n_expert;
-    // one half of the mirror; the tables live in one tensor of 2*n_layers
-    // columns, so derive the half from the layer count, not from its shape
+    // one half of a mirror; each device's tables live in one tensor of 2*n_layer_all
+    // columns, so derive the half from the layer count, not from the tensor's shape
     const size_t n_half = (size_t) st.n_expert * st.layers.size();
-    // pick a free mirror slot: never the ready one (not published yet) nor the
-    // published one (its set_async may be in flight); three slots, no waiting
-    const int32_t ready = st.mirror_ready.load(std::memory_order_acquire);
-    const int32_t pub   = st.mirror_pub.load(std::memory_order_acquire);
-    int32_t k = -1;
-    for (int32_t c = 0; c < 3; ++c) {
-        const int32_t cand = pub < 0 ? c : (pub + 1 + c) % 3;
-        if (cand != ready && cand != pub) {
-            k = cand;
-            break;
-        }
-    }
-    if (k < 0) {
-        return st.seq_ctr; // cannot happen: ready and pub occupy at most two of three
-    }
-    std::vector<int32_t> & mir = st.tab_mirror[k];
-    if (mir.size() != 2 * n_half) {
-        mir.assign(2 * n_half, -1);
-    }
-    for (int32_t il : st.pooled_layers) {
-        const llama_expert_pool_mount & m = st.mount(il);
-        if (!m.active) {
-            continue;
-        }
-        const std::vector<int32_t> & res = st.resident[il];
-        int32_t * rmp    = mir.data() + il * n_expert;
-        int32_t * rmp_cu = mir.data() + n_half + il * n_expert;
-        // default: nothing resident (remap -1, inverse = its own id)
-        for (int32_t e = 0; e < n_expert; ++e) {
-            rmp[e] = -1;
-            rmp_cu[e] = e;
-        }
-        for (int32_t s = 0; s < (int32_t) res.size(); ++s) {
-            const int32_t e = res[s];
-            if (e >= 0 && e < n_expert) {
-                rmp[e] = s;
-                rmp_cu[e] = -1;
+    {
+        // pick a free mirror slot: never the ready one (not published yet) nor the
+        // published one (its set_async may be in flight); three slots, no waiting
+        const int32_t ready = d.mirror_ready.load(std::memory_order_acquire);
+        const int32_t pub   = d.mirror_pub.load(std::memory_order_acquire);
+        int32_t k = -1;
+        for (int32_t c = 0; c < 3; ++c) {
+            const int32_t cand = pub < 0 ? c : (pub + 1 + c) % 3;
+            if (cand != ready && cand != pub) {
+                k = cand;
+                break;
             }
         }
+        if (k < 0) {
+            return d.seq_ctr; // cannot happen: ready and pub occupy at most two of three
+        }
+        std::vector<int32_t> & mir = d.mirror[k];
+        if (mir.size() != 2 * n_half) {
+            mir.assign(2 * n_half, -1);
+        }
+        for (int32_t il : d.layers) {
+            const llama_expert_pool_mount & m = st.mount(il);
+            if (!m.active) {
+                continue;
+            }
+            const std::vector<int32_t> & res = st.resident[il];
+            int32_t * rmp    = mir.data() + il * n_expert;
+            int32_t * rmp_cu = mir.data() + n_half + il * n_expert;
+            // default: nothing resident (remap -1, inverse = its own id)
+            for (int32_t e = 0; e < n_expert; ++e) {
+                rmp[e] = -1;
+                rmp_cu[e] = e;
+            }
+            for (int32_t s = 0; s < (int32_t) res.size(); ++s) {
+                const int32_t e = res[s];
+                if (e >= 0 && e < n_expert) {
+                    rmp[e] = s;
+                    rmp_cu[e] = -1;
+                }
+            }
+        }
+        d.mirror_seq[k] = ++d.seq_ctr;
+        d.mirror_ready.store(k, std::memory_order_release);
     }
-    st.mirror_seq[k] = ++st.seq_ctr;
-    st.mirror_ready.store(k, std::memory_order_release);
-    return st.seq_ctr;
+    return d.seq_ctr;
+}
+
+// rebuild every bundle's mirror (non-worker callers: the relayout path)
+int32_t llama_expert_pool_tab_build(llama_expert_pool_state & st) {
+    int32_t seq = 0;
+    for (std::unique_ptr<llama_expert_pool_state::pool_dev> & dp : st.devs) {
+        seq = llama_expert_pool_tab_build_dev(st, *dp);
+    }
+    return seq;
 }
 
 // publish the ready mirror (hook thread only, at a step boundary): the GPU table
@@ -645,21 +688,24 @@ int32_t llama_expert_pool_tab_build(llama_expert_pool_state & st) {
 // compute and queued before the step's remaining GPU segments submit; no host sync
 // (the mirror slot rules keep the source alive). the CPU copy is a sync set.
 void llama_expert_pool_tab_publish(llama_expert_pool_state & st) {
-    if (st.tab_all == nullptr) {
-        return;
-    }
-    const int32_t r = st.mirror_ready.load(std::memory_order_acquire);
-    if (r < 0 || r == st.mirror_pub.load(std::memory_order_acquire)) {
-        return;
-    }
     const size_t n_half = (size_t) st.n_expert * st.layers.size();
-    // both halves in one stream-ordered copy (the table layout matches the mirror)
-    ggml_backend_tensor_set_async(st.pool_backend, st.tab_all, st.tab_mirror[r].data(), 0, 2 * n_half * sizeof(int32_t));
-    if (st.tab_cpu != nullptr) {
-        ggml_backend_tensor_set(st.tab_cpu, st.tab_mirror[r].data() + n_half, 0, n_half * sizeof(int32_t));
+    for (std::unique_ptr<llama_expert_pool_state::pool_dev> & dp : st.devs) {
+        llama_expert_pool_state::pool_dev & d = *dp;
+        if (d.tab_all == nullptr) {
+            continue;
+        }
+        const int32_t r = d.mirror_ready.load(std::memory_order_acquire);
+        if (r < 0 || r == d.mirror_pub.load(std::memory_order_acquire)) {
+            continue;
+        }
+        // both halves in one stream-ordered copy (the table layout matches the mirror)
+        ggml_backend_tensor_set_async(d.backend, d.tab_all, d.mirror[r].data(), 0, 2 * n_half * sizeof(int32_t));
+        if (d.tab_cpu != nullptr) {
+            ggml_backend_tensor_set(d.tab_cpu, d.mirror[r].data() + n_half, 0, n_half * sizeof(int32_t));
+        }
+        d.mirror_pub.store(r, std::memory_order_release);
+        d.pub_seq.store(d.mirror_seq[r], std::memory_order_release);
     }
-    st.mirror_pub.store(r, std::memory_order_release);
-    st.pub_seq.store(st.mirror_seq[r], std::memory_order_release);
 }
 
 // top-k refresh + two-phase slot fill + mirror rebuild (worker thread only).
@@ -672,8 +718,8 @@ void llama_expert_pool_tab_publish(llama_expert_pool_state & st) {
 // an exchange spans two settles: settle N unmaps the victim (res = -1), the hook
 // publishes that mirror at the step boundary, and only then - guarded by the
 // published sequence - settle N+1 writes the weights and remaps the slot.
-static int32_t worker_decide_and_copy(llama_expert_pool_state & st) {
-    const int32_t P = (int32_t) st.pooled_layers.size();
+static int32_t worker_decide_and_copy(llama_expert_pool_state & st, llama_expert_pool_state::pool_dev & d) {
+    const int32_t P = (int32_t) d.layers.size();
     const int32_t n_expert = st.n_expert;
     if (P <= 0 || st.act_cnt.empty()) {
         return 0;
@@ -690,7 +736,7 @@ static int32_t worker_decide_and_copy(llama_expert_pool_state & st) {
 
     // a slot with a pending fill is owned by the pending queue - never plan it again
     auto slot_pending = [&](int32_t il, int32_t slot) {
-        for (const auto & p : st.pend_fill) {
+        for (const auto & p : d.pend_fill) {
             if (p.il == il && p.slot == slot) {
                 return true;
             }
@@ -700,14 +746,15 @@ static int32_t worker_decide_and_copy(llama_expert_pool_state & st) {
 
     // phase 1: fill the slots whose unmap reached the tables
     int32_t filled = 0;
-    if (!st.pend_fill.empty()) {
-        const int32_t pub_seq = st.pub_seq.load(std::memory_order_acquire);
+    if (!d.pend_fill.empty()) {
         std::vector<llama_expert_pool_state::pending_fill> wait;
-        for (const auto & p : st.pend_fill) {
+        for (const auto & p : d.pend_fill) {
             std::vector<int32_t> & res = st.resident[p.il];
             if ((size_t) p.slot >= res.size() || res[p.slot] >= 0) {
                 continue; // the slot is no longer waiting (teardown or replan)
             }
+            // the fill waits for THIS bundle's mirror: its table unmapped the slot
+            const int32_t pub_seq = d.pub_seq.load(std::memory_order_acquire);
             if (p.seq > pub_seq) {
                 wait.push_back(p); // its unmap is not in the tables yet
                 continue;
@@ -720,14 +767,14 @@ static int32_t worker_decide_and_copy(llama_expert_pool_state & st) {
             filled += 1;
             LLAMA_LOG_INFO_V(LLAMA_LOG_VERBOSITY_TRACE,
                     "%s: fill layer %d slot %d (step %d): expert e=%d (cnt %.3f)\n",
-                    __func__, p.il, p.slot, st.settled_steps, p.e, p.cnt);
+                    __func__, p.il, p.slot, d.settled_steps, p.e, p.cnt);
         }
-        st.pend_fill.swap(wait);
+        d.pend_fill.swap(wait);
     }
 
     // phase 2: plan this settle's exchanges and unmap the victim slots
     for (int32_t ilx = 0; ilx < P; ++ilx) {
-        const int32_t il = st.pooled_layers[ilx];
+        const int32_t il = d.layers[ilx];
         const std::vector<int32_t> & res = st.resident[il];
         if (res.empty()) {
             continue;
@@ -816,69 +863,74 @@ static int32_t worker_decide_and_copy(llama_expert_pool_state & st) {
         // unmap the victim: once the mirror built below is published, no
         // expert maps onto this slot, so the fill may write it next settle
         res[p.slot] = -1;
-        st.pend_fill.push_back({ il, p.e, p.slot, 0, p.cnt });
+        d.pend_fill.push_back({ il, p.e, p.slot, 0, p.cnt });
         planned += 1;
         LLAMA_LOG_INFO_V(LLAMA_LOG_VERBOSITY_TRACE,
                 "%s: unmap layer %d slot %d (step %d): evict e=%d, fill e=%d (cnt %.3f), evict cnt %.3f\n",
-                __func__, il, p.slot, st.settled_steps, victim_e, p.e, p.cnt, p.cnt_out);
+                __func__, il, p.slot, d.settled_steps, victim_e, p.e, p.cnt, p.cnt_out);
     }
     if (filled > 0 || planned > 0) {
-        // tag the fills queued above with this mirror's sequence so they wait for it
-        const int32_t seq = llama_expert_pool_tab_build(st);
-        for (auto & p : st.pend_fill) {
+        // tag the fills queued above with this bundle's mirror sequence so they wait for it
+        const int32_t seq = llama_expert_pool_tab_build_dev(st, d);
+        for (auto & p : d.pend_fill) {
             if (p.seq == 0) {
                 p.seq = seq;
             }
         }
-        st.swap_sum += filled;
+        d.swap_sum += filled;
     }
     if (deferred > 0) {
         LLAMA_LOG_INFO_V(LLAMA_LOG_VERBOSITY_DEBUG,
                 "%s: %d pair(s) deferred by the per-step swap limit (step %d)",
-                __func__, deferred, st.settled_steps);
+                __func__, deferred, d.settled_steps);
     }
     return filled;
 }
 
-// settle one queued step marker: consume the rows pushed before it, decay and count
-// them, run the refresh, rebuild the mirror. worker thread only.
-bool llama_expert_pool_worker_settle(llama_expert_pool_state & st) {
+// settle one queued step marker of ONE bundle: consume that bundle's rows pushed before
+// it, decay and count them, run the refresh, rebuild that bundle's mirror. worker thread.
+bool llama_expert_pool_worker_settle(llama_expert_pool_state & st, llama_expert_pool_state::pool_dev & d) {
     std::vector<llama_expert_pool_state::route_block> rows;
     {
-        std::lock_guard<std::mutex> lk(st.route_mtx);
+        std::lock_guard<std::mutex> lk(d.route_mtx);
         // find the first marker WITHOUT consuming: rows are only complete once
         // their marker arrives, so an early wake must leave the queue untouched
         size_t nrows = 0;
-        for (; nrows < st.route_q.size() && st.route_q[nrows].il >= 0; ++nrows) {
+        for (; nrows < d.route_q.size() && d.route_q[nrows].il >= 0; ++nrows) {
         }
-        if (nrows >= st.route_q.size()) {
+        if (nrows >= d.route_q.size()) {
             return false; // no marker queued - nothing to settle
         }
         rows.reserve(nrows);
         for (size_t i = 0; i < nrows; ++i) {
-            rows.push_back(std::move(st.route_q.front()));
-            st.route_q.pop_front();
+            rows.push_back(std::move(d.route_q.front()));
+            d.route_q.pop_front();
         }
-        st.route_q.pop_front(); // the step marker itself
+        d.route_q.pop_front(); // the step marker itself
     }
     if (rows.empty()) {
         // a marker with no rows (the first step marker): nothing settled.
         return true;
     }
-    // lazy allocation of the counters
-    if (st.act_cnt.empty() && !st.pooled_layers.empty()) {
-        st.act_cnt.assign(st.layers.size() * (size_t) st.n_expert, 0.0f);
+    // the counters are allocated once, before the workers start (see the build path):
+    // every bundle owns its own layer columns, so no lock is needed here
+    if (st.act_cnt.empty()) {
+        return true;
     }
     // count by the rows' own step id: a lagging worker may settle several old
     // steps at once, so each step gets one decay tick and then its rows land
     size_t i = 0;
     while (i < rows.size()) {
         const int32_t t = rows[i].step;
-        // one decay tick per settled step; the rows land with 1/n_tok increments,
-        // so a batch of n columns contributes one step's worth of evidence
+        // one decay tick per settled step, over THIS bundle's layer columns only; the
+        // rows land with 1/n_tok increments, so a batch of n columns contributes one
+        // step's worth of evidence
         const float lam = st.swap_lambda;
-        for (float & c : st.act_cnt) {
-            c *= lam;
+        for (const int32_t il : d.layers) {
+            float * c = st.act_cnt.data() + (size_t) il * (size_t) st.n_expert;
+            for (int32_t e = 0; e < st.n_expert; ++e) {
+                c[e] *= lam;
+            }
         }
         size_t j = i;
         for (; j < rows.size() && rows[j].step == t; ++j) {
@@ -891,16 +943,16 @@ bool llama_expert_pool_worker_settle(llama_expert_pool_state & st) {
         i = j;
         // the refresh runs after this step's rows are counted, and reaches the
         // graph 1-2 steps later (the hook publishes at a step boundary)
-        const int32_t delta = worker_decide_and_copy(st);
-        st.settled_steps = t + 1;
+        const int32_t delta = worker_decide_and_copy(st, d);
+        d.settled_steps = t + 1;
         st.swap_total.fetch_add(delta, std::memory_order_relaxed);
-        st.swap_steps += 1;
+        d.swap_steps += 1;
         // attribute this settle's pairs to the windows of the step's slots (a
         // window closed by a report simply misses its tail - the accepted +-1)
         {
-            std::lock_guard<std::mutex> lk(st.route_mtx);
-            while (!st.step_slots_hist.empty() && st.step_slots_hist.front().first <= t) {
-                const std::pair<int32_t, std::vector<int32_t>> & e = st.step_slots_hist.front();
+            std::lock_guard<std::mutex> lk(d.route_mtx);
+            while (!d.step_slots_hist.empty() && d.step_slots_hist.front().first <= t) {
+                const std::pair<int32_t, std::vector<int32_t>> & e = d.step_slots_hist.front();
                 if (e.first == t) {
                     for (const int32_t s : e.second) {
                         if (s < 0 || s >= LLAMA_MAX_SEQ) {
@@ -912,7 +964,7 @@ bool llama_expert_pool_worker_settle(llama_expert_pool_state & st) {
                         }
                     }
                 }
-                st.step_slots_hist.pop_front();
+                d.step_slots_hist.pop_front();
             }
         }
         // per-exchange lines at TRACE/DEBUG; INFO gets a periodic average
@@ -920,7 +972,7 @@ bool llama_expert_pool_worker_settle(llama_expert_pool_state & st) {
         if (delta > 0) {
             LLAMA_LOG_INFO_V(LLAMA_LOG_VERBOSITY_DEBUG,
                     "%s: swap step %d: swapped %d\n",
-                    __func__, st.settled_steps, delta);
+                    __func__, d.settled_steps, delta);
         }
     }
     // the hit rate is printed once at segment end by expert_pool_finalize
@@ -943,6 +995,79 @@ llama_expert_pool::llama_expert_pool(
     ctx(ctx), model(model), cparams(cparams), backend_ptrs(backend_ptrs), backend_buft(backend_buft) {
 }
 
+// one bundle per selected serving device, in the given order, with the given layers and
+// budgets: the single place the bundles are created. called by expert_pool_init (which
+// resolves the budgets) and by the relayout path, which frees the bundles first because the
+// widths - and with them the tensor shapes - change.
+void llama_expert_pool::expert_pool_make_devs(
+        const std::vector<ggml_backend_dev_t> &   dv_order,
+        const std::vector<std::vector<int32_t>> & layers_by_dev,
+        const std::vector<int32_t> &              slots_by_dev,
+        const std::vector<int32_t> &              scope_by_dev) {
+    llama_expert_pool_state & st = this->st;
+    const int32_t n_expert    = (int32_t) model.hparams.n_expert;
+    const int32_t n_layer_all = (int32_t) model.hparams.n_layer_all;
+
+    st.layer_dev.assign(n_layer_all, -1);
+    st.devs.clear();
+    st.dev_slots.clear();
+    st.dev_scope.clear();
+    for (size_t si = 0; si < dv_order.size(); ++si) {
+        const ggml_backend_dev_t layer_dev = dv_order[si];
+        // the device's first non-host buft; a device without one gets the CPU buft, which is
+        // the degenerate (nothing to cache) configuration
+        ggml_backend_buffer_type_t bt = nullptr;
+        for (const ggml_backend_buffer_type_t cand : backend_buft) {
+            if (cand != nullptr && !ggml_backend_buft_is_host(cand) &&
+                    ggml_backend_buft_get_device(cand) == layer_dev) {
+                bt = cand;
+                break;
+            }
+        }
+        if (bt == nullptr) {
+            bt = ggml_backend_cpu_buffer_type();
+        }
+        std::unique_ptr<llama_expert_pool_state::pool_dev> d(new llama_expert_pool_state::pool_dev);
+        d->buft = bt;
+        for (size_t i = 0; i < backend_buft.size() && i < backend_ptrs.size(); ++i) {
+            if (backend_buft[i] == bt) {
+                d->backend = backend_ptrs[i];
+                break;
+            }
+        }
+        d->w_ctx       = ggml_init({ 4u*1024u*1024u, nullptr, true }); // no_alloc
+        d->tab_ctx     = ggml_init({ 4u*1024u*1024u, nullptr, true });
+        d->tab_cpu_ctx = ggml_init({ 64u*1024u, nullptr, true });
+        // CPU-hosted copy of the inverse table: the miss chain's get_rows reads it HERE, so
+        // its ids are not tied to the pool segment's output slot
+        d->tab_cpu = ggml_new_tensor_2d(d->tab_cpu_ctx, GGML_TYPE_I32, n_expert, (int64_t) n_layer_all);
+        ggml_set_name(d->tab_cpu, "mnt_tab_cpu");
+        // the device table: ONE [n_expert, 2*n_layer_all] I32 tensor holding both halves in the
+        // mirror's layout (remap, then inv); each layer gets a 1KB view, so a publish is one
+        // stream-ordered copy
+        d->tab_all = ggml_new_tensor_2d(d->tab_ctx, GGML_TYPE_I32, n_expert, 2 * (int64_t) n_layer_all);
+        ggml_set_name(d->tab_all, "mnt_tab_all");
+        st.dev_slots.push_back(si < slots_by_dev.size() ? slots_by_dev[si] : 0);
+        st.dev_scope.push_back(si < scope_by_dev.size() ? scope_by_dev[si] : 0);
+        st.devs.push_back(std::move(d));
+        for (int32_t il : layers_by_dev[si]) {
+            st.layer_dev[il] = (int32_t) si;
+            st.devs.back()->layers.push_back(il);
+        }
+    }
+    int32_t n_layers_pooled = 0;
+    for (const std::unique_ptr<llama_expert_pool_state::pool_dev> & dp : st.devs) {
+        n_layers_pooled += (int32_t) dp->layers.size();
+    }
+    LLAMA_LOG_INFO("%s: pool serves %d layer(s) on %d device bundle(s)\n",
+            __func__, n_layers_pooled, (int32_t) st.devs.size());
+    for (size_t bi = 0; bi < st.devs.size(); ++bi) {
+        LLAMA_LOG_INFO("%s: bundle %zu: %s, %zu layer(s), %d slots (-nep)\n",
+                __func__, bi, ggml_backend_buft_name(st.devs[bi]->buft), st.devs[bi]->layers.size(),
+                st.dev_slots[bi]);
+    }
+}
+
 // expert pool initialization:
 // - find the host-resident MoE layers, allocate one pool weight copy per matrix
 //   (same type/layout, expert dim = S), seed the resident sets, fill the tables
@@ -958,13 +1083,15 @@ void llama_expert_pool::expert_pool_init() {
     if (cparams.expert_pool <= 0) {
         return;
     }
-    // multi-GPU (layer split) is not supported: per-device pools are the planned
-    // design, and a single-device pool would round-trip every pooled layer through
-    // card 0. keep the pure -cmoe.
+    // one bundle per serving device (grouped below): a layer-split run is dispatched
+    // per device, each with its own weight buffer, tables and mirror. the swap decision
+    // is still taken by ONE worker across all bundles, so the per-step budget is shared
+    // between devices until the per-pool worker lands.
     if (model.n_devices() > 1) {
-        LLAMA_LOG_WARN("%s: multi-GPU layer split not supported for the expert pool yet, "
-                       "pool disabled (pure -cmoe)\n", __func__);
-        return;
+        LLAMA_LOG_WARN("%s: %d devices: the pool is dispatched per serving device (one bundle "
+                       "each), but this path is NOT verified on this build (single-GPU host); "
+                       "the per-step swap budget is currently shared between the bundles\n",
+                __func__, model.n_devices());
     }
     const int32_t n_layer = model.hparams.n_layer();
     const int32_t n_layer_all = (int32_t) model.hparams.n_layer_all;
@@ -1025,6 +1152,15 @@ void llama_expert_pool::expert_pool_init() {
             if (ggml_backend_dev_type(model.dev_layer(il)) == GGML_BACKEND_DEVICE_TYPE_CPU) {
                 continue;
             }
+            // the same for a meta device (tensor parallel / -sm tensor): the pool's weight
+            // copies and its mount chain would have to run through the meta buft and the
+            // meta backend, which the pool does not serve. reject by TYPE first - the buft
+            // identity tests below would accept a meta buft, and it is not a host buffer
+            if (ggml_backend_dev_type(model.dev_layer(il)) == GGML_BACKEND_DEVICE_TYPE_META) {
+                LLAMA_LOG_WARN("%s: layer %d is placed on a meta device (tensor parallel): "
+                               "the pool cannot serve it, layer skipped\n", __func__, il);
+                continue;
+            }
             ggml_tensor * ws[4] = {L.ffn_gate_up_exps, L.ffn_up_exps, L.ffn_gate_exps, L.ffn_down_exps};
             bool any        = false;
             bool any_host   = false;
@@ -1063,82 +1199,183 @@ void llama_expert_pool::expert_pool_init() {
         return;
     }
 
-    int32_t n_pooled = (int32_t) pooled_ils.size();
-    // -nep M,N: keep the M deepest eligible layers; the budget spreads over them
-    if (cparams.expert_pool_layers > 0 && n_pooled > cparams.expert_pool_layers) {
-        const int32_t n_eligible = n_pooled;
-        pooled_ils.erase(pooled_ils.begin(), pooled_ils.end() - cparams.expert_pool_layers);
-        n_pooled = (int32_t) pooled_ils.size();
-        LLAMA_LOG_INFO("%s: pooling the deepest %d of %d eligible MoE layers (layer %d..%d)\n",
-                __func__, n_pooled, n_eligible, pooled_ils.front(), pooled_ils.back());
-    }
-    // whole-layer layout (experiment): the shallowest k eligible layers (k = budget /
-    // n_expert) go fully resident in the model's own order, the rest stay pool layers at
-    // width 0: nothing of them is resident and the plain path computes them, but they
-    // are still observed. the layer set is the same in every layout - only the widths
-    // differ. the leftover slots stay unused. refs prefill-whole-layer-mode-2026-09-24.md
-    const bool layout_whole = llama_expert_pool_layout_whole();
-    int32_t n_full = n_pooled;
-    if (layout_whole) {
-        if (cparams.expert_pool_layers > 0) {
-            LLAMA_LOG_WARN("%s: GGML_EXPPOOL_LAYOUT=whole keeps the shallow layers; the -nep M,N layer set is ignored\n",
-                    __func__);
+    // --- per device budgets -------------------------------------------------------------
+    // group the eligible layers by serving device, in the model's device order (= the
+    // --device order); resolve the -nep entries against those devices; then give every pool
+    // its OWN layer set and widths. nothing is shared between pools except the rate knobs
+    // and the batch-regime threshold.
+    auto model_dev_pos = [&](ggml_backend_dev_t dv) -> int32_t {
+        for (size_t i = 0; i < model.devices.size(); ++i) {
+            if (model.devices[i].dev == dv) {
+                return (int32_t) i;
+            }
         }
-        n_full = std::min(n_pooled, cparams.expert_pool / n_expert);
-        if (n_full <= 0) {
-            LLAMA_LOG_WARN("%s: expert pool budget %d is below one full layer (%d experts), pool disabled\n",
-                    __func__, cparams.expert_pool, n_expert);
+        return -1;
+    };
+    std::vector<ggml_backend_dev_t>   dv_order;
+    std::vector<std::vector<int32_t>> dv_layers;
+    auto dv_slot_of = [&](ggml_backend_dev_t dv) -> int32_t {
+        const int32_t pos = model_dev_pos(dv);
+        size_t at = 0;
+        while (at < dv_order.size() && dv_order[at] != dv && model_dev_pos(dv_order[at]) <= pos) {
+            at += 1;
+        }
+        if (at < dv_order.size() && dv_order[at] == dv) {
+            return (int32_t) at;
+        }
+        dv_order.insert(dv_order.begin() + at, dv);
+        dv_layers.insert(dv_layers.begin() + at, std::vector<int32_t>());
+        return (int32_t) at;
+    };
+    for (int32_t il : pooled_ils) {
+        dv_layers[dv_slot_of(model.dev_layer(il))].push_back(il);
+    }
+    const int32_t n_dv = (int32_t) dv_order.size();
+
+    // resolve the entries: an empty name means "the i-th device"; a name matches the device
+    // name or the buffer type name (what the allocation log prints); the first entry wins
+    std::vector<int32_t> dv_slots(n_dv, 0);
+    std::vector<int32_t> dv_scope(n_dv, 0);
+    std::vector<char>    dv_seen (n_dv, 0);
+    std::vector<llama_cparams::expert_pool_dev_budget> entries = cparams.expert_pool_devs;
+    if (entries.empty() && cparams.expert_pool > 0) {
+        // the legacy single value (-nep N, or an API caller setting slots/layers): one
+        // positional entry, i.e. the FIRST device only
+        llama_cparams::expert_pool_dev_budget b = {};
+        b.slots  = cparams.expert_pool;
+        b.layers = cparams.expert_pool_layers;
+        entries.push_back(b);
+    }
+    for (size_t ei = 0; ei < entries.size(); ++ei) {
+        const llama_cparams::expert_pool_dev_budget & e = entries[ei];
+        int32_t at = -1;
+        if (e.dev[0] == '\0') {
+            at = (int32_t) ei;
+        } else {
+            for (int32_t b = 0; b < n_dv && at < 0; ++b) {
+                if (strcmp(e.dev, ggml_backend_dev_name(dv_order[b])) == 0) {
+                    at = b;
+                    break;
+                }
+                for (const ggml_backend_buffer_type_t bt : backend_buft) {
+                    if (bt != nullptr && ggml_backend_buft_get_device(bt) == dv_order[b] &&
+                            strcmp(e.dev, ggml_backend_buft_name(bt)) == 0) {
+                        at = b;
+                        break;
+                    }
+                }
+            }
+        }
+        if (at < 0 || at >= n_dv) {
+            LLAMA_LOG_ERROR("%s: -nep entry %d ('%s') does not match any of the %d device(s) the pool "
+                            "serves; pool disabled\n", __func__, (int) ei,
+                    e.dev[0] != '\0' ? e.dev : "(by position)", n_dv);
+            st.reset();
             return;
         }
-        LLAMA_LOG_INFO("%s: whole-layer layout: %d full layers (layer %d..%d), %d slots unused, %d layers at width 0\n",
-                __func__, n_full, pooled_ils.front(), pooled_ils[n_full - 1],
-                cparams.expert_pool - n_full * n_expert, n_pooled - n_full);
+        if (dv_seen[at]) {
+            LLAMA_LOG_WARN("%s: -nep: %s already has a budget entry (the first one wins)\n",
+                    __func__, ggml_backend_dev_name(dv_order[at]));
+            continue;
+        }
+        dv_seen[at]  = 1;
+        dv_slots[at] = e.slots;
+        dv_scope[at] = e.layers;
     }
 
-    // uniform width from the budget. below the floor (llama_expert_pool_min_slots, 1% of
-    // the expert count) the per-layer mount roundtrip costs more than the hits save, so
-    // warn - a budget this thin is a configuration error, and re-laying the layer set is
-    // the placement logic's job (--fit), never the pool's
-    const int32_t min_slots = llama_expert_pool_min_slots(n_expert);
-    int32_t n_slot = layout_whole ? n_expert : cparams.expert_pool / n_pooled;
-    int32_t rem    = layout_whole ? 0 : cparams.expert_pool % n_pooled;
-    if (!layout_whole && n_slot < min_slots) {
-        LLAMA_LOG_WARN("%s: %d slots per layer is under 1%% of the layer's experts (floor %d of %d): the mount roundtrip may cost more than the hits save - consider fewer pooled layers (-nep M,N) or a bigger budget\n",
-                __func__, n_slot, min_slots, n_expert);
+    // per device: keep (its layers, its deepest M), then its own widths
+    const bool    layout_whole = llama_expert_pool_layout_whole();
+    const int32_t min_slots    = llama_expert_pool_min_slots(n_expert);
+    std::vector<int32_t> widths(n_layer_all, 0);
+    std::vector<int32_t> kept_ils;
+    std::vector<ggml_backend_dev_t>   sel_dev;     // the devices that end up with a pool
+    std::vector<std::vector<int32_t>> sel_layers;
+    std::vector<int32_t>              sel_slots;
+    std::vector<int32_t>              sel_scope;
+    for (int32_t b = 0; b < n_dv; ++b) {
+        std::vector<int32_t> keep = dv_layers[b];   // ascending
+        const int32_t N = dv_slots[b];
+        const int32_t M = dv_scope[b];
+        if (N <= 0) {
+            LLAMA_LOG_INFO("%s: %s: no budget entry, its %d eligible MoE layer(s) stay at width 0\n",
+                    __func__, ggml_backend_dev_name(dv_order[b]), (int32_t) keep.size());
+            continue;
+        }
+        if (M > 0 && (int32_t) keep.size() > M) {
+            const int32_t n_eligible = (int32_t) keep.size();
+            keep.erase(keep.begin(), keep.end() - M);
+            LLAMA_LOG_INFO("%s: %s: pooling the deepest %d of %d eligible MoE layers (layer %d..%d)\n",
+                    __func__, ggml_backend_dev_name(dv_order[b]), (int32_t) keep.size(), n_eligible,
+                    keep.front(), keep.back());
+        }
+        if (keep.empty()) {
+            continue;
+        }
+        if (layout_whole) {
+            const int32_t n_full = std::min<int32_t>((int32_t) keep.size(), N / n_expert);
+            if (n_full <= 0) {
+                LLAMA_LOG_WARN("%s: %s: budget %d is below one full layer (%d experts), its pool stays empty\n",
+                        __func__, ggml_backend_dev_name(dv_order[b]), N, n_expert);
+                continue;
+            }
+            for (int32_t i = 0; i < n_full; ++i) {
+                widths[keep[i]] = n_expert;
+            }
+            LLAMA_LOG_INFO("%s: %s: whole-layer layout, %d full layer(s) (layer %d..%d), %d slots unused\n",
+                    __func__, ggml_backend_dev_name(dv_order[b]), n_full, keep.front(), keep[n_full - 1],
+                    N - n_full * n_expert);
+        } else {
+            int32_t n_slot = N / (int32_t) keep.size();
+            int32_t rem    = N % (int32_t) keep.size();
+            if (n_slot > n_expert) {
+                LLAMA_LOG_WARN("%s: %s: request of %d slots exceeds capacity (%d layers x %d experts), "
+                               "saturating to full coverage per layer\n",
+                        __func__, ggml_backend_dev_name(dv_order[b]), N, (int32_t) keep.size(), n_expert);
+                n_slot = n_expert;
+                rem    = 0;
+            }
+            if (n_slot < min_slots) {
+                LLAMA_LOG_WARN("%s: %s: %d slots per layer is under 1%% of the layer's experts (floor %d of %d): "
+                               "the mount roundtrip may cost more than the hits save\n",
+                        __func__, ggml_backend_dev_name(dv_order[b]), n_slot, min_slots, n_expert);
+            }
+            for (size_t i = 0; i < keep.size(); ++i) {
+                widths[keep[i]] = n_slot + ((int32_t) i >= (int32_t) keep.size() - rem ? 1 : 0);
+            }
+        }
+        sel_dev.push_back(dv_order[b]);
+        sel_layers.push_back(keep);
+        sel_slots.push_back(N);
+        sel_scope.push_back(M);
+        kept_ils.insert(kept_ils.end(), keep.begin(), keep.end());
+    }
+    std::sort(kept_ils.begin(), kept_ils.end());
+    if (kept_ils.empty()) {
+        LLAMA_LOG_WARN("%s: no device got a usable budget, expert pool disabled\n", __func__);
+        return;
     }
 
     st.layers.assign(n_layer_all, llama_expert_pool_layer{});
     st.resident.resize(n_layer_all);
-    st.pooled_layers = pooled_ils;
+    st.pooled_layers = kept_ils;
     st.pool_flag.assign((size_t) n_layer_all, 0);
-    for (int32_t il : pooled_ils) {
+    for (int32_t il : kept_ils) {
         st.pool_flag[il] = 1;
     }
     st.layout_whole = layout_whole;
 
-    if (!layout_whole && n_slot > n_expert) {
-        LLAMA_LOG_WARN("%s: expert pool request of %d slots exceeds capacity (%d pooled layers x %d experts), "
-                       "saturating to full coverage per layer\n",
-                __func__, cparams.expert_pool, n_pooled, n_expert);
-        n_slot = n_expert;
-        rem    = 0;
-    }
-    // per-layer widths: the whole-layer layout covers the shallow end fully, otherwise
-    // uniform n_slot with the remainder going to the deepest pooled layers
-    std::vector<int32_t> widths(n_layer_all, 0);
-    for (size_t i = 0; i < pooled_ils.size(); ++i) {
-        if (layout_whole) {
-            widths[pooled_ils[i]] = (int32_t) i < n_full ? n_expert : 0;
-        } else {
-            widths[pooled_ils[i]] = n_slot + ((int32_t) i >= (int32_t) pooled_ils.size() - rem ? 1 : 0);
-        }
-    }
+    // one bundle per selected device, in the budget order resolved above
+    expert_pool_make_devs(sel_dev, sel_layers, sel_slots, sel_scope);
+
     if (layout_whole) {
         // identity slot order: slot s holds expert s, so a fully resident layer's pool
         // tensors are the model's own matrices in its own order and no remap is needed;
         // the width-0 ones stay empty (they have no pool tensors either)
-        for (int32_t i = 0; i < n_full; ++i) {
-            std::vector<int32_t> & res = st.resident[pooled_ils[i]];
+        for (int32_t il : kept_ils) {
+            if (widths[il] != n_expert) {
+                continue;
+            }
+            std::vector<int32_t> & res = st.resident[il];
             res.resize((size_t) n_expert);
             for (int32_t e = 0; e < n_expert; ++e) {
                 res[e] = e;
@@ -1177,14 +1414,24 @@ void llama_expert_pool::expert_pool_build() {
         }
     }
 
+    // the bundles were created in expert_pool_init (one per serving device, in the model's
+    // device order, with the budget each one resolved) - build only allocates and fills.
     // reset the whole array so a zero-slot layer never keeps stale pointers
     st.layers.assign(model.hparams.n_layer_all, llama_expert_pool_layer{});
+    // the swap counters are allocated ONCE here, before any worker starts: every bundle
+    // owns its own layer columns of this array (shared storage, disjoint columns, no lock)
+    if (st.swap_auto) {
+        st.act_cnt.assign(st.layers.size() * (size_t) st.n_expert, 0.0f);
+    }
 
     // --- create pool weight tensors ---
-    pool_ctx = ggml_init({ 4u*1024u*1024u, nullptr, true }); // no_alloc = true (allocated via buft)
-
     for (size_t ix = 0; ix < pooled_ils.size(); ++ix) {
         const int32_t il = pooled_ils[ix];
+        const int32_t di = st.dev_of(il);
+        if (di < 0) {
+            continue;
+        }
+        llama_expert_pool_state::pool_dev & dev = *st.devs[di];
         const llama_layer & L = model.layers[il];
         // per-layer slot count = the pool file's line length; zero-slot layers get no
         // pool tensors (the layer falls back to CPU). COMPACT layout: slot s holds
@@ -1209,8 +1456,8 @@ void llama_expert_pool::expert_pool_build() {
             // weights 4D, slot-compact biases 2D; both are (expert -> slot) copies,
             // so the per-expert stride is ne[2] and ne[1] respectively
             l.pool[k] = (k < PK_UP_B)
-                ? ggml_new_tensor_4d(pool_ctx, src[k]->type, src[k]->ne[0], src[k]->ne[1], s_il, 1)
-                : ggml_new_tensor_2d(pool_ctx, src[k]->type, src[k]->ne[0], s_il);
+                ? ggml_new_tensor_4d(dev.w_ctx, src[k]->type, src[k]->ne[0], src[k]->ne[1], s_il, 1)
+                : ggml_new_tensor_2d(dev.w_ctx, src[k]->type, src[k]->ne[0], s_il);
         }
     }
 
@@ -1267,21 +1514,18 @@ void llama_expert_pool::expert_pool_build() {
         }
     }
 
-    // --- mount routing tables, all on the pool device: every gather runs on the GPU
-    // segment; ids_cpu and the scale values reach the CPU segment as 32B inputs ---
+    // --- mount routing tables, one set per serving device: every gather runs on the
+    // GPU segment; ids_cpu and the scale values reach the CPU segment as 32B inputs ---
     if (st.direct_mount) {
-        pool_tab_ctx = ggml_init({ 4u*1024u*1024u, nullptr, true }); // no_alloc
-        // CPU-hosted copy of the inverse table: the miss chain's get_rows reads it HERE,
-        // so its ids are not tied to the pool segment's output slot
-        pool_tab_cpu_ctx = ggml_init({ 64u*1024u, nullptr, true });
-        st.tab_cpu = ggml_new_tensor_2d(pool_tab_cpu_ctx, GGML_TYPE_I32, n_expert,
-                                        (int64_t) model.hparams.n_layer_all);
-        ggml_set_name(st.tab_cpu, "mnt_tab_cpu");
         // one pool-side copy of the top-k rows per pool layer (see the field comment):
         // the graph writes it every ubatch, the pool reads it after the graph
         st.ids_shadow.assign(model.hparams.n_layer_all, nullptr);
         for (int32_t il : pooled_ils) {
-            st.ids_shadow[il] = ggml_new_tensor_1d(pool_tab_ctx, GGML_TYPE_I32,
+            const int32_t di = st.dev_of(il);
+            if (di < 0) {
+                continue;
+            }
+            st.ids_shadow[il] = ggml_new_tensor_1d(st.devs[di]->tab_ctx, GGML_TYPE_I32,
                     (int64_t) model.hparams.n_expert_used(il) * cparams.n_ubatch);
             char nm[64];
             snprintf(nm, sizeof(nm), "mnt_ids_shadow_%d", il);
@@ -1296,33 +1540,30 @@ void llama_expert_pool::expert_pool_build() {
         if (!mreg.active) {
             continue;
         }
+        const int32_t di = st.dev_of(il);
+        if (di < 0) {
+            continue;
+        }
+        llama_expert_pool_state::pool_dev & d = *st.devs[di];
         llama_expert_pool_mount m = mreg;
         const llama_layer & L = model.layers[il];
-        // merged table: ONE [n_expert, 2*n_layers] I32 tensor holding both halves in the
-        // mirror's layout (remap, then inv); each layer gets a 1KB view, so a publish
-        // is one stream-ordered copy
-        if (st.tab_all == nullptr) {
-            st.tab_all = ggml_new_tensor_2d(pool_tab_ctx, GGML_TYPE_I32, n_expert,
-                                            2 * (int64_t) model.hparams.n_layer_all);
-            ggml_set_name(st.tab_all, "mnt_tab_all");
-        }
         const size_t  i32sz        = ggml_type_size(GGML_TYPE_I32);
         const int64_t n_layers_all = (int64_t) model.hparams.n_layer_all;
-        m.remap     = ggml_view_2d(pool_tab_ctx, st.tab_all, 1, n_expert, i32sz,
+        m.remap     = ggml_view_2d(d.tab_ctx, d.tab_all, 1, n_expert, i32sz,
                                    il * n_expert * i32sz);
-        m.remap_inv = ggml_view_2d(pool_tab_ctx, st.tab_all, 1, n_expert, i32sz,
+        m.remap_inv = ggml_view_2d(d.tab_ctx, d.tab_all, 1, n_expert, i32sz,
                                    (n_layers_all + il) * n_expert * i32sz);
         // CPU-side view of the host table (tab_cpu holds only the inv part)
-        m.remap_inv_host = ggml_view_2d(pool_tab_cpu_ctx, st.tab_cpu, 1, n_expert, i32sz,
+        m.remap_inv_host = ggml_view_2d(d.tab_cpu_ctx, d.tab_cpu, 1, n_expert, i32sz,
                                        il * n_expert * i32sz);
         if (L.ffn_down_exps_s != nullptr) {
-            m.scale = ggml_new_tensor_1d(pool_tab_ctx, GGML_TYPE_F32, n_expert);
+            m.scale = ggml_new_tensor_1d(d.tab_ctx, GGML_TYPE_F32, n_expert);
         }
         if (L.ffn_up_exps_s != nullptr) {
-            m.scale_up = ggml_new_tensor_1d(pool_tab_ctx, GGML_TYPE_F32, n_expert);
+            m.scale_up = ggml_new_tensor_1d(d.tab_ctx, GGML_TYPE_F32, n_expert);
         }
         if (L.ffn_gate_exps_s != nullptr) {
-            m.scale_gate = ggml_new_tensor_1d(pool_tab_ctx, GGML_TYPE_F32, n_expert);
+            m.scale_gate = ggml_new_tensor_1d(d.tab_ctx, GGML_TYPE_F32, n_expert);
         }
         char nm[64];
         snprintf(nm, sizeof(nm), "mnt_remap_%d", il);
@@ -1345,31 +1586,25 @@ void llama_expert_pool::expert_pool_build() {
         }
         st.set_mount(il, m);
     }
-    // --- allocate: device tables on the pool device, host tables on the CPU ---
-    ggml_backend_buffer_type_t tab_buft = ggml_backend_cpu_buffer_type();
-    for (const ggml_backend_buffer_type_t bt : backend_buft) {
-        if (!ggml_backend_buft_is_host(bt)) {
-            tab_buft = bt;
-            break;
-        }
-    }
+    // --- allocate: each bundle's tables on its own device, the host halves on the CPU ---
     if (st.direct_mount) {
-        ggml_backend_buffer_ptr tab_buf(ggml_backend_alloc_ctx_tensors_from_buft(
-                pool_tab_ctx, tab_buft));
-        if (!tab_buf) {
-            LLAMA_LOG_ERROR("%s: mount table allocation failed, direct mount disabled\n", __func__);
-            st.direct_mount = false;
-        } else {
-            tab_buf.swap(mount_tab_buf);
-        }
-        // CPU-side table: allocate with the CPU buft (host memory)
-        ggml_backend_buffer_ptr tab_cpu_buf(ggml_backend_alloc_ctx_tensors_from_buft(
-                pool_tab_cpu_ctx, ggml_backend_cpu_buffer_type()));
-        if (!tab_cpu_buf) {
-            LLAMA_LOG_ERROR("%s: CPU mount table allocation failed, direct mount disabled\n", __func__);
-            st.direct_mount = false;
-        } else {
-            tab_cpu_buf.swap(mount_tab_cpu_buf);
+        for (std::unique_ptr<llama_expert_pool_state::pool_dev> & dp : st.devs) {
+            llama_expert_pool_state::pool_dev & d = *dp;
+            d.tab_buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(d.tab_ctx, d.buft));
+            if (!d.tab_buf) {
+                LLAMA_LOG_ERROR("%s: mount table allocation failed on %s, direct mount disabled\n",
+                        __func__, ggml_backend_buft_name(d.buft));
+                st.direct_mount = false;
+                break;
+            }
+            // CPU-side table: allocate with the CPU buft (host memory)
+            d.tab_cpu_buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(d.tab_cpu_ctx,
+                    ggml_backend_cpu_buffer_type()));
+            if (!d.tab_cpu_buf) {
+                LLAMA_LOG_ERROR("%s: CPU mount table allocation failed, direct mount disabled\n", __func__);
+                st.direct_mount = false;
+                break;
+            }
         }
         if (!st.direct_mount) {
             // de-register the mounts so the graph builder never sees active=true with null tables
@@ -1381,65 +1616,54 @@ void llama_expert_pool::expert_pool_build() {
         }
     }
 
-    // --- allocate the pool tensors on the fastest non-CPU buft, fallback CPU ---
-    ggml_backend_buffer_type_t pool_buft = nullptr;
-    for (const ggml_backend_buffer_type_t bt : backend_buft) {
-        if (!ggml_backend_buft_is_host(bt)) {
-            pool_buft = bt;
-            break;
-        }
-    }
-    if (!pool_buft) {
-        pool_buft = ggml_backend_cpu_buffer_type();
-    }
-    // the pool uploads weight bytes exactly as they sit in host memory, so a backend that
-    // reorders expert weights on the device side would read every uploaded slice wrong.
-    // SYCL does that lazily and in place (opt_for_reorder_id, K-quants on Intel GPUs) with
-    // no hook to re-apply, and there is no neutral way to ask for it - refuse the whole pool
-    {
-        ggml_backend_dev_t pool_dev = ggml_backend_buft_get_device(pool_buft);
+    // --- allocate each bundle's weight tensors on its own device (CPU fallback per bundle) ---
+    for (std::unique_ptr<llama_expert_pool_state::pool_dev> & dp : st.devs) {
+        llama_expert_pool_state::pool_dev & d = *dp;
+        // the pool uploads weight bytes exactly as they sit in host memory, so a backend
+        // that reorders expert weights on the device side would read every uploaded slice
+        // wrong. SYCL does that lazily and in place (opt_for_reorder_id, K-quants on Intel
+        // GPUs) with no hook to re-apply, and there is no neutral way to ask for it -
+        // refuse the whole pool
+        ggml_backend_dev_t pool_dev = ggml_backend_buft_get_device(d.buft);
         if (pool_dev != nullptr &&
                 std::string(ggml_backend_reg_name(ggml_backend_dev_backend_reg(pool_dev))) == "SYCL") {
             LLAMA_LOG_WARN("%s: %s reorders expert weights in place on first use; the pool uploads raw "
                            "weights and would read them wrong - pool disabled\n",
                     __func__, ggml_backend_dev_name(pool_dev));
-            expert_pool_release(); // free the partial allocations (pool ctx / tables)
+            expert_pool_release(); // frees the bundles
             st.reset();
             return;
         }
-    }
-    st.pool_buft = pool_buft;
-    pool_buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(pool_ctx, pool_buft));
-    if (!pool_buf) {
-        LLAMA_LOG_WARN("%s: pool allocation on %s failed, falling back to CPU\n",
-                __func__, ggml_backend_buft_name(pool_buft));
-        pool_buft = ggml_backend_cpu_buffer_type();
-        pool_buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(pool_ctx, pool_buft));
-    }
-    if (!pool_buf) {
-        LLAMA_LOG_ERROR("%s: expert pool allocation failed, pool disabled\n", __func__);
-        expert_pool_release(); // free the partial allocations (pool ctx / tables)
-        st.reset();
-        return;
-    }
-    // the backend owning the pool buft: the swap worker issues its copies async on this
-    // backend's stream (sync fallback when none matches, e.g. a CPU pool)
-    st.pool_backend = nullptr;
-    for (size_t i = 0; i < backend_buft.size() && i < backend_ptrs.size(); ++i) {
-        if (backend_buft[i] == pool_buft) {
-            st.pool_backend = backend_ptrs[i];
-            break;
+        d.w_buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(d.w_ctx, d.buft));
+        if (!d.w_buf) {
+            LLAMA_LOG_WARN("%s: pool allocation on %s failed, falling back to CPU\n",
+                    __func__, ggml_backend_buft_name(d.buft));
+            d.buft = ggml_backend_cpu_buffer_type();
+            d.backend = nullptr;
+            for (size_t i = 0; i < backend_buft.size() && i < backend_ptrs.size(); ++i) {
+                if (backend_buft[i] == d.buft) {
+                    d.backend = backend_ptrs[i];
+                    break;
+                }
+            }
+            d.w_buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(d.w_ctx, d.buft));
         }
-    }
-    LLAMA_LOG_INFO("%s: pool allocated on %s (host=%d, %zu bytes)\n",
-            __func__, ggml_backend_buft_name(pool_buft),
-            (int) ggml_backend_buffer_is_host(pool_buf.get()), ggml_backend_buffer_get_size(pool_buf.get()));
-    // mark the pool tensors as weights so the scheduler keeps the warm-path mat_mul_id
-    // (and its outputs) on the pool device
-    ggml_backend_buffer_set_usage(pool_buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        if (!d.w_buf) {
+            LLAMA_LOG_ERROR("%s: expert pool allocation failed, pool disabled\n", __func__);
+            expert_pool_release(); // frees the bundles
+            st.reset();
+            return;
+        }
+        LLAMA_LOG_INFO("%s: pool allocated on %s (host=%d, %zu bytes)\n",
+                __func__, ggml_backend_buft_name(d.buft),
+                (int) ggml_backend_buffer_is_host(d.w_buf.get()), ggml_backend_buffer_get_size(d.w_buf.get()));
+        // mark the pool tensors as weights so the scheduler keeps the warm-path mat_mul_id
+        // (and its outputs) on the pool device
+        ggml_backend_buffer_set_usage(d.w_buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
 
-    // zero the pool buffer ONCE: fresh backend buffers are not guaranteed zeroed
-    ggml_backend_buffer_clear(pool_buf.get(), 0);
+        // zero the pool buffer ONCE: fresh backend buffers are not guaranteed zeroed
+        ggml_backend_buffer_clear(d.w_buf.get(), 0);
+    }
 
     int32_t tot_slots = 0;
     for (int32_t il : pooled_ils) {
@@ -1603,15 +1827,29 @@ void llama_expert_pool::expert_pool_finalize(int32_t id_slot) {
     }
     st.seg = {};
 
-    // the swap average: per window for a slot report, per segment otherwise. the
-    // worker is NOT stopped here - the worker catch-up wait is the only sync this report
-    // would need, and a window tolerates a +-1 step tail
-    if (win == nullptr && st.swap_sum > 0 && st.swap_steps > 0) {
-        LLAMA_LOG_INFO_V(LLAMA_LOG_VERBOSITY_INFO,
-                "%s: swap avg %.1f expert slots/step (segment, %d steps)\n",
-                __func__, (float) st.swap_sum / (float) st.swap_steps, st.swap_steps);
-        st.swap_sum = 0;
-        st.swap_steps = 0;
+    // the swap average: per window for a slot report, per segment otherwise. each pool
+    // reports its OWN average (one worker per device), so the quotient stays readable
+    // whatever the other pools settled; the device name is appended only when there is
+    // more than one bundle, which keeps the single-device line text unchanged
+    if (win == nullptr) {
+        const bool multi = st.devs.size() > 1;
+        for (size_t di = 0; di < st.devs.size(); ++di) {
+            llama_expert_pool_state::pool_dev & d = *st.devs[di];
+            if (d.swap_sum > 0 && d.swap_steps > 0) {
+                if (multi) {
+                    LLAMA_LOG_INFO_V(LLAMA_LOG_VERBOSITY_INFO,
+                            "%s: swap avg %.1f expert slots/step (segment, %d steps, %s)\n",
+                            __func__, (float) d.swap_sum / (float) d.swap_steps, d.swap_steps,
+                            ggml_backend_buft_name(d.buft));
+                } else {
+                    LLAMA_LOG_INFO_V(LLAMA_LOG_VERBOSITY_INFO,
+                            "%s: swap avg %.1f expert slots/step (segment, %d steps)\n",
+                            __func__, (float) d.swap_sum / (float) d.swap_steps, d.swap_steps);
+                }
+            }
+            d.swap_sum   = 0;
+            d.swap_steps = 0;
+        }
     }
 }
 
@@ -1627,52 +1865,70 @@ void llama_expert_pool::expert_pool_relayout(bool whole) {
     }
     const int32_t n_expert = model.hparams.n_expert;
 
-    // one exchange spans two settles: stop the worker first (its join is the barrier)
+    // one exchange spans two settles: stop the workers first (their joins are the barrier)
     st.stop_worker();
 
-    std::vector<std::vector<int32_t>> resident;
-    if (whole) {
-        // the shallowest layers the budget covers go fully resident, in the model's own
-        // order (a full-width layer is laid out in expert order); the rest go to width 0
-        const int32_t n_full = std::min<int32_t>((int32_t) st.pooled_layers.size(),
-                                                 cparams.expert_pool / n_expert);
-        if (n_full <= 0) {
-            LLAMA_LOG_WARN("%s: expert pool budget %d is below one full layer (%d experts), keeping the current layout\n",
-                    __func__, cparams.expert_pool, n_expert);
-            llama_expert_pool_start_worker(st);
-            return;
+    // the layer set and the budgets stay; only the widths change, and with them the tensor
+    // shapes, so EVERY pool is re-laid with its OWN budget and the bundles are re-created
+    std::vector<ggml_backend_dev_t>   sel_dev;
+    std::vector<std::vector<int32_t>> sel_layers;
+    const std::vector<int32_t>        sel_slots = st.dev_slots;
+    const std::vector<int32_t>        sel_scope = st.dev_scope;
+    for (const std::unique_ptr<llama_expert_pool_state::pool_dev> & dp : st.devs) {
+        sel_dev.push_back(ggml_backend_buft_get_device(dp->buft));
+        sel_layers.push_back(dp->layers);
+    }
+
+    std::vector<std::vector<int32_t>> resident; // indexed by LAYER
+    resident.resize(model.hparams.n_layer_all);
+    for (size_t si = 0; si < sel_dev.size(); ++si) {
+        const int32_t N = si < sel_slots.size() ? sel_slots[si] : 0;
+        std::vector<int32_t> & ls = sel_layers[si];
+        if (N <= 0 || ls.empty()) {
+            continue;
         }
-        resident.assign(st.pooled_layers.size(), {});
-        for (int32_t i = 0; i < n_full; ++i) {
-            resident[i].resize((size_t) n_expert);
-            for (int32_t e = 0; e < n_expert; ++e) {
-                resident[i][e] = e;
+        const int32_t P = (int32_t) ls.size();
+        if (whole) {
+            // this pool's shallowest (budget / n_expert) layers go fully resident in the
+            // model's own order (a full-width layer is laid out in expert order); its other
+            // layers go to width 0
+            const int32_t n_full = std::min<int32_t>(P, N / n_expert);
+            if (n_full <= 0) {
+                LLAMA_LOG_WARN("%s: %s: budget %d is below one full layer (%d experts), its pool stays as it is\n",
+                        __func__, ggml_backend_buft_name(st.devs[si]->buft), N, n_expert);
+                continue;
             }
-        }
-    } else {
-        // uniform widths, the remainder on the DEEP layers: at the coverage ratios where the
-        // remainder is worth deciding (below ~13% of the experts per layer, see the routing
-        // baseline ref) the marginal expert sits in the deeper layers, so they take the spare
-        const int32_t P = (int32_t) st.pooled_layers.size();
-        const int32_t wu = cparams.expert_pool / P;
-        const int32_t rem = cparams.expert_pool % P;
-        resident.assign(P, {});
-        for (int32_t i = 0; i < P; ++i) {
-            const int32_t wi = wu + (i >= P - rem ? 1 : 0);
-            const float * row = st.act_cnt.data() + (size_t) st.pooled_layers[i] * n_expert;
-            std::vector<std::pair<float, int32_t>> top;
-            top.reserve((size_t) n_expert);
-            for (int32_t e = 0; e < n_expert; ++e) {
-                if (row[e] > 0.0f) {
-                    top.emplace_back(row[e], e);
+            for (int32_t i = 0; i < n_full; ++i) {
+                std::vector<int32_t> & res = resident[ls[i]];
+                res.resize((size_t) n_expert);
+                for (int32_t e = 0; e < n_expert; ++e) {
+                    res[e] = e;
                 }
             }
-            std::sort(top.begin(), top.end(), [](const auto & a, const auto & b) {
-                return a.first > b.first || (a.first == b.first && a.second < b.second);
-            });
-            const int32_t take = std::min<int32_t>(wi, (int32_t) top.size());
-            for (int32_t k = 0; k < take; ++k) {
-                resident[i].push_back(top[k].second);
+        } else {
+            // uniform widths, the remainder on the DEEP layers of this pool: at the coverage
+            // ratios where the remainder is worth deciding (below ~13% of the experts per
+            // layer, see the routing baseline ref) the marginal expert sits in the deeper
+            // layers, so they take the spare
+            const int32_t wu  = N / P;
+            const int32_t rem = N % P;
+            for (int32_t i = 0; i < P; ++i) {
+                const int32_t wi = wu + (i >= P - rem ? 1 : 0);
+                const float * row = st.act_cnt.data() + (size_t) ls[i] * n_expert;
+                std::vector<std::pair<float, int32_t>> top;
+                top.reserve((size_t) n_expert);
+                for (int32_t e = 0; e < n_expert; ++e) {
+                    if (row[e] > 0.0f) {
+                        top.emplace_back(row[e], e);
+                    }
+                }
+                std::sort(top.begin(), top.end(), [](const auto & a, const auto & b) {
+                    return a.first > b.first || (a.first == b.first && a.second < b.second);
+                });
+                const int32_t take = std::min<int32_t>(wi, (int32_t) top.size());
+                for (int32_t k = 0; k < take; ++k) {
+                    resident[ls[i]].push_back(top[k].second);
+                }
             }
         }
     }
@@ -1685,38 +1941,23 @@ void llama_expert_pool::expert_pool_relayout(bool whole) {
     }
     ctx.gf_res_prev_active = nullptr;
     ggml_backend_sched_reset(ctx.sched.get());
-    pool_buf.reset();
-    mount_tab_buf.reset();
-    mount_tab_cpu_buf.reset();
-    if (pool_ctx != nullptr) {
-        ggml_free(pool_ctx);
-        pool_ctx = nullptr;
-    }
-    if (pool_tab_ctx != nullptr) {
-        ggml_free(pool_tab_ctx);
-        pool_tab_ctx = nullptr;
-    }
-    if (pool_tab_cpu_ctx != nullptr) {
-        ggml_free(pool_tab_cpu_ctx);
-        pool_tab_cpu_ctx = nullptr;
-    }
-    st.tab_all = nullptr;
-    st.tab_cpu = nullptr;
-    for (auto & m : st.tab_mirror) {
-        m.clear();
-    }
-    st.mirror_ready.store(-1);
-    st.mirror_pub.store(-1);
+    release_devs();
     st.resident.assign(model.hparams.n_layer_all, {});
-    for (size_t i = 0; i < st.pooled_layers.size() && i < resident.size(); ++i) {
-        st.resident[st.pooled_layers[i]] = std::move(resident[i]);
+    for (int32_t il : st.pooled_layers) {
+        st.resident[il] = std::move(resident[il]);
     }
     st.layout_whole = whole;
+    expert_pool_make_devs(sel_dev, sel_layers, sel_slots, sel_scope);
     expert_pool_build();
-    expert_pool_fill(); // restarts the swap worker
+    expert_pool_fill(); // restarts the swap workers
     ctx.sched_need_reserve = true;
-    LLAMA_LOG_INFO("%s: pool re-laid out (%s layout, %d layers, %d slots)\n",
-            __func__, whole ? "whole-layer" : "partial", (int) st.pooled_layers.size(), cparams.expert_pool);
+    int32_t tot_slots = 0;
+    for (const int32_t v : sel_slots) {
+        tot_slots += v;
+    }
+    LLAMA_LOG_INFO("%s: pool re-laid out (%s layout, %d layers, %d device(s), %d slots)\n",
+            __func__, whole ? "whole-layer" : "partial", (int) st.pooled_layers.size(),
+            (int) sel_dev.size(), tot_slots);
 }
 
 // the layout follows the batch regime (GGML_EXPPOOL_LAYOUT=auto): at or above the
@@ -1748,6 +1989,40 @@ void llama_expert_pool::expert_pool_cross(int32_t n_tokens) {
 }
 
 
+// release the per-device bundles: weight context/buffer, tables and mirrors. Buffers
+// first, then the contexts that own the tensor metadata.
+void llama_expert_pool::release_devs() {
+    for (std::unique_ptr<llama_expert_pool_state::pool_dev> & dp : st.devs) {
+        llama_expert_pool_state::pool_dev & d = *dp;
+        d.w_buf.reset();
+        if (d.w_ctx != nullptr) {
+            ggml_free(d.w_ctx);
+            d.w_ctx = nullptr;
+        }
+        d.tab_buf.reset();
+        d.tab_cpu_buf.reset();
+        d.tab_all = nullptr;
+        d.tab_cpu = nullptr;
+        for (auto & m : d.mirror) {
+            m.clear();
+        }
+        d.mirror_seq[0] = d.mirror_seq[1] = d.mirror_seq[2] = -1;
+        d.mirror_ready.store(-1);
+        d.mirror_pub.store(-1);
+        d.pub_seq.store(-1);
+        if (d.tab_ctx != nullptr) {
+            ggml_free(d.tab_ctx);
+            d.tab_ctx = nullptr;
+        }
+        if (d.tab_cpu_ctx != nullptr) {
+            ggml_free(d.tab_cpu_ctx);
+            d.tab_cpu_ctx = nullptr;
+        }
+    }
+    st.devs.clear();
+    st.layer_dev.clear();
+}
+
 void llama_expert_pool::expert_pool_release() {
     llama_expert_pool_state & st = this->st;
 
@@ -1763,39 +2038,30 @@ void llama_expert_pool::expert_pool_release() {
                 (unsigned long long) (st.seg.hit + st.seg.miss));
         st.seg = {};
     }
-    if (unclosed && st.swap_sum > 0 && st.swap_steps > 0) {
-        LLAMA_LOG_INFO_V(LLAMA_LOG_VERBOSITY_INFO, "%s: swap avg %.1f expert slots/step (segment, %d steps)\n", __func__,
-                (float) st.swap_sum / (float) st.swap_steps, st.swap_steps);
-        st.swap_sum = 0;
-        st.swap_steps = 0;
+    if (unclosed) {
+        // every pool's own tally (the workers are still running here - the stop below is
+        // what makes this the last read); the device name only in a multi-bundle run, so
+        // the single-device line text stays unchanged
+        const bool multi = st.devs.size() > 1;
+        for (size_t di = 0; di < st.devs.size(); ++di) {
+            llama_expert_pool_state::pool_dev & d = *st.devs[di];
+            if (d.swap_sum > 0 && d.swap_steps > 0) {
+                if (multi) {
+                    LLAMA_LOG_INFO_V(LLAMA_LOG_VERBOSITY_INFO, "%s: swap avg %.1f expert slots/step (segment, %d steps, %s)\n", __func__,
+                            (float) d.swap_sum / (float) d.swap_steps, d.swap_steps, ggml_backend_buft_name(d.buft));
+                } else {
+                    LLAMA_LOG_INFO_V(LLAMA_LOG_VERBOSITY_INFO, "%s: swap avg %.1f expert slots/step (segment, %d steps)\n", __func__,
+                            (float) d.swap_sum / (float) d.swap_steps, d.swap_steps);
+                }
+            }
+            d.swap_sum   = 0;
+            d.swap_steps = 0;
+        }
     }
 
     // stop the swap worker first: its sync tensor_set calls reference the pool tensors
     // freed below
     st.stop_worker();
 
-    pool_buf.reset(); // release the pool buffer before freeing the ctx metadata
-    if (pool_ctx != nullptr) {
-        ggml_free(pool_ctx);
-        pool_ctx = nullptr;
-    }
-    mount_tab_buf.reset();
-    if (pool_tab_ctx != nullptr) {
-        ggml_free(pool_tab_ctx);
-        pool_tab_ctx = nullptr;
-    }
-    mount_tab_cpu_buf.reset();
-    if (pool_tab_cpu_ctx != nullptr) {
-        ggml_free(pool_tab_cpu_ctx);
-        pool_tab_cpu_ctx = nullptr;
-    }
-
-    // the merged tables lived in those contexts
-    st.tab_all = nullptr;
-    st.tab_cpu = nullptr;
-    for (auto & m : st.tab_mirror) {
-        m.clear();
-    }
-    st.mirror_ready.store(-1);
-    st.mirror_pub.store(-1);
+    release_devs();
 }

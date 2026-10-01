@@ -153,6 +153,26 @@ llama_context::llama_context(
     cparams.expert_pool_swap_cap   = ep.swap_cap;
     cparams.expert_pool_swap_decay = ep.swap_decay;
     cparams.expert_pool_miss_method= ep.miss_method;
+    // per device budget entries: the pool resolves them against the devices it serves.
+    // `expert_pool` is the sum, used only as a boolean proxy for the "is a pool configured?"
+    // gates (llama-graph's mount gate reads it) - no budget arithmetic reads it any more
+    cparams.expert_pool_devs.clear();
+    for (int32_t i = 0; i < ep.n_dev; ++i) {
+        llama_cparams::expert_pool_dev_budget b = {};
+        snprintf(b.dev, sizeof(b.dev), "%s", ep.dev[i].dev);
+        b.slots  = ep.dev[i].slots;
+        b.layers = ep.dev[i].layers;
+        cparams.expert_pool_devs.push_back(b);
+    }
+    if (ep.n_dev > 0) {
+        int32_t total = 0;
+        for (const llama_cparams::expert_pool_dev_budget & b : cparams.expert_pool_devs) {
+            if (b.slots > 0) {
+                total += b.slots;
+            }
+        }
+        cparams.expert_pool = total;
+    }
 
     cparams.ctx_other = nullptr;
 

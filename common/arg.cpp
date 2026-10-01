@@ -1695,41 +1695,69 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_SWA_FULL"));
     add_opt(common_arg(
-        {"-nep", "--expert-pool"}, "N|M,N",
-        "expert pool slot budget (0 = disabled). N = spread over all pooled MoE layers, "
-        "M,N = spread over the M deepest MoE layers",
+        {"-nep", "--expert-pool"}, "LIST",
+        "expert pool slot budget (0 = disabled). LIST = one entry per device, comma separated, in\n"
+        "device order; a single entry applies to the FIRST device only:\n"
+        "  N        N slots on that device (0 = that device's pool off)\n"
+        "  M:N      the same budget over that device's deepest M MoE layers\n"
+        "  N=DEV    the entry targets DEV (a device or buffer type name, e.g. CUDA1)\n"
+        "  M:N=DEV  both. a device named twice keeps its first entry; a list longer than the\n"
+        "  devices the pool serves is refused at startup (write M:N for the layer-scoped form)",
         [](common_params & params, const std::string & value) {
-            const std::vector<std::string> parts = string_split<std::string>(value, ',');
-            if (parts.empty() || parts.size() > 2) {
-                throw std::invalid_argument("expert-pool: expected N or M,N");
-            }
+            llama_expert_pool_params & ep = params.expert_pool;
+            ep.n_dev = 0;
 
-            int32_t v[2] = { 0, 0 };
-            for (size_t i = 0; i < parts.size(); ++i) {
-                size_t n_read = 0;
-                if (parts[i].empty()) {
-                    throw std::invalid_argument("expert-pool: empty value in N or M,N");
-                }
+            auto parse_int = [](const std::string & s, const char * what) -> int32_t {
+                size_t  n_read = 0;
+                int32_t v      = 0;
                 try {
-                    v[i] = std::stoi(parts[i], &n_read);
+                    v = std::stoi(s, &n_read);
                 } catch (const std::exception &) {
                     n_read = 0;
                 }
-                if (n_read != parts[i].size() || v[i] < 0) {
-                    throw std::invalid_argument(string_format("expert-pool: '%s' is not a non-negative integer", parts[i].c_str()));
+                if (n_read != s.size() || v < 0) {
+                    throw std::invalid_argument(string_format("expert-pool: '%s' is not a non-negative integer (%s)", s.c_str(), what));
                 }
-            }
+                return v;
+            };
 
-            if (parts.size() == 1) {
-                params.expert_pool.slots  = v[0];
-                params.expert_pool.layers = 0;
-                return;
+            for (const std::string & raw : string_split<std::string>(value, ',')) {
+                if (raw.empty()) {
+                    throw std::invalid_argument("expert-pool: empty entry in the device list");
+                }
+                std::string entry = raw;
+                std::string dev;
+                const size_t eq = entry.find('=');
+                if (eq != std::string::npos) {
+                    dev   = entry.substr(eq + 1);
+                    entry = entry.substr(0, eq);
+                    if (dev.empty() || dev.size() >= LLAMA_EXPERT_POOL_DEV_NAME_LEN) {
+                        throw std::invalid_argument(string_format("expert-pool: '%s' has no usable device name after '='", raw.c_str()));
+                    }
+                }
+                int32_t layers  = 0;
+                std::string slots_s = entry;
+                const size_t colon = entry.find(':');
+                if (colon != std::string::npos) {
+                    layers  = parse_int(entry.substr(0, colon), "layers");
+                    slots_s = entry.substr(colon + 1);
+                }
+                if (ep.n_dev >= LLAMA_EXPERT_POOL_MAX_DEV) {
+                    throw std::invalid_argument(string_format("expert-pool: at most %d device entries", LLAMA_EXPERT_POOL_MAX_DEV));
+                }
+                llama_expert_pool_dev_params & d = ep.dev[ep.n_dev];
+                memset(d.dev, 0, sizeof(d.dev));
+                if (!dev.empty()) {
+                    memcpy(d.dev, dev.c_str(), dev.size());
+                }
+                d.slots  = parse_int(slots_s, "slots");
+                d.layers = layers;
+                ep.n_dev += 1;
             }
-            if (v[1] <= 0) {
-                throw std::invalid_argument("expert-pool: the M,N budget must be greater than zero");
-            }
-            params.expert_pool.slots  = v[1];
-            params.expert_pool.layers = v[0];
+            // the first entry also lands in the legacy single-value fields: the graph gates read
+            // them, and they describe the first device
+            ep.slots  = ep.dev[0].slots;
+            ep.layers = ep.dev[0].layers;
         }
     ));
     add_opt(common_arg(

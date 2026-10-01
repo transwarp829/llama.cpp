@@ -154,12 +154,31 @@ LLAMA_API uint32_t llama_model_get_tok_embd(const struct llama_model * model, fl
 // The pool's knobs (llama_context_params.expert_pool; a null pointer there means
 // "no pool", the default). Start from llama_expert_pool_default_params() - a
 // zeroed struct means a frozen pool, not a default one.
+//
+// The budget is PER DEVICE (one pool per device, nothing shared between them except the
+// rate knobs and the batch-regime threshold): `dev[i]` holds one entry in device order
+// (an empty name means "the i-th device", i.e. the i-th entry of the model's device list,
+// which is the --device order; the pool refuses a list longer than the devices it serves).
+// With n_dev == 0 the legacy single value in `slots` / `layers` applies to the FIRST
+// device only - a multi-device run has to be written out.
+// Entry syntax: comma separates devices, ':' separates the layer scope from the budget.
+#define LLAMA_EXPERT_POOL_MAX_DEV      8
+#define LLAMA_EXPERT_POOL_DEV_NAME_LEN 32
+
+struct llama_expert_pool_dev_params {
+    char    dev[LLAMA_EXPERT_POOL_DEV_NAME_LEN]; // device or buffer type name ("CUDA1"); "" = by position
+    int32_t slots;   // slot budget for that device (0 = that device's pool off)
+    int32_t layers;  // spread the budget over that device's deepest N MoE layers (0 = all eligible)
+};
+
 struct llama_expert_pool_params {
-    int32_t slots;           // slot budget (0 = disabled)
-    int32_t layers;          // spread the budget over the deepest N layers (0 = all eligible)
+    int32_t slots;           // slot budget for the first device (0 = disabled)
+    int32_t layers;          // spread the budget over the deepest N MoE layers (0 = all eligible)
     int32_t swap_cap;        // max expert pairs swapped in per decode step (<= 0 freezes the set)
     int32_t swap_decay;      // decaying activation counter: half-life in decode steps (0 = library default)
     int32_t miss_method;     // how a miss runs: 0 = cpu-serial, 1 = cpu-parallel
+    int32_t n_dev;           // per-device entries below (0 = the single value above, first device)
+    struct llama_expert_pool_dev_params dev[LLAMA_EXPERT_POOL_MAX_DEV];
 };
 
 // swap_cap 40, swap_decay 96, miss_method cpu-serial, everything else off; the
