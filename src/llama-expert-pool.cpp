@@ -2000,16 +2000,11 @@ void llama_expert_pool::expert_pool_cross(int32_t n_tokens) {
     }
     const bool want_whole = n_tokens >= llama_expert_pool_offload_min_batch();
     if (want_whole == st.layout_whole) {
-        // the regime's layout is in place: a later crossing may try again
-        st.layout_tried = -1;
+        // the regime's layout is in place
         return;
     }
-    if ((int8_t) want_whole == st.layout_tried) {
-        // this regime's target was refused once; retrying every batch would cost a
-        // worker join per step for nothing
-        return;
-    }
-    st.layout_tried = (int8_t) want_whole;
+    // a crossing always lands: the budgets are fixed at init, so a relayout cannot refuse
+    // its target and there is nothing to retry
     LLAMA_LOG_INFO_V(LLAMA_LOG_VERBOSITY_INFO, "%s: batch of %d tokens crosses the %d-token threshold: re-laying the pool\n",
             __func__, n_tokens, llama_expert_pool_offload_min_batch());
     expert_pool_relayout(want_whole);

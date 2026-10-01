@@ -171,10 +171,6 @@ struct llama_expert_pool_state {
     // current layout of the pool: true when the pooled layers sit fully resident in
     // expert order (the whole-layer layout), false for the slot cache (partial)
     bool layout_whole = false;
-    // the direction the last crossing asked for (-1 none): a refused target is not
-    // retried until the regime crosses again - the counts only improve as rows arrive,
-    // and re-attempting every batch costs a worker join per step
-    int8_t layout_tried = -1;
 
     // split-head registry, rebuilt per graph build (the builder registers each
     // pooled layer's clean topk ids and the miss chain's first node)
