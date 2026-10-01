@@ -1566,12 +1566,12 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 mount_end = false;
             }
             // split the layer's GPU segment so the mounted chain forms its own split,
-            // submittable right after the layer front: the head (ffn_moe_mount_cur, the
-            // cur prep) and the tail (ffn_moe_mount, the down output) mark the block,
+            // submittable right after the layer front: the head (the cur prep) and the
+            // tail (the mounted down output) carry the roles that mark the block,
             // and everything between them is self-contained (A1-final inputs only), so
             // it is a legal split. GPU segments only - the CPU miss chain must stay one
             // split; gated with the early submit (callback mode keeps the serial shape).
-            if (sched->layer_parallel && !sched->callback_eval && node->name != NULL) {
+            if (sched->layer_parallel && !sched->callback_eval) {
                 const int  node_role     = tensor_role(node);
                 const bool is_mount_head = node_role == GGML_BACKEND_SCHED_ROLE_MOUNT_HEAD;
                 const bool is_mount_tail = node_role == GGML_BACKEND_SCHED_ROLE_MOUNT_TAIL;
