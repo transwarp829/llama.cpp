@@ -683,8 +683,12 @@ void llama_context::sched_reserve() {
     gf_res_prev_active = nullptr;
 
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
-    // the pool owns its state, buffers and worker; the context hands it the handles it needs
-    expert_pool = std::make_unique<llama_expert_pool>(*this, model, cparams, backend_ptrs, backend_buft);
+    // the pool owns its state, buffers and worker; the context hands it the handles it needs.
+    // it is created ONCE per context: a re-reserve must not drop the layout state (a crossing
+    // re-lays the pool and then forces this reserve) nor copy the pool weights again
+    if (expert_pool == nullptr) {
+        expert_pool = std::make_unique<llama_expert_pool>(*this, model, cparams, backend_ptrs, backend_buft);
+    }
     ggml_backend_sched_set_layer_parallel(sched.get(), cparams.expert_pool_miss_method == LLAMA_EXPERT_POOL_MISS_CPU_PARALLEL);
     // serves the pool's statistics and the route observer: with or without a pool
     ggml_backend_sched_set_split_head_observer(sched.get(), llama_expert_pool_observe_split_head, &expert_pool->st);

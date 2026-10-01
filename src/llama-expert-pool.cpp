@@ -1934,13 +1934,9 @@ void llama_expert_pool::expert_pool_relayout(bool whole) {
     }
 
     ctx.synchronize(); // the publish pipeline may still have async copies in flight
-    // the cached previous graph and the scheduler's own state still reference the pool
-    // tensors (their buffers are freed below): drop both, the next reserve rebuilds them
-    for (auto & res : ctx.gf_res_prev) {
-        res.reset();
-    }
-    ctx.gf_res_prev_active = nullptr;
-    ggml_backend_sched_reset(ctx.sched.get());
+    // the cached graphs and the scheduler still reference the pool tensors freed below; both
+    // callers reserve right after this (sched_need_reserve, set at the end of this function),
+    // and sched_reserve() drops the cached graphs and builds a fresh scheduler itself
     release_devs();
     st.resident.assign(model.hparams.n_layer_all, {});
     for (int32_t il : st.pooled_layers) {
@@ -1967,7 +1963,9 @@ void llama_expert_pool::expert_pool_relayout(bool whole) {
 // decision follows the same threshold the scheduler uses to move a miss chain off the CPU.
 void llama_expert_pool::expert_pool_cross(int32_t n_tokens) {
     llama_expert_pool_state & st = this->st;
-    if (!llama_expert_pool_layout_auto() || st.phase == llama_expert_pool_state::PHASE_NONE ||
+    // only a batch the pool has actually served decides the regime: the tiny decodes the
+    // context runs while reserving must not re-lay it before it has served anything
+    if (!llama_expert_pool_layout_auto() || st.phase != llama_expert_pool_state::PHASE_FILLED ||
             st.pooled_layers.empty()) {
         return;
     }
