@@ -1083,14 +1083,11 @@ void llama_expert_pool::expert_pool_init() {
     if (cparams.expert_pool <= 0) {
         return;
     }
-    // one bundle per serving device (grouped below): a layer-split run is dispatched
-    // per device, each with its own weight buffer, tables and mirror. the swap decision
-    // is still taken by ONE worker across all bundles, so the per-step budget is shared
-    // between devices until the per-pool worker lands.
+    // one bundle per serving device (grouped below), each with its own weight buffer, tables,
+    // mirror and swap worker: a layer-split run is dispatched per device
     if (model.n_devices() > 1) {
-        LLAMA_LOG_WARN("%s: %d devices: the pool is dispatched per serving device (one bundle "
-                       "each), but this path is NOT verified on this build (single-GPU host); "
-                       "the per-step swap budget is currently shared between the bundles\n",
+        LLAMA_LOG_WARN("%s: %d devices: the pool runs one bundle and one swap worker per serving "
+                       "device, but this path is NOT verified on this build (single-GPU host)\n",
                 __func__, model.n_devices());
     }
     const int32_t n_layer = model.hparams.n_layer();
