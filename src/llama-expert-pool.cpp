@@ -1285,6 +1285,10 @@ void llama_expert_pool::expert_pool_init() {
 
     // per device: keep (its layers, its deepest M), then its own widths
     const bool    layout_whole = llama_expert_pool_layout_whole();
+    // auto decides by the batch regime, and the first phase is almost always a prefill: it
+    // starts whole and re-lays to partial at the first small batch. seeding the partial
+    // layout here would buy nothing - the first batch would re-lay it away
+    const bool    init_whole   = layout_whole || llama_expert_pool_layout_auto();
     const int32_t min_slots    = llama_expert_pool_min_slots(n_expert);
     std::vector<int32_t> widths(n_layer_all, 0);
     std::vector<int32_t> kept_ils;
@@ -1311,10 +1315,11 @@ void llama_expert_pool::expert_pool_init() {
         if (keep.empty()) {
             continue;
         }
-        if (layout_whole) {
+        if (init_whole) {
             const int32_t n_full = std::min<int32_t>((int32_t) keep.size(), N / n_expert);
             if (n_full <= 0) {
-                LLAMA_LOG_WARN("%s: %s: budget %d is below one full layer (%d experts), its pool stays empty\n",
+                LLAMA_LOG_WARN("%s: %s: budget %d is below one full layer (%d experts): the pool starts empty, "
+                               "the partial layout would spread it\n",
                         __func__, ggml_backend_dev_name(dv_order[b]), N, n_expert);
                 continue;
             }
@@ -1362,12 +1367,12 @@ void llama_expert_pool::expert_pool_init() {
     for (int32_t il : kept_ils) {
         st.pool_flag[il] = 1;
     }
-    st.layout_whole = layout_whole;
+    st.layout_whole = init_whole;
 
     // one bundle per selected device, in the budget order resolved above
     expert_pool_make_devs(sel_dev, sel_layers, sel_slots, sel_scope);
 
-    if (layout_whole) {
+    if (init_whole) {
         // identity slot order: slot s holds expert s, so a fully resident layer's pool
         // tensors are the model's own matrices in its own order and no remap is needed;
         // the width-0 ones stay empty (they have no pool tensors either)
@@ -1881,6 +1886,16 @@ void llama_expert_pool::expert_pool_relayout(bool whole) {
 
     std::vector<std::vector<int32_t>> resident; // indexed by LAYER
     resident.resize(model.hparams.n_layer_all);
+    // the counter-driven pick below needs counts to read; with none (the swap worker is off,
+    // or the whole-layer layout fed no counters since the last build) the partial layout
+    // would come up empty, so those pools take the fixed-seed random set instead
+    bool have_counts = false;
+    for (const float c : st.act_cnt) {
+        if (c > 0.0f) {
+            have_counts = true;
+            break;
+        }
+    }
     for (size_t si = 0; si < sel_dev.size(); ++si) {
         const int32_t N = si < sel_slots.size() ? sel_slots[si] : 0;
         std::vector<int32_t> & ls = sel_layers[si];
@@ -1904,6 +1919,20 @@ void llama_expert_pool::expert_pool_relayout(bool whole) {
                 for (int32_t e = 0; e < n_expert; ++e) {
                     res[e] = e;
                 }
+            }
+        } else if (!have_counts) {
+            // seed like the partial init does: uniform widths, remainder deep, random
+            // experts on the fixed seed (the swap worker then sorts them out)
+            const int32_t wu  = N / P;
+            const int32_t rem = N % P;
+            std::vector<int32_t>              w_all(model.hparams.n_layer_all, 0);
+            std::vector<std::vector<int32_t>> r_all;
+            for (int32_t i = 0; i < P; ++i) {
+                w_all[ls[i]] = std::min<int32_t>(wu + (i >= P - rem ? 1 : 0), n_expert);
+            }
+            llama_expert_pool_random(model.hparams.n_layer_all, n_expert, w_all, r_all);
+            for (int32_t i = 0; i < P; ++i) {
+                resident[ls[i]] = std::move(r_all[ls[i]]);
             }
         } else {
             // uniform widths, the remainder on the DEEP layers of this pool: at the coverage
