@@ -488,22 +488,44 @@ void llama_expert_pool_account_ids(llama_expert_pool_state & st) {
     if (!st.direct_mount || st.pooled_layers.empty() || st.phase != llama_expert_pool_state::PHASE_FILLED) {
         return;
     }
-    // this ubatch is one step: open the windows of its slots and count it in each (the
-    // step boundary the mount path's hook used to detect by the layer order)
-    for (const int32_t s : st.step_slots) {
-        if (s < 0 || s >= LLAMA_MAX_SEQ) {
+    // large batches are served by the scheduler's lane, not by the pool: their rows are
+    // not pool hits. skip them (decided per ubatch by the widest rows tensor - during a
+    // prefill the last layer's ids can come back trimmed) so the reported hit rate and
+    // the slot windows cover the pool's small-batch regime only
+    int32_t n_tok_max = 0;
+    for (size_t ilx = 0; ilx < st.pooled_layers.size(); ++ilx) {
+        const int32_t il = st.pooled_layers[ilx];
+        const ggml_tensor * ids = (size_t) il < st.ids_clean.size() ? st.ids_clean[il] : nullptr;
+        const int32_t n_used = (size_t) il < st.ids_n_used.size() ? st.ids_n_used[il] : 0;
+        if (ids == nullptr || n_used <= 0 || ids->type != GGML_TYPE_I32 || ids->ne[0] <= 0) {
             continue;
         }
-        llama_expert_pool_state::slot_window & w = st.slot_windows[s];
-        if (!w.open.load(std::memory_order_relaxed)) {
-            w.swap_base = st.swap_total.load(std::memory_order_relaxed);
-            w.pairs.store(0, std::memory_order_relaxed);
-            w.steps = 0;
-            w.hit = 0;
-            w.miss = 0;
-            w.open.store(true, std::memory_order_relaxed);
+        const int64_t n_rows = ggml_nelements(ids);
+        if (n_rows <= 0 || n_rows % n_used != 0) {
+            continue;
         }
-        w.steps ++;
+        const int32_t n_tok = (int32_t) (n_rows / n_used);
+        n_tok_max = n_tok > n_tok_max ? n_tok : n_tok_max;
+    }
+    const bool pool_form = n_tok_max < llama_expert_pool_offload_min_batch();
+    if (pool_form) {
+        // this ubatch is one step: open the windows of its slots and count it in each (the
+        // step boundary the mount path's hook used to detect by the layer order)
+        for (const int32_t s : st.step_slots) {
+            if (s < 0 || s >= LLAMA_MAX_SEQ) {
+                continue;
+            }
+            llama_expert_pool_state::slot_window & w = st.slot_windows[s];
+            if (!w.open.load(std::memory_order_relaxed)) {
+                w.swap_base = st.swap_total.load(std::memory_order_relaxed);
+                w.pairs.store(0, std::memory_order_relaxed);
+                w.steps = 0;
+                w.hit = 0;
+                w.miss = 0;
+                w.open.store(true, std::memory_order_relaxed);
+            }
+            w.steps ++;
+        }
     }
 
     bool any = false;
@@ -539,7 +561,7 @@ void llama_expert_pool_account_ids(llama_expert_pool_state & st) {
         const int32_t di       = st.dev_of(il);
         const int32_t pub      = di >= 0 ? st.devs[di]->mirror_pub.load(std::memory_order_acquire) : -1;
         const bool have_mirror = di >= 0 && pub >= 0 && pub < 3 && !st.devs[di]->mirror[pub].empty();
-        if (have_mirror && !st.resident[il].empty()) {
+        if (pool_form && have_mirror && !st.resident[il].empty()) {
             const size_t n_half = (size_t) st.n_expert * st.layers.size();
             const int32_t * inv = st.devs[di]->mirror[pub].data() + n_half + (size_t) il * st.n_expert;
             uint64_t row_hit  = 0;
