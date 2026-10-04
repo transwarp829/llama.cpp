@@ -226,9 +226,13 @@ Two more numbers worth knowing before tuning:
   hold the model's layout, and the pool requires host-visible buffers, so such layers
   are skipped with a per-layer warning. Reading the raw bytes from the GGUF file offsets
   (as some third-party caches do) would lift that; it is not implemented.
-- The pool needs host-resident experts (`-cmoe`); it also needs exactly one device -
-  with more than one device the pool disables itself and logs a warning (per-device
-  pools are not *yet* implemented).
+- The pool needs host-resident experts (`-cmoe`). With more than one serving device
+  it keeps one bundle and one swap worker per device, with per-device budgets and
+  layer routing (see `-nep LIST` above); layer split only - upstream turns pipeline
+  parallelism off under `-cmoe`, tensor split is refused for most MoE architectures,
+  and META devices are not accepted as pool targets. This multi-device path is not
+  yet exercised on a real multi-GPU host in this build: the startup log warns about
+  it.
 - Layers whose attention runs on the CPU are not pooled, and the pool cannot reach
   them: the resident chain lives on the device and takes the layer's FFN input right
   after the device-side front segment, so a CPU layer would need an extra H2D of that
