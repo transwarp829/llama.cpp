@@ -2004,7 +2004,7 @@ void llama_expert_pool::expert_pool_relayout(bool whole) {
             (int) sel_dev.size(), tot_slots);
 }
 
-// the layout follows the batch regime (GGML_EXPPOOL_LAYOUT=auto): at or above the
+// the layout follows the batch regime (the default, GGML_EXPPOOL_LAYOUT): at or above the
 // offload threshold the whole-layer layout serves the batch, below it the partial one.
 // only a batch that lands on the other side re-lays the pool; the same-side batches just
 // run. the caller passes the tokens this batch will actually hand to one graph, so the

@@ -47,12 +47,18 @@ inline int32_t llama_expert_pool_min_slots(int32_t n_expert) {
     return (n_expert + 99) / 100;
 }
 
-// whole-layer layout (experiment, GGML_EXPPOOL_LAYOUT=whole): every pooled layer is
-// either fully resident in the model's own expert order (identity slots) or not
-// pooled at all - a fully resident layer then runs the plain path over the pool's
-// matrices, so the batch regime that cannot use routing locality pays no dual-chain
-// tax at all. the layer set and the budget keep their -nep meaning (the budget still
-// picks how many layers can be covered), so the resident bytes match the budget.
+// the resident layout, GGML_EXPPOOL_LAYOUT. the default follows the batch regime: a
+// batch at or above the offload threshold runs the whole-layer layout, below it the
+// partial one, and only a batch that crosses the threshold re-lays the pool.
+// "partial" pins the partial layout (the pool stays in place and never re-lays);
+// "whole" pins the whole-layer layout - both are A/B values.
+
+// whole-layer form: every pooled layer is either fully resident in the model's own
+// expert order (identity slots) or not pooled at all - a fully resident layer then
+// runs the plain path over the pool's matrices, so the batch regime that cannot use
+// routing locality pays no dual-chain tax at all. the layer set and the budget keep
+// their -nep meaning (the budget still picks how many layers can be covered), so the
+// resident bytes match the budget.
 inline bool llama_expert_pool_layout_whole() {
     static const bool v = [] {
         const char * s = getenv("GGML_EXPPOOL_LAYOUT");
@@ -61,14 +67,11 @@ inline bool llama_expert_pool_layout_whole() {
     return v;
 }
 
-// the layout follows the batch regime (GGML_EXPPOOL_LAYOUT=auto): a batch at or above
-// the offload threshold runs the whole-layer layout, below it the partial one, and only
-// a batch that crosses the threshold re-lays the pool. the static values above/below
-// stay for the A/B arms.
+// default on: only a pinned static form (whole|partial) turns the crossing off
 inline bool llama_expert_pool_layout_auto() {
     static const bool v = [] {
         const char * s = getenv("GGML_EXPPOOL_LAYOUT");
-        return s != nullptr && std::string(s) == "auto";
+        return s == nullptr || std::string(s) == "auto";
     }();
     return v;
 }

@@ -113,10 +113,12 @@ bundle 0: CUDA0, 16 layer(s), 1024 slots (-nep)
 bundle 1: CUDA1, 14 layer(s), 2048 slots (-nep)
 ```
 
-Debug/env switches (all off by default, all no-ops when unset):
+Env switches (`GGML_EXPPOOL_LAYOUT` picks the resident layout; the rest are debug
+switches, off by default and no-ops when unset):
 
 | env | effect |
 |---|---|
+| `GGML_EXPPOOL_LAYOUT={partial,whole}` | pin a static resident layout. The default follows the batch regime: a batch at or above the MoE offload threshold runs the whole-layer form, below it the partial form, and only a crossing batch re-lays the pool. `partial` pins the partial form (the pool stays in place and never re-lays); `whole` pins the whole-layer form - both for A/B and debugging |
 | `GGML_EXPPOOL_ROUTING_LOG=<path>` | per-step, per-layer routing rows as csv (written by `llama-step-profiler`) |
 | `GGML_EXPPOOL_STAGE_LOG=1` | print the expert count/bytes actually staged per node |
 | `GGML_SCHED_SANITIZE=1` | scheduler async-race sanitizer (vendored from upstream) |
@@ -193,7 +195,9 @@ is rule 5 of the ladder above.
 Prompt processing: the pool is a **decode** accelerator; prefill never drives the
 design and the only bar it must clear is "not worse than plain `-cmoe`". The pool is
 active at prefill too (the resident experts come from the pool, only the non-residents
-take the staging lane). Measured on gemma4 at 37k prompt tokens: `-cmoe` 3459 t/s,
+take the staging lane; with the default layout a large batch runs the whole-layer form
+instead, see the layout switch above). Measured on gemma4 at 37k prompt tokens (pinned
+`partial` form): `-cmoe` 3459 t/s,
 equal-VRAM `-ncmoe` 4632 t/s, pool 4063-4103 t/s - so the pool is 17.5% ahead of
 `-cmoe` and 12.6% behind `-ncmoe`, with decode unchanged (54.8 / 70.1 t/s for the
 frozen / swapping arms). The gap to `-ncmoe` is the shape tax of the dual-chain
