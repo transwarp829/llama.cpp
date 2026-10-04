@@ -10,7 +10,6 @@
 
 #include "ggml-backend.h"
 #include "ggml-backend-impl.h"
-#include "ggml-backend-sanitize.h"
 #include "ggml-alloc.h"
 #include "ggml-impl.h"
 
@@ -259,7 +258,6 @@ void ggml_backend_buffer_free(ggml_backend_buffer_t buffer) {
         return;
     }
 
-    ggml_san_buffer_free(buffer);
 
     if (buffer->iface.free_buffer != NULL) {
         buffer->iface.free_buffer(buffer);
@@ -361,8 +359,6 @@ bool ggml_backend_buffer_copy_tensor(const struct ggml_tensor * src, struct ggml
     if (dst_buf->iface.cpy_tensor) {
         const bool copied = dst_buf->iface.cpy_tensor(dst_buf, src, dst);
         if (copied) {
-            ggml_san_access(NULL, src, 0, ggml_nbytes(src), false, "buffer_copy_tensor src");
-            ggml_san_access(NULL, dst, 0, ggml_nbytes(dst), true,  "buffer_copy_tensor dst");
         }
         return copied;
     }
@@ -420,7 +416,6 @@ void ggml_backend_tensor_set_async(ggml_backend_t backend, struct ggml_tensor * 
         ggml_backend_synchronize(backend);
         ggml_backend_tensor_set(tensor, data, offset, size);
     } else {
-        ggml_san_access(backend, tensor, offset, size, true, "set_async");
         backend->iface.set_tensor_async(backend, tensor, data, offset, size);
     }
 }
@@ -435,7 +430,6 @@ void ggml_backend_tensor_get_async(ggml_backend_t backend, const struct ggml_ten
         ggml_backend_synchronize(backend);
         ggml_backend_tensor_get(tensor, data, offset, size);
     } else {
-        ggml_san_access(backend, tensor, offset, size, false, "get_async");
         backend->iface.get_tensor_async(backend, tensor, data, offset, size);
     }
 }
@@ -459,7 +453,6 @@ void ggml_backend_tensor_set_2d_async(ggml_backend_t backend, struct ggml_tensor
     GGML_ASSERT(tensor->data != NULL && "tensor not allocated");
     GGML_ASSERT(offset + (n_copies-1)*stride_tensor + size <= ggml_nbytes(tensor) && "tensor write out of bounds");
     for (size_t i = 0; i < n_copies; i++) {
-        ggml_san_access(backend, tensor, offset + i*stride_tensor, size, true, "set_2d_async");
     }
     backend->iface.set_tensor_2d_async(backend, tensor, data, offset, size, n_copies, stride_tensor, stride_data);
 }
@@ -483,7 +476,6 @@ void ggml_backend_tensor_get_2d_async(ggml_backend_t backend, const struct ggml_
     GGML_ASSERT(tensor->data != NULL && "tensor not allocated");
     GGML_ASSERT(offset + (n_copies-1)*stride_tensor + size <= ggml_nbytes(tensor) && "tensor read out of bounds");
     for (size_t i = 0; i < n_copies; i++) {
-        ggml_san_access(backend, tensor, offset + i*stride_tensor, size, false, "get_2d_async");
     }
     backend->iface.get_tensor_2d_async(backend, tensor, data, offset, size, n_copies, stride_tensor, stride_data);
 }
@@ -500,7 +492,6 @@ void ggml_backend_tensor_set(struct ggml_tensor * tensor, const void * data, siz
     GGML_ASSERT(tensor->data != NULL && "tensor not allocated");
     GGML_ASSERT(offset + size <= ggml_nbytes(tensor) && "tensor write out of bounds");
 
-    ggml_san_access(NULL, tensor, offset, size, true, "tensor_set");
     buf->iface.set_tensor(buf, tensor, data, offset, size);
 }
 
@@ -516,7 +507,6 @@ void ggml_backend_tensor_get(const struct ggml_tensor * tensor, void * data, siz
     GGML_ASSERT(tensor->data != NULL && "tensor not allocated");
     GGML_ASSERT(offset + size <= ggml_nbytes(tensor) && "tensor read out of bounds");
 
-    ggml_san_access(NULL, tensor, offset, size, false, "tensor_get");
     buf->iface.get_tensor(buf, tensor, data, offset, size);
 }
 
@@ -540,7 +530,6 @@ void ggml_backend_tensor_set_2d(struct ggml_tensor * tensor, const void * data, 
     GGML_ASSERT(offset + (n_copies-1)*stride_tensor + size <= ggml_nbytes(tensor) && "tensor write out of bounds");
 
     for (size_t i = 0; i < n_copies; i++) {
-        ggml_san_access(NULL, tensor, offset + i*stride_tensor, size, true, "tensor_set_2d");
     }
     buf->iface.set_tensor_2d(buf, tensor, data, offset, size, n_copies, stride_tensor, stride_data);
 }
@@ -565,7 +554,6 @@ void ggml_backend_tensor_get_2d(const struct ggml_tensor * tensor, void * data, 
     GGML_ASSERT(offset + (n_copies-1)*stride_tensor + size <= ggml_nbytes(tensor) && "tensor read out of bounds");
 
     for (size_t i = 0; i < n_copies; i++) {
-        ggml_san_access(NULL, tensor, offset + i*stride_tensor, size, false, "tensor_get_2d");
     }
     buf->iface.get_tensor_2d(buf, tensor, data, offset, size, n_copies, stride_tensor, stride_data);
 }
@@ -583,7 +571,6 @@ void ggml_backend_tensor_memset(struct ggml_tensor * tensor, uint8_t value, size
     GGML_ASSERT(offset + size <= ggml_nbytes(tensor) && "tensor write out of bounds");
     GGML_ASSERT(buf->iface.memset_tensor != NULL && "memset not implemented by backend buffer");
 
-    ggml_san_access(NULL, tensor, offset, size, true, "tensor_memset");
     buf->iface.memset_tensor(buf, tensor, value, offset, size);
 }
 
@@ -594,7 +581,6 @@ void ggml_backend_synchronize(ggml_backend_t backend) {
     }
 
     backend->iface.synchronize(backend);
-    ggml_san_sync(backend);
 }
 
 ggml_backend_graph_plan_t ggml_backend_graph_plan_create(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
@@ -628,7 +614,6 @@ enum ggml_status ggml_backend_graph_compute_async(ggml_backend_t backend, struct
     GGML_ASSERT(backend);
     const enum ggml_status status = backend->iface.graph_compute(backend, cgraph);
     if (status == GGML_STATUS_SUCCESS) {
-        ggml_san_compute(backend, cgraph);
     }
     return status;
 }
@@ -689,7 +674,6 @@ void ggml_backend_tensor_copy_async(ggml_backend_t backend_src, ggml_backend_t b
     if (backend_dst->iface.cpy_tensor_async != NULL) {
         const bool accepted = backend_dst->iface.cpy_tensor_async(backend_src, backend_dst, src, dst);
         if (accepted) {
-            ggml_san_cpy_async(backend_src, backend_dst, src, dst);
             return;
         }
     }
@@ -723,7 +707,6 @@ void ggml_backend_event_record(ggml_backend_event_t event, ggml_backend_t backen
     GGML_ASSERT(backend->iface.event_record != NULL);
 
     backend->iface.event_record(backend, event);
-    ggml_san_event_record(event, backend);
 }
 
 void ggml_backend_event_synchronize(ggml_backend_event_t event) {
@@ -731,7 +714,6 @@ void ggml_backend_event_synchronize(ggml_backend_event_t event) {
     GGML_ASSERT(event->device->iface.event_synchronize);
 
     event->device->iface.event_synchronize(event->device, event);
-    ggml_san_event_sync(event);
 }
 
 void ggml_backend_event_wait(ggml_backend_t backend, ggml_backend_event_t event) {
@@ -739,7 +721,6 @@ void ggml_backend_event_wait(ggml_backend_t backend, ggml_backend_event_t event)
     GGML_ASSERT(backend->iface.event_wait != NULL);
 
     backend->iface.event_wait(backend, event);
-    ggml_san_event_wait(backend, event);
 }
 
 static void ggml_backend_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * cgraph, struct ggml_backend_graph_optimize_params * params) {
@@ -1030,7 +1011,7 @@ struct ggml_backend_sched {
     ggml_backend_sched_split_head_fn obs_split_head    = nullptr;
     void *                           obs_split_head_ud = nullptr;
 
-    // the anchor split's end mark (layer-parallel): recorded before the mount chain is submitted, so the anchor's immediate successor can wait for the front alone instead of waiting for the whole stream (the timeline probe reads the same mark)
+    // the anchor split's end mark (layer-parallel): recorded before the mount chain is submitted, so the anchor's immediate successor can wait for the front alone instead of waiting for the whole stream
     ggml_backend_event_t anchor_event = nullptr;
     ggml_backend_t anchor_be = nullptr;
     bool anchor_valid = false;
@@ -2019,22 +2000,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
 
-    // split timeline probe (GGML_SCHED_TIMELINE_CSV): per split enter/inputs/submit us
-    static FILE * tl_fp = nullptr;
-    static int64_t tl_step = -1;
-    static const bool tl_on = getenv("GGML_SCHED_TIMELINE_CSV") != nullptr;
-    if (tl_on && tl_fp == nullptr) {
-        tl_fp = fopen(getenv("GGML_SCHED_TIMELINE_CSV"), "w");
-        if (tl_fp) {
-            fprintf(tl_fp, "step,split,backend,enter_us,inputs_us,submit_us,idsready_us,anchorend_us\n");
-        }
-    }
     // a new graph compute: the previous step's anchor mark is stale
     sched->anchor_valid = false;
     sched->anchor_split = -1;
-    if (tl_on && tl_fp != nullptr) {
-        tl_step++;
-    }
 
     ggml_tensor * prev_ids_tensor = nullptr;
     std::vector<int32_t> ids;
@@ -2046,11 +2014,6 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
-        const int64_t tl_t0 = tl_on && tl_fp ? ggml_time_us() : 0;
-    // true-wait probe stamps, taken at the ids fetch (0 = no fetch on this split, not a
-    // wait sample)
-        int64_t tl_idsready_us = 0;
-        int64_t tl_anchorend_us = 0;
 
         // ensure the previous split's async work has completed before we start
         // this split, the allocator may have reused buffer regions across splits
@@ -2067,7 +2030,6 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         // a split submitted ahead already has its inputs copied - the copy section is skipped
         const bool pre_submitted = sched->layer_parallel && split->submitted_early;
 
-        ggml_san_split(split_id, split_backend, split->n_inputs);
 
         // copy the input tensors to the split backend
         for (int input_id = 0; input_id < split->n_inputs && !pre_submitted; input_id++) {
@@ -2126,17 +2088,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     if (ids_tensor != prev_ids_tensor) {
                         ids.resize(ggml_nbytes(ids_tensor) / sizeof(int32_t));
                         ggml_backend_tensor_get_async(ids_backend, ids_tensor, ids.data(), 0, ggml_nbytes(ids_tensor));
-                        // true-wait probe: the host's real dependency point (topk ids in hand);
-                        // the anchor precedes on the same stream, so syncing its end mark
-                        // returns no later
-                        if (tl_on && tl_fp && sched->anchor_valid && ids_backend == sched->anchor_be) {
-                            ggml_backend_event_synchronize(sched->anchor_event);
-                            tl_anchorend_us = ggml_time_us();
-                        }
                         ggml_backend_synchronize(ids_backend);
-                        if (tl_on && tl_fp && ids_backend->iface.synchronize != NULL) {
-                            tl_idsready_us = ggml_time_us();
-                        }
 
                         // find the used experts
                         used_ids.clear();
@@ -2177,17 +2129,6 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         id++;
                     }
 
-                    // probe (GGML_EXPPOOL_STAGE_LOG): staged experts/bytes per node - verifies
-                    // that the pool's -1 mask shrinks the copied volume
-                    if (getenv("GGML_EXPPOOL_STAGE_LOG") != nullptr) {
-                        int n_used = 0;
-                        for (int e = 0; e < n_expert; e++) {
-                            n_used += ggml_bitset_get(used_ids.data(), e) ? 1 : 0;
-                        }
-                        fprintf(stderr, "exppool_stage: %s T=%lld used=%d all_skip=%d bytes=%lld\n",
-                                node->name ? node->name : "?", (long long) node->ne[2], n_used, n_used == 0 ? 1 : 0,
-                                (long long) n_used * (long long) expert_size);
-                    }
                     if (id >= n_expert) {
                     // all columns skipped (fully resident used set): the mmid reads no weight
                     // row - skip the copy
@@ -2220,7 +2161,6 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     if (split_backend->iface.cpy_tensor_async) {
                         cpy_async_ok = split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy);
                         if (cpy_async_ok) {
-                            ggml_san_cpy_async(input_backend, split_backend, input, input_cpy);
                         }
                     }
                     if (!cpy_async_ok) {
@@ -2231,20 +2171,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             split_backend_id == sched->n_backends - 1;
                         if (anchor_wait) {
                             ggml_backend_event_synchronize(sched->anchor_event);
-                            if (tl_on && tl_fp) {
-                                tl_anchorend_us = ggml_time_us();
-                            }
                         } else {
-                        // true-wait probe: the host-blocking drain of the producer stream (the
-                        // CPU backend has no cpy_tensor_async); stamp only real syncs
-                            if (tl_on && tl_fp && sched->anchor_valid && input_backend == sched->anchor_be) {
-                                ggml_backend_event_synchronize(sched->anchor_event);
-                                tl_anchorend_us = ggml_time_us();
-                            }
                             ggml_backend_synchronize(input_backend);
-                        }
-                        if (tl_on && tl_fp && input_backend->iface.synchronize != NULL) {
-                            tl_idsready_us = ggml_time_us();
                         }
                         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                             ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
@@ -2273,7 +2201,6 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
             GGML_LOG_DEBUG("sched_split #%03d %-8s n=%d%s\n", split_id, ggml_backend_name(split_backend), n, nbuf);
         }
-        const int64_t t1 = tl_on && tl_fp ? ggml_time_us() : 0;
         if (!sched->callback_eval) {
             if (sched->layer_parallel && split->submitted_early) {
             // already submitted (with its input copies) by the previous split
@@ -2281,15 +2208,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             const int64_t t0 = ggml_time_us();
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
-                ggml_san_split(-1, NULL, 0);
                 return ec;
-            }
-            if (tl_on && tl_fp) {
-                fprintf(tl_fp, "%lld,%d,%s,%lld,%lld,%lld,%lld,%lld\n",
-                        (long long) tl_step, split_id, ggml_backend_name(split_backend),
-                        (long long) tl_t0, (long long) t1, (long long) ggml_time_us(),
-                        (long long) tl_idsready_us, (long long) tl_anchorend_us);
-                fflush(tl_fp);
             }
         // record this split's completion on the backend's stream (no host block; other
         // splits wait device-side)
@@ -2439,7 +2358,6 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                 enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &gv);
                 if (ec != GGML_STATUS_SUCCESS) {
-                    ggml_san_split(-1, NULL, 0);
                     return ec;
                 }
 
@@ -2462,7 +2380,6 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         prev_backend_id = split_backend_id;
     }
 
-    ggml_san_split(-1, NULL, 0);
 
     return GGML_STATUS_SUCCESS;
 }

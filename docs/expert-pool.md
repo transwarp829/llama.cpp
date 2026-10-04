@@ -113,15 +113,11 @@ bundle 0: CUDA0, 16 layer(s), 1024 slots (-nep)
 bundle 1: CUDA1, 14 layer(s), 2048 slots (-nep)
 ```
 
-Env switches (`GGML_EXPPOOL_LAYOUT` picks the resident layout; the rest are debug
-switches, off by default and no-ops when unset):
+Env switches (`GGML_EXPPOOL_LAYOUT` pins the resident layout):
 
 | env | effect |
 |---|---|
 | `GGML_EXPPOOL_LAYOUT={partial,whole}` | pin a static resident layout. The default follows the batch regime: a batch at or above the MoE offload threshold runs the whole-layer form, below it the partial form, and only a crossing batch re-lays the pool - the first re-lay waits until a large batch has gone through, so the warmup run and the setup decodes never decide. `partial` pins the partial form (the pool stays in place and never re-lays); `whole` pins the whole-layer form - both for A/B and debugging |
-| `GGML_EXPPOOL_ROUTING_LOG=<path>` | per-step, per-layer routing rows as csv (written by `llama-step-profiler`) |
-| `GGML_EXPPOOL_STAGE_LOG=1` | print the expert count/bytes actually staged per node |
-| `GGML_SCHED_SANITIZE=1` | scheduler async-race sanitizer (vendored from upstream) |
 
 ## How it runs
 
@@ -170,8 +166,8 @@ The resident set is refreshed by a worker thread running an **aging LFU** policy
    is built.
 
 Reporting: `llama-server` prints one line per request (the steps this slot took part
-in, and the average swap count over that window); `llama-step-profiler` prints the
-pool-level line. Other tools run the pool without printing its statistics.
+in, and the average swap count over that window). Other tools run the pool without
+printing its statistics.
 
 ## Measured
 
@@ -263,11 +259,7 @@ Two more numbers worth knowing before tuning:
 
 ## See also
 
-- `tools/step-profiler` - per-step decode walls + the pool/routing capture used for
-  the measurements above (fork-only tool).
 - `tools/cli/README.md`, `tools/server/README.md`, `tools/completion/README.md` - the
   pool flags listed next to the other MoE offload options.
-- Fork-side debug instruments: the scheduler race sanitizer (`GGML_SCHED_SANITIZE`,
-  vendored from upstream PR 26167, Aman Gupta) and the in-tree `llama-step-profiler`.
-  Segment-level timing is read from the tree's own `GGML_SCHED_DEBUG=2` print
+- Segment-level timing is read from the tree's own `GGML_SCHED_DEBUG=2` print
   (`sched_split #k: <backend> nodes [a,b) <head> X.XXX ms`; adds ~20-50 us/split).

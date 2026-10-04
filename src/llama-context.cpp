@@ -3822,8 +3822,8 @@ void llama_context::opt_epoch(
     llama_batch_free(batch);
 }
 
-// the sched eval-callback is a user-facing hook (used by step-profiler); the pool's
-// routing capture rides the split-head observer instead
+// the sched eval-callback is a user-facing hook; the pool's routing capture rides
+// the split-head observer instead
 //
 // interface implementation
 //
