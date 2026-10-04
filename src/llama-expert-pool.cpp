@@ -58,6 +58,7 @@ void llama_expert_pool_state::reset() {
 
     swap_auto = false;
     hook_step = 0;
+    prefill_seen = false;
     act_cnt.clear();
     swap_total.store(0);
     step_slots.clear();
@@ -508,6 +509,11 @@ void llama_expert_pool_account_ids(llama_expert_pool_state & st) {
         n_tok_max = n_tok > n_tok_max ? n_tok : n_tok_max;
     }
     const bool pool_form = n_tok_max < llama_expert_pool_offload_min_batch();
+    if (!pool_form) {
+        // a batch the lane serves: the prefill regime has begun, so the batch sizes may
+        // decide the layout from here on
+        st.prefill_seen = true;
+    }
     if (pool_form) {
         // this ubatch is one step: open the windows of its slots and count it in each (the
         // step boundary the mount path's hook used to detect by the layer order)
@@ -2011,10 +2017,11 @@ void llama_expert_pool::expert_pool_relayout(bool whole) {
 // decision follows the same threshold the scheduler uses to move a miss chain off the CPU.
 void llama_expert_pool::expert_pool_cross(int32_t n_tokens) {
     llama_expert_pool_state & st = this->st;
-    // only a batch the pool has actually served decides the regime: the tiny decodes the
-    // context runs while reserving must not re-lay it before it has served anything
+    // the first down-cross waits for a prefill batch: the setup decodes (the seq-rm probe
+    // and the warmup run) arrive below the threshold and would otherwise pull the pool
+    // off its whole-layer start before the first real batch, paying a re-lay twice
     if (!llama_expert_pool_layout_auto() || st.phase != llama_expert_pool_state::PHASE_FILLED ||
-            st.pooled_layers.empty()) {
+            st.pooled_layers.empty() || !st.prefill_seen) {
         return;
     }
     const bool want_whole = n_tokens >= llama_expert_pool_offload_min_batch();

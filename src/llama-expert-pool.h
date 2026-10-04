@@ -212,6 +212,9 @@ struct llama_expert_pool_state {
     int32_t n_expert = 0;                  // experts per layer (set at init)
     // step counter (only the worker owns the counters below)
     int32_t hook_step = 0;
+    // a batch at or above the offload threshold has been served: until then the layout
+    // keeps its whole-layer start (the setup decodes must not decide the regime)
+    bool prefill_seen = false;
 
     struct route_block {
         int32_t step = 0;                  // decode step this row belongs to

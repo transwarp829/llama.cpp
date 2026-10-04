@@ -118,7 +118,7 @@ switches, off by default and no-ops when unset):
 
 | env | effect |
 |---|---|
-| `GGML_EXPPOOL_LAYOUT={partial,whole}` | pin a static resident layout. The default follows the batch regime: a batch at or above the MoE offload threshold runs the whole-layer form, below it the partial form, and only a crossing batch re-lays the pool. `partial` pins the partial form (the pool stays in place and never re-lays); `whole` pins the whole-layer form - both for A/B and debugging |
+| `GGML_EXPPOOL_LAYOUT={partial,whole}` | pin a static resident layout. The default follows the batch regime: a batch at or above the MoE offload threshold runs the whole-layer form, below it the partial form, and only a crossing batch re-lays the pool - the first re-lay waits until a large batch has gone through, so the warmup run and the setup decodes never decide. `partial` pins the partial form (the pool stays in place and never re-lays); `whole` pins the whole-layer form - both for A/B and debugging |
 | `GGML_EXPPOOL_ROUTING_LOG=<path>` | per-step, per-layer routing rows as csv (written by `llama-step-profiler`) |
 | `GGML_EXPPOOL_STAGE_LOG=1` | print the expert count/bytes actually staged per node |
 | `GGML_SCHED_SANITIZE=1` | scheduler async-race sanitizer (vendored from upstream) |
