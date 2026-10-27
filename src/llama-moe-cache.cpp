@@ -1513,13 +1513,17 @@ static void pool_rank_layer(llama_expert_pool_state & st, int32_t il) {
 }
 
 // the two sides of a pair, merged off the cached ends: the hottest candidate and the coldest victim of
-// the group. ties follow the smaller key, like the single scans this replaces
+// the group. a free slot is a victim of heat 0, so it comes before any resident and evicts nothing; its
+// index rides out in `slot_free`, and `key_out` stays -1 for it. ties follow the smaller key, like the
+// single scans this replaces
 static bool pool_rank_pair(llama_expert_pool_state & st, size_t ai,
-                           int32_t & key_in, float & cnt_in, int32_t & key_out, float & cnt_out) {
-    key_in  = -1;
-    cnt_in  = 0.0f;
-    key_out = -1;
-    cnt_out = 0.0f;
+                           int32_t & key_in, float & cnt_in, int32_t & key_out, float & cnt_out,
+                           int32_t & slot_free) {
+    key_in    = -1;
+    cnt_in    = 0.0f;
+    key_out   = -1;
+    cnt_out   = 0.0f;
+    slot_free = -1;
     if (st.ids_cnt_per_token.empty() || ai >= st.groups.size() || st.plan_taken.empty() || st.rank.empty()) {
         return false;
     }
@@ -1540,30 +1544,16 @@ static bool pool_rank_pair(llama_expert_pool_state & st, size_t ai,
             cnt_out = rk.vict_rate;
         }
     }
-    return key_in >= 0 && cnt_in > 0.0f && key_out >= 0; // a spent counter is no candidate
-}
-
-// the hottest candidate of the group, off the cached ends
-static bool pool_rank_cand(llama_expert_pool_state & st, size_t ai, int32_t & key_out, float & cnt_out) {
-    key_out = -1;
-    cnt_out = 0.0f;
-    if (st.ids_cnt_per_token.empty() || ai >= st.groups.size() || st.plan_taken.empty() || st.rank.empty()) {
-        return false;
+    if (key_in < 0 || cnt_in <= 0.0f) {
+        return false; // a spent counter is no candidate
     }
-    for (int32_t il : st.groups[ai].layers) {
-        if (st.layers[il].form != llama_expert_pool_layer::FORM_CHAIN) {
-            continue; // not in the index
-        }
-        if (st.rank[(size_t) il].dirty) {
-            pool_rank_layer(st, il);
-        }
-        const llama_expert_pool_state::layer_rank & rk = st.rank[(size_t) il];
-        if (rk.cand >= 0 && (key_out < 0 || rk.cand_rate > cnt_out || (rk.cand_rate == cnt_out && rk.cand < key_out))) {
-            key_out = rk.cand;
-            cnt_out = rk.cand_rate;
-        }
+    slot_free = llama_expert_group_alloc(st, ai);
+    if (slot_free >= 0) {
+        key_out = -1;   // nothing is evicted
+        cnt_out = 0.0f; // a free slot reads as heat 0
+        return true;
     }
-    return key_out >= 0 && cnt_out > 0.0f; // a spent counter is no candidate
+    return key_out >= 0;
 }
 
 static void pool_admit(llama_expert_pool_state & st, llama_expert_pool_state::pool_dev & d, int32_t key, int32_t slot);
@@ -1581,36 +1571,28 @@ static int32_t pool_plan_rank(llama_expert_pool_state & st, llama_expert_pool_st
         n_fill += 1;
     };
 
-    // free slots first: the hottest candidates take them, nothing is evicted
+    // one rank for free slots and residents alike: a free slot is a victim of heat 0, so it is taken
+    // before any resident can be evicted, and the margin follows from the same comparison
     for (;;) {
-        const int32_t slot = llama_expert_group_alloc(st, ai);
-        if (slot < 0) {
-            break;
-        }
-        int32_t key_in = -1;
-        float   cnt_in = 0.0f;
-        if (!pool_rank_cand(st, ai, key_in, cnt_in)) {
-            break;
-        }
-        admit(key_in, slot);
-    }
-    // the rank pairs: the next hottest candidate against the next coldest resident, only while the candidate is hotter
-    for (;;) {
-        int32_t key_in  = -1;
-        float   cnt_in  = 0.0f;
-        int32_t key_out = -1;
-        float   cnt_out = 0.0f;
-        if (!pool_rank_pair(st, ai, key_in, cnt_in, key_out, cnt_out)) {
+        int32_t key_in   = -1;
+        float   cnt_in   = 0.0f;
+        int32_t key_out  = -1;
+        float   cnt_out  = 0.0f;
+        int32_t slot_free = -1;
+        if (!pool_rank_pair(st, ai, key_in, cnt_in, key_out, cnt_out, slot_free)) {
             break;
         }
         if (!(cnt_in - cnt_out > st.plan_margin * cnt_in)) {
             break;
         }
-        st.plan_taken[(size_t) key_out] = 1; // evicted: it must not come back as a candidate
-        st.rank_consumed.push_back(key_out / n_expert);
-        const int32_t slot = st.slot_of[key_out];
-        st.slot_of[key_out] = -1;
-        slot_map_mark(st, key_out / n_expert);
+        int32_t slot = slot_free;
+        if (key_out >= 0) {
+            st.plan_taken[(size_t) key_out] = 1; // evicted: it must not come back as a candidate
+            st.rank_consumed.push_back(key_out / n_expert);
+            slot = st.slot_of[key_out];
+            st.slot_of[key_out] = -1;
+            slot_map_mark(st, key_out / n_expert);
+        }
         admit(key_in, slot);
     }
     slot_map_publish(st);
