@@ -255,7 +255,7 @@ public:
     uint32_t graph_max_nodes(uint32_t n_tokens) const;
 
     // print-and-reset the pool segment (public API support)
-    void expert_pool_finalize(int32_t id_slot);
+    void expert_pool_finalize();
 
 
     // can reuse the llm_graph_result instance of the context (for example to update a memory module)

@@ -369,7 +369,7 @@ struct llama_expert_pool {
     void release_devs();
     void expert_pool_release();
     // report and reset the pool's segment; the slot id is kept for the API
-    void expert_pool_finalize(int32_t id_slot);
+    void expert_pool_finalize();
     void expert_pool_relayout(bool whole);
     void expert_pool_cross(int32_t n_tokens);
 

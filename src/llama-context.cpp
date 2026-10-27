@@ -1930,6 +1930,12 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         return -1;
     }
 
+    // a batch whose first token sits at position 0 opens a new prompt: report and reset the pool's
+    // segment window here, so the numbers stay per prompt for every embedder and not only for ours
+    if (expert_pool != nullptr && batch_inp.tokens[0].pos[0] == 0) {
+        expert_pool->expert_pool_finalize();
+    }
+
     if (batch_inp.n_embd > 0 && batch_inp.n_embd != batch_inp.n_embd_inp) {
         LLAMA_LOG_ERROR("%s: embd row width %zu does not match the decoder input %zu\n",
                 __func__, batch_inp.n_embd, batch_inp.n_embd_inp);
@@ -4842,16 +4848,8 @@ llama_context * llama_get_ctx_other(struct llama_context * ctx) {
 }
 
 
-void llama_context::expert_pool_finalize(int32_t id_slot) {
+void llama_context::expert_pool_finalize() {
     if (expert_pool != nullptr) {
-        expert_pool->expert_pool_finalize(id_slot);
+        expert_pool->expert_pool_finalize();
     }
-}
-
-
-void llama_expert_pool_finalize(struct llama_context * ctx, int32_t id_slot) {
-    if (ctx == nullptr) {
-        return;
-    }
-    ctx->expert_pool_finalize(id_slot);
 }

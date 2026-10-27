@@ -2611,7 +2611,7 @@ static void pool_report(llama_expert_pool_state & st) {
     st.seg_large = {};
 }
 
-void llama_expert_pool::expert_pool_finalize(int32_t) {
+void llama_expert_pool::expert_pool_finalize() {
     llama_expert_pool_state & st = this->st;
     if (st.seg.hit + st.seg.miss + st.seg_large.hit + st.seg_large.miss == 0) {
         return;

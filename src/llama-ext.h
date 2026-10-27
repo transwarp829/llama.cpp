@@ -216,11 +216,3 @@ struct llama_expert_pool_params {
 // swap on (fill_cap > 0), cnt_decay 128 layer ticks, miss_method cpu-parallel, everything else off; the
 // struct must outlive the context's first reserve, like the other pointer args.
 LLAMA_API struct llama_expert_pool_params llama_expert_pool_default_params(void);
-
-//
-// expert pool: segment accounting (fork-private)
-
-// end of a generation segment: print the accumulated hit rate at info verbosity and reset
-// the segment counters (call once after the decode loop). the report is segment-scoped; the
-// slot id is kept for the API and is not used.
-LLAMA_API void llama_expert_pool_finalize(struct llama_context * ctx, int32_t id_slot);
