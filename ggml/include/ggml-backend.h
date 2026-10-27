@@ -317,13 +317,13 @@ extern "C" {
     //
     typedef bool (*ggml_backend_sched_eval_callback)(struct ggml_tensor * t, bool ask, void * user_data);
 
-    // Callback while copying input weights of a split
-    // if the user returns false the scheduler simply copies the entire weight
-    // the callback is called only for input weights in host buffers
-    // the callback is called after all non-weight inputs of the split have been copied
+    // Callback while copying the inputs of a split, except for the user inputs
+    // if the user returns false the scheduler copies the input
     // `src` is the tensor in the previous split
     // `dst` is the copy of `src` in the split
     // `graph` is the compute graph of the split
+    // if the callback returns true the input must be in `dst` when the split runs
+    // copies the callback issues must be ordered after the work queued on the split backend
     typedef bool (*ggml_backend_sched_copy_callback)(ggml_backend_t backend, const struct ggml_tensor * src, struct ggml_tensor * dst, struct ggml_cgraph * graph, void * user_data);
 
     // Callback when the buffers reserved for a graph are not sufficient and have to be reserved again
@@ -374,7 +374,18 @@ extern "C" {
 
     // Set a callback to be called when the inputs weights of a split are being copied
     GGML_API void                 ggml_backend_sched_set_copy_callback(ggml_backend_sched_t sched, ggml_backend_sched_copy_callback callback, void * user_data);
+    // Copy the inputs of the CPU splits while the previous split computes: the scheduler cuts the
+    // device split at the last producer of these inputs, stages them in host memory and waits the
+    // copies before the CPU split's head runs. The device split keeps computing meanwhile.
+    GGML_API void                 ggml_backend_sched_set_early_cpu_inputs(ggml_backend_sched_t sched, bool enable);
 
+    // The host copy of the input that the scheduler staged for the split it hands to the observer,
+    // NULL if the input was not staged. The data is complete when the observer is called.
+    GGML_API struct ggml_tensor * ggml_backend_sched_get_early_input(ggml_backend_sched_t sched, const struct ggml_tensor * input);
+    // fork-private observer: the sched reports every split's head node (and its backend)
+    // right before the split runs; the expert pool is the consumer (matched by pointer).
+    typedef void (*ggml_backend_sched_split_head_fn)(void * user_data, struct ggml_tensor * head, struct ggml_backend * backend);
+    GGML_API void                 ggml_backend_sched_set_split_head_observer(ggml_backend_sched_t sched, ggml_backend_sched_split_head_fn fn, void * user_data);
     // Set a callback to be called when the compute buffers of a graph are being reallocated
     GGML_API void                 ggml_backend_sched_set_realloc_callback(ggml_backend_sched_t sched, ggml_backend_sched_realloc_callback callback, void * user_data);
 
