@@ -1985,7 +1985,7 @@ void llama_expert_pool::expert_pool_init() {
     // FFN input after a device segment, which those blocks do not have
     std::vector<int32_t> pooled_ils;
     // pooling stays opt-in: without a host-placement override there is no chain to build
-    if (model.params.tensor_buft_overrides != nullptr) {
+    if (model.get_params().tensor_buft_overrides != nullptr) {
         for (const moe_cache_layer & e : moe_cache_eligible_layers(model, il_end, /*warn=*/true, __func__)) {
             pooled_ils.push_back(e.il);
         }

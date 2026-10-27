@@ -3,7 +3,6 @@
 #include "llama-impl.h"
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
-#include "ggml-backend.h"
 
 void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
 
@@ -933,7 +932,7 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         const auto * model_other = llama_get_model(cparams.ctx_other);
 
         GGML_ASSERT(model_other->tok_embd != nullptr && "DFlash decoder requires the target model's token embeddings");
-        tok_embd = model.borrow_tensor(model_other->tok_embd);
+        tok_embd = model_other->tok_embd;
     }
 
     ggml_tensor * inp_tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
@@ -1067,14 +1066,8 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         GGML_ASSERT(cparams.ctx_other != nullptr);
         const auto * model_other = llama_get_model(cparams.ctx_other);
         GGML_ASSERT(model_other->output != nullptr && "DFlash decoder requires the target model's output projection");
-        // the target's lm_head may live in a buffer this draft context cannot
-        // route (e.g. a CPU-only draft: -devd none); borrow_tensor then hands
-        // out a host copy. its companion scale is borrowed too: for the models
-        // in play that tensor is absent (borrow_tensor(nullptr) returns null),
-        // so this is the same as the old direct reference, and an arch that
-        // does carry output.scale stays correct instead of losing it.
-        output   = model.borrow_tensor(model_other->output);
-        output_s = model.borrow_tensor(model_other->output_s);
+        output   = model_other->output;
+        output_s = model_other->output_s;
     }
 
     cur = build_lora_mm(output, cur, output_s);
@@ -1187,7 +1180,7 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llama_model & model, const llm_
         const auto * model_other = llama_get_model(cparams.ctx_other);
 
         GGML_ASSERT(model_other->tok_embd != nullptr && "DSpark decoder requires the target model's token embeddings");
-        tok_embd = model.borrow_tensor(model_other->tok_embd);
+        tok_embd = model_other->tok_embd;
     }
 
     auto inp = std::make_unique<llm_graph_input_embd>(n_embd);
@@ -1282,10 +1275,8 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llama_model & model, const llm_
         GGML_ASSERT(cparams.ctx_other != nullptr);
         const auto * model_other = llama_get_model(cparams.ctx_other);
         GGML_ASSERT(model_other->output != nullptr && "DSpark decoder requires the target model's output projection");
-        // see the DFlash path above: host copy when this context cannot route
-        // the target's buffer, companion scale included
-        output   = model.borrow_tensor(model_other->output);
-        output_s = model.borrow_tensor(model_other->output_s);
+        output   = model_other->output;
+        output_s = model_other->output_s;
     }
 
     cur = build_lora_mm(output, cur, output_s);
