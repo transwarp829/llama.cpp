@@ -100,6 +100,8 @@ struct llama_cross {
 };
 
 struct llm_graph_params;
+struct llama_expert_pool_state;
+struct llama_expert_pool_layer;
 
 //
 // llm_graph_input
@@ -809,6 +811,9 @@ struct llm_graph_params {
 
     const llama_prec_policy * prec_policy = nullptr;
 
+    // expert pool of the owning context (may be null); hit-chain builds read
+    // their per-layer hit_chains from here (one pool per context)
+    const llama_expert_pool_state * expert_pool = nullptr;
     const llama_hadamard * hdmd = nullptr;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
@@ -1067,6 +1072,8 @@ struct llm_graph_context {
 
     const llama_prec_policy * prec_policy;
 
+    // expert pool of the owning context (may be null)
+    const llama_expert_pool_state * expert_pool;
     const llama_hadamard * hdmd;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
@@ -1125,6 +1132,19 @@ struct llm_graph_context {
     // keep both individual values and Q8 activation block sums within F16 range
     llm_graph_amax_src1 build_amax_src1_f16(
               ggml_tensor * cur) const;
+
+    // the scale half of build_lora_mm_id: reshape -> repeat -> get_rows -> mul, with the
+    // lookup riding its own ids. the pooled chains carry -1 in their ids (the skip
+    // mask), which get_rows cannot index, so the scale is looked up on the clean topk
+    // rows; the ops, the shapes and the position right after the matmul stay upstream's,
+    // so a backend fusion keyed on the (matmul -> scale lookup -> mul) pattern still
+    // matches.
+    static ggml_tensor * moe_scale_mul(
+            ggml_context * ctx,
+            ggml_tensor * res,
+            ggml_tensor * w_s,
+            ggml_tensor * ids_scale,
+            int64_t       n_tokens);
 
     ggml_tensor * build_norm(
              ggml_tensor * cur,
@@ -1223,7 +1243,15 @@ struct llm_graph_context {
              ggml_tensor * down_exps_s = nullptr,
              ggml_tensor * selected_experts_in = nullptr,
              ggml_tensor * post_exp_norm = nullptr,
-                   float   post_exp_norm_eps = 1e-5f) const;
+                   float   post_exp_norm_eps = 1e-5f,
+             ggml_tensor * chain_weights_in = nullptr,
+             // the pooled chains read their per-expert tables through ids of their own:
+             // the scale lookup needs indexable rows (the clean topk - a multiplication
+             // is 0-safe), while the bias lookup rides the chain's own masked ids, which
+             // add_id's -1 pass-through keeps exact. null keeps the table ids the caller
+             // supplied.
+             ggml_tensor * ids_for_scale_in = nullptr,
+                     bool   chain_only = false) const;
 
     // the slots of the selected experts in the MoE cache, nullptr if the experts of the layer are not read from the cache
     ggml_tensor * build_moe_cache_slots(
@@ -1233,6 +1261,35 @@ struct llm_graph_context {
              ggml_tensor * down_exps,
              ggml_tensor * gate_up_exps,
                      int   il) const;
+
+    // what a pooled layer hands its two chains: the tables, the ids each chain reads, and the
+    // 2D input the hit chain is built from. empty for a layer the pool does not serve
+    struct expert_pool_chain {
+        const llama_expert_pool_layer *     layer     = nullptr; // its tables, scales and form
+        ggml_tensor *                       ids_remap     = nullptr; // clean ids through the pool remap (hit chain)
+        ggml_tensor *                       ids_for_scale = nullptr; // clean ids for the scale lookups
+        ggml_tensor *                       cur_hit_in    = nullptr; // the 2D input of the hit chain
+        ggml_tensor *                       ids_miss      = nullptr; // inverse remap through the miss chain
+    };
+    // the pool's merge: the two chains' columns are disjoint, so one add is exact; the weights then apply
+    // once, on the merged result
+    ggml_tensor * build_expert_pool_merge(
+            ggml_tensor * experts,
+            ggml_tensor * hit_out,
+            ggml_tensor * weights,
+                    bool   weight_before_ffn,
+                     int   il) const;
+
+    expert_pool_chain build_expert_pool_chain(
+                 int   il,
+         ggml_tensor * cur,
+         ggml_tensor * selected_experts,
+             int64_t   n_expert,
+             int64_t   n_expert_used,
+         ggml_tensor * ids_for_scale_in,
+         ggml_tensor * & up_exps_s,
+         ggml_tensor * & gate_exps_s,
+         ggml_tensor * & down_exps_s) const;
 
     //
     // inputs

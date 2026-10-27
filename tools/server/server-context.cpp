@@ -18,6 +18,7 @@
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
+#include "llama-ext.h" // fork-private ext API (expert pool segment stats)
 #include "mtmd.h"
 #include "mtmd-helper.h"
 #include "base64.hpp"
@@ -792,6 +793,13 @@ struct server_slot {
         }
 
         common_speculative_print_stats(spec);
+
+        // expert pool: print-and-reset this slot's segment window (the steps it
+        // took part in); the draft context has no pool
+        llama_expert_pool_finalize(ctx_tgt, id);
+        if (ctx_dft != nullptr) {
+            llama_expert_pool_finalize(ctx_dft, id);
+        }
     }
 
     json to_json(bool only_metrics = false) const {

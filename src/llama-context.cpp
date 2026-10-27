@@ -1,6 +1,7 @@
 #include "llama-context.h"
 
 #include "ggml.h"
+#include "ggml-cpu.h"
 #include "llama-arch.h"
 #include "llama-graph.h"
 #include "llama-impl.h"
@@ -14,8 +15,10 @@
 #include "llama-sampler.h"
 #include "llama.h"
 
+#include <algorithm>
 #include <cinttypes>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -233,6 +236,26 @@ llama_context::llama_context(
     cparams.cb_eval           = params.cb_eval;
     cparams.cb_eval_user_data = params.cb_eval_user_data;
 
+    // fork-private expert pool knobs (llama-ext.h); a null pointer keeps the defaults (pool off).
+    // the budget and the layer set are the MoE cache's own parameters (--moe-cache-mib and
+    // --moe-cache-layers), so the pool reads them from cparams directly
+    const llama_expert_pool_params ep = params.expert_pool != nullptr
+        ? *params.expert_pool : llama_expert_pool_default_params();
+    cparams.expert_pool_fill_cap   = ep.fill_cap;
+    cparams.expert_pool_cnt_decay  = ep.cnt_decay;
+    cparams.expert_pool_miss_method= ep.miss_method;
+    cparams.moe_cache_size_dev.assign(ep.size_dev, ep.size_dev + (ep.n_dev > 0 ? ep.n_dev : 0));
+    cparams.moe_cache_layers.assign(ep.layers, ep.layers + (ep.n_dev > 0 ? ep.n_dev : 0));
+    // `expert_pool` is the boolean proxy for "is a pool configured?" (the graph gates read it);
+    // every budget comes from moe_cache_size_dev
+    cparams.expert_pool = 0;
+    for (const size_t b : cparams.moe_cache_size_dev) {
+        if (b > 0) {
+            cparams.expert_pool = 1;
+            break;
+        }
+    }
+
     cparams.ctx_other = nullptr;
 
     // TODO: more generic
@@ -369,6 +392,17 @@ llama_context::llama_context(
     cparams.op_offload     = params.op_offload;
     cparams.kv_unified     = params.kv_unified;
     cparams.moe_cache_size = params.moe_cache_size;
+
+    // the pool's worker and the cache's copy callback are exclusive: a pool with cpu misses
+    // owns the fills, a cache/gpu miss path keeps the callback
+    const llama_expert_pool_miss_strategy miss_strategy_c =
+        llama_expert_pool_miss_strategy_of(cparams.expert_pool_miss_method);
+    if (!miss_strategy_c.pool_active) {
+        cparams.expert_pool = 0;
+    } else if (cparams.moe_cache_size > 0) {
+        LLAMA_LOG_WARN("%s: the MoE cache and the expert pool exclude each other, using the pool\n", __func__);
+        cparams.moe_cache_size = 0;
+    }
 
     // initialized later
     cparams.pipeline_parallel = false;
@@ -559,8 +593,11 @@ llama_context::llama_context(
             LLAMA_LOG_INFO("%s: pipeline parallelism enabled\n", __func__);
         }
 
-        if (cparams.moe_cache_size > 0) {
-            moe_cache = std::make_unique<llama_moe_cache>(model, model.no_alloc(), backend_ptrs, backend_buft, cparams.moe_cache_size);
+        // the mechanism: ONE object holds the pool's own arrangements and the MoE cache's device path. it is
+        // created here because the reserve below reads it; the budget configures it either way and the miss
+        // method only says how a miss is computed
+        if (expert_pool == nullptr) {
+            expert_pool = std::make_unique<llama_expert_pool>(*this, model, cparams, backend_ptrs, backend_buft);
         }
 
         sched_reserve();
@@ -605,6 +642,16 @@ llama_context::~llama_context() {
         }
     }
     ggml_opt_free(opt_ctx);
+
+    // release the scheduler BEFORE the pool buffers: its CUDA graph cache references
+    // the pool tensors, which the frees below would invalidate (use-after-free at exit)
+    sched.reset();
+
+    // stop the swap worker and free the pool (single teardown owner; the worker's
+    // sync tensor_set calls reference the pool tensors)
+    if (expert_pool != nullptr) {
+        expert_pool->expert_pool_release();
+    }
 }
 
 void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint32_t n_seqs) {
@@ -627,7 +674,7 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
                 continue;
             }
 
-            GGML_ASSERT(node.il >= 0);
+            if (node.il < 0) { continue; }
 
             ggml_backend_t backend_fused = ggml_backend_sched_get_tensor_backend(sched.get(), node.tensor);
             ggml_backend_dev_t device_fused = backend_fused ? ggml_backend_get_device(backend_fused) : nullptr;
@@ -756,6 +803,30 @@ void llama_context::sched_reserve() {
     gf_res_prev_active = nullptr;
 
     sched_new(max_nodes, cparams.pipeline_parallel);
+    // the pool owns its state, buffers and worker; the context hands it the handles it needs.
+    // it is created ONCE per context: a re-reserve must not drop the layout state (a crossing
+    // re-lays the pool and then forces this reserve) nor copy the pool weights again
+    // the three miss methods are peers; this run's takes one of them. a method that is not the
+    // pool's leaves it inert: its object is still built (the graph params and the fill/accounting
+    // hooks hold its state by reference), but the slot sums stay 0, so no dual chain is taken
+    const llama_expert_pool_miss_strategy miss_strategy =
+        llama_expert_pool_miss_strategy_of(cparams.expert_pool_miss_method);
+    if (!miss_strategy.pool_active) {
+        cparams.expert_pool = 0;
+    }
+    if (expert_pool == nullptr) {
+        expert_pool = std::make_unique<llama_expert_pool>(*this, model, cparams, backend_ptrs, backend_buft);
+    }
+    ggml_backend_sched_set_early_cpu_inputs(sched.get(), miss_strategy.layer_parallel);
+    // serves the pool's statistics and the route observer: with or without a pool
+    ggml_backend_sched_set_split_head_observer(sched.get(), llama_expert_pool_observe_split_head, &expert_pool->st);
+    expert_pool->st.sched = sched.get();
+
+    expert_pool->expert_pool_init();
+    if (expert_pool->st.phase == llama_expert_pool_state::PHASE_NONE) {
+        // no usable budget: the graph must take the plain path, not a disabled pool
+        cparams.expert_pool = 0;
+    }
 
     llama_memory_context_ptr mctx;
     if (memory) {
@@ -795,6 +866,10 @@ void llama_context::sched_reserve() {
                 LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
                 cparams.pipeline_parallel = false;
                 sched_new(max_nodes, false);
+                ggml_backend_sched_set_early_cpu_inputs(sched.get(), llama_expert_pool_miss_strategy_of(cparams.expert_pool_miss_method).layer_parallel);
+                // serves the pool's statistics and the route observer: with or without a pool
+                ggml_backend_sched_set_split_head_observer(sched.get(), llama_expert_pool_observe_split_head, &expert_pool->st);
+    expert_pool->st.sched = sched.get();
                 gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
             }
             if (!gf) {
@@ -1573,6 +1648,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
 
         gf_res_prev_active = res;
+
+        // first graph allocation places the model weight tensors: fill the pool now
+        expert_pool->expert_pool_fill();
     }
 
     // set the input data for the input tensors
@@ -1591,6 +1669,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         ret = status;
         return nullptr;
     }
+
+    // the fully resident layers' routing rows arrive here, once per ubatch: their plain
+    // path has no observed split head, so the pool reads the registered copy instead
+    llama_expert_pool_account_ids(expert_pool->st);
 
     ret = GGML_STATUS_SUCCESS;
 
@@ -1640,6 +1722,7 @@ int llama_context::encode(const llama_batch_ext & batch_inp) {
         t_compute_start_us = ggml_time_us();
     }
 
+    expert_pool->expert_pool_cross((int32_t) std::min<uint32_t>(n_tokens, cparams.n_ubatch));
     sched_reserve();
 
     n_queued_tokens += n_tokens;
@@ -1930,6 +2013,9 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     output_swaps.clear();
     embd_batch_idxs.clear();
 
+    // the pool's layout follows the batch regime: a batch that crosses the offload
+    // threshold re-lays the pool before it runs (LLAMA_EXPERT_POOL_LAYOUT=auto)
+    expert_pool->expert_pool_cross((int32_t) std::min<uint32_t>(n_tokens_all, cparams.n_ubatch));
     sched_reserve();
 
     bool did_optimize = false;
@@ -2678,7 +2764,7 @@ ggml_cgraph * llama_context::graph_reserve(
 
     // check the graph before scheduling: cross-backend copies break the producer chain that the check follows
     if (!hadamard_verified && gf && (!model.hdmd.rot.empty() || !model.hdmd.inv.empty())) {
-        llama_verify_hadamard_graph(gf, model.hdmd.rot, model.hdmd.inv, moe_cache.get());
+        llama_verify_hadamard_graph(gf, model.hdmd.rot, model.hdmd.inv, moe_cache());
         hadamard_verified = true;
     }
 
@@ -2718,8 +2804,9 @@ llm_graph_params llama_context::graph_params(
         /*.loras       =*/ loras.get(),
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
-        /*.moe_cache   =*/ moe_cache.get(),
+        /*.moe_cache   =*/ expert_pool->moe_cache(),
         /*.prec_policy =*/ &model.prec_policy,
+        /*.expert_pool =*/ &expert_pool->st,
         /*.hdmd        =*/ model.hdmd.rot.empty() ? nullptr : &model.hdmd,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
@@ -2781,8 +2868,9 @@ ggml_status llama_context::graph_compute(
 bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data) {
     auto * lctx = static_cast<llama_context *>(user_data);
 
-    // the slot maps of the MoE cache
-    if (lctx->moe_cache && lctx->moe_cache->copy(backend, src, dst, graph)) {
+    // the slot maps of the MoE cache (the mechanism's device path)
+    llama_moe_cache * const cache = lctx->moe_cache();
+    if (cache != nullptr && cache->copy(backend, src, dst, graph)) {
         return true;
     }
 
@@ -2814,6 +2902,11 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
         for (int64_t i1 = 0; i1 < ids->ne[1]; i1++) {
             for (int64_t i0 = 0; i0 < ids->ne[0]; i0++) {
                 const int32_t id = st.ids_data[i1*ids->nb[1]/sizeof(int32_t) + i0*ids->nb[0]/sizeof(int32_t)];
+                if (id == -1) {
+                    // skipped column (the pool's -1 remap): the kernel zeroes it -
+                    // no weight range needed
+                    continue;
+                }
                 GGML_ASSERT(id >= 0 && id < n_expert);
                 st.used[id] = true;
             }
@@ -2835,8 +2928,9 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
 
         // the experts in the MoE cache are copied from device memory, the others are uploaded
         int64_t next = first;
-        for (int64_t e = first; e <= last && lctx->moe_cache; ) {
-            const int64_t n = lctx->moe_cache->copy_experts(backend, src, dst, e, last);
+        llama_moe_cache * const cache = lctx->moe_cache();
+        for (int64_t e = first; e <= last && cache != nullptr; ) {
+            const int64_t n = cache->copy_experts(backend, src, dst, e, last);
             if (n == 0) {
                 e++;
                 continue;
@@ -3726,8 +3820,15 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
             ret[buft].context += size;
         }
     }
-    if (moe_cache) {
-        for (const auto & [buft, size] : moe_cache->memory_breakdown()) {
+    if (moe_cache() != nullptr) {
+        for (const auto & [buft, size] : moe_cache()->memory_breakdown()) {
+            ret[buft].context += size;
+        }
+    }
+    if (expert_pool) {
+        // the pool's weight copies and routing tables are context-owned device memory:
+        // counted here so the fit estimate (common/fit.cpp) leaves room for them
+        for (const auto & [buft, size] : expert_pool->memory_breakdown()) {
             ret[buft].context += size;
         }
     }
@@ -3988,6 +4089,8 @@ void llama_context::opt_epoch(
     llama_batch_free(batch);
 }
 
+// the sched eval-callback is a user-facing hook (the fork's out-of-tree step profiler
+// uses it); the pool's routing capture rides the split-head observer instead
 //
 // interface implementation
 //
@@ -4032,6 +4135,7 @@ llama_context_params llama_context_default_params() {
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,
+        /*.expert_pool                 =*/ nullptr,
     };
 
     return result;
@@ -4735,4 +4839,19 @@ llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * c
 
 llama_context * llama_get_ctx_other(struct llama_context * ctx) {
     return ctx->get_cparams().ctx_other;
+}
+
+
+void llama_context::expert_pool_finalize(int32_t id_slot) {
+    if (expert_pool != nullptr) {
+        expert_pool->expert_pool_finalize(id_slot);
+    }
+}
+
+
+void llama_expert_pool_finalize(struct llama_context * ctx, int32_t id_slot) {
+    if (ctx == nullptr) {
+        return;
+    }
+    ctx->expert_pool_finalize(id_slot);
 }

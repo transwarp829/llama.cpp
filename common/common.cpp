@@ -12,6 +12,7 @@
 #include "llama.h"
 #include "sampling.h"
 #include "speculative.h"
+#include "../src/llama-ext.h" // fork-private ext API (verbosity-explicit logging)
 #include "unicode.h"
 
 #include <algorithm>
@@ -1734,7 +1735,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     return mparams;
 }
 
-struct llama_context_params common_context_params_to_llama(const common_params & params) {
+struct llama_context_params common_context_params_to_llama(common_params & params) {
     auto cparams = llama_context_default_params();
 
     cparams.n_ctx             = params.n_ctx;
@@ -1766,6 +1767,9 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.op_offload        = !params.no_op_offload;
     cparams.swa_full          = params.swa_full;
     cparams.kv_unified        = params.kv_unified;
+    // fork-private expert pool knobs: point the context params at the caller's struct
+    // (it outlives the ctx)
+    cparams.expert_pool = &params.expert_pool;
 
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;

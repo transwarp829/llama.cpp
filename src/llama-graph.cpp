@@ -1581,6 +1581,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     cross            (params.cross),
     moe_cache        (params.moe_cache),
     prec_policy      (params.prec_policy),
+    expert_pool      (params.expert_pool),
     hdmd             (params.hdmd),
     samplers         (params.samplers),
     cb_func          (params.cb),
@@ -1711,6 +1712,19 @@ llm_graph_amax_src1 llm_graph_context::build_amax_src1_f16(
     };
 
     return result;
+}
+
+// the scale half of build_lora_mm_id: identical ops, shapes and position (right after
+// the matmul), so a backend fusion keyed on the (matmul -> scale lookup -> mul) pattern
+// still matches. only the lookup ids differ: the pooled chains carry the -1 skip mask,
+// which get_rows cannot index, so the lookup rides the clean topk rows instead.
+ggml_tensor * llm_graph_context::moe_scale_mul(
+        ggml_context * ctx, ggml_tensor * res, ggml_tensor * w_s, ggml_tensor * ids_scale, int64_t n_tokens) {
+    const int64_t n_expert = w_s->ne[0];
+    ggml_tensor * s = ggml_reshape_3d(ctx, w_s, 1, n_expert, 1);
+    s = ggml_repeat_4d(ctx, s, 1, n_expert, n_tokens, 1);
+    s = ggml_get_rows(ctx, s, ids_scale);
+    return ggml_mul(ctx, res, s);
 }
 
 ggml_tensor * llm_graph_context::build_lora_mm_id(
@@ -2193,7 +2207,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         down_exps_s,
         selected_experts_in,
         post_exp_norm,
-        post_exp_norm_eps
+        post_exp_norm_eps,
+        /* chain_weights_in */ nullptr,
+        /* ids_for_scale_in */ nullptr,
+        /* chain_only       */ false
     );
 }
 
@@ -2223,14 +2240,56 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * down_exps_s,
          ggml_tensor * selected_experts_in,
          ggml_tensor * post_exp_norm,
-               float   post_exp_norm_eps) const {
+               float   post_exp_norm_eps,
+         ggml_tensor * chain_weights_in,
+         ggml_tensor * ids_for_scale_in,
+                 bool   chain_only) const {
     const int64_t n_embd   = cur->ne[0];
     const int64_t n_tokens = cur->ne[1];
     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
 
-    ggml_tensor * logits = nullptr;
+    // expert-pool hit-chain mode (chain_only): the caller supplies the ids and the
+    // routing weights, so the routing section is skipped and the chain below
+    // is built exactly as the main graph would - every variant inherited.
+    ggml_tensor * selected_experts = selected_experts_in;
 
-    if (probs_in == nullptr) {
+    ggml_tensor * logits = nullptr;
+    ggml_tensor * weights = nullptr;
+    ggml_tensor * hit_out  = nullptr; // hit-chain GPU chain result (weighted)
+    ggml_tensor * hit_ids_cpu = nullptr; // inverse-remap ids for the CPU chain
+    ggml_tensor * cur_hit_in = nullptr; // 2D cur for the hit chain (built at the end)
+    const llama_expert_pool_layer * pool_layer_p = nullptr; // hit-chain operands
+    ggml_tensor * ids_remap = nullptr; // remapped expert ids (pool chain), GPU segment
+    ggml_tensor * ids_for_scale = ids_for_scale_in; // the scale lookups ride these ids
+
+    // whole-layer layout: a layer that is fully resident in expert order runs the plain
+    // path over the pool's copies of the model's matrices - the rest of this function is
+    // then the no-pool graph node for node, only the weight addresses change
+    if (!chain_only && expert_pool != nullptr && cparams.expert_pool > 0 && il >= 0) {
+        const llama_expert_pool_layer & lyr = expert_pool->layers[il];
+        if (lyr.form == llama_expert_pool_layer::FORM_PLAIN) {
+            up_exps        = lyr.pool[PK_UP]        != nullptr ? lyr.pool[PK_UP]        : up_exps;
+            gate_exps      = lyr.pool[PK_GATE]      != nullptr ? lyr.pool[PK_GATE]      : gate_exps;
+            down_exps      = lyr.pool[PK_DOWN]      != nullptr ? lyr.pool[PK_DOWN]      : down_exps;
+            gate_up_exps   = lyr.pool[PK_GATE_UP]   != nullptr ? lyr.pool[PK_GATE_UP]   : gate_up_exps;
+            up_exps_b      = lyr.pool[PK_UP_B]      != nullptr ? lyr.pool[PK_UP_B]      : up_exps_b;
+            gate_exps_b    = lyr.pool[PK_GATE_B]    != nullptr ? lyr.pool[PK_GATE_B]    : gate_exps_b;
+            down_exps_b    = lyr.pool[PK_DOWN_B]    != nullptr ? lyr.pool[PK_DOWN_B]    : down_exps_b;
+            gate_up_exps_b = lyr.pool[PK_GATE_UP_B] != nullptr ? lyr.pool[PK_GATE_UP_B] : gate_up_exps_b;
+            up_exps_s      = lyr.scale_up    != nullptr ? lyr.scale_up    : up_exps_s;
+            gate_exps_s    = lyr.scale_gate  != nullptr ? lyr.scale_gate  : gate_exps_s;
+            down_exps_s    = lyr.scale       != nullptr ? lyr.scale       : down_exps_s;
+        }
+    }
+
+    // the experts of host-resident layers may be read from the MoE cache. the declaration sits
+    // at the function level so the shared tail below can see it, but the fill stays where
+    // upstream does it (right after the weights expansion, inside the !chain_only path): the
+    // chain-only hit chain is the pool's own and never reads the cache
+    ggml_tensor * slots = nullptr;
+
+    if (!chain_only) {
+        if (probs_in == nullptr) {
         logits = build_lora_mm(gate_inp, cur); // [n_expert, n_tokens]
         if (gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS) {
             ggml_prec_set_acc(logits, GGML_PREC_F32);
@@ -2238,6 +2297,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(logits, "ffn_moe_logits", il);
     } else {
         logits = probs_in;
+        // models that compute the router themselves hand the logits in: that
+        // node is the layer-front anchor for the early submit as well
     }
 
     if (gate_inp_b) {
@@ -2313,7 +2374,6 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     }
 
     // select experts
-    ggml_tensor * selected_experts = selected_experts_in;
     if (selected_experts == nullptr) {
         selected_experts = ggml_argsort_top_k(ctx0, selection_probs, n_expert_used); // [n_expert_used, n_tokens]
         cb(selected_experts->src[0], "ffn_moe_argsort", il);
@@ -2329,7 +2389,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         probs = ggml_reshape_3d(ctx0, probs, 1, n_expert, n_tokens);
     }
 
-    ggml_tensor * weights = ggml_get_rows(ctx0, probs, selected_experts); // [1, n_expert_used, n_tokens]
+    weights = ggml_get_rows(ctx0, probs, selected_experts); // [1, n_expert_used, n_tokens]
     cb(weights, "ffn_moe_weights", il);
 
 
@@ -2368,10 +2428,50 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     //call early so that topk-moe can be used
     ggml_build_forward_expand(gf, weights);
 
-    // the experts of host-resident layers may be read from the MoE cache
-    ggml_tensor * slots = build_moe_cache_slots(selected_experts, up_exps, gate_exps, down_exps, gate_up_exps, il);
+    // the experts of host-resident layers may be read from the MoE cache (upstream's spot)
+    slots = build_moe_cache_slots(selected_experts, up_exps, gate_exps, down_exps, gate_up_exps, il);
+
+    // expert-pool hit chain: the ids, the tables and the operand overrides this layer needs.
+    // the chain itself is built by re-entering this function with the pool weights (chain_only),
+    // so every model variant is inherited rather than re-implemented; the -1 skip ids split the
+    // columns by construction, so one add merges the two chains.
+    const expert_pool_chain pool_chain = build_expert_pool_chain(il, cur, selected_experts,
+            n_expert, n_expert_used, ids_for_scale_in, up_exps_s, gate_exps_s, down_exps_s);
+    ids_remap     = pool_chain.ids_remap;
+    ids_for_scale = pool_chain.ids_for_scale;
+    cur_hit_in    = pool_chain.cur_hit_in;
+    pool_layer_p  = pool_chain.layer;
+    hit_ids_cpu   = pool_chain.ids_miss;
+
+    }
+
+
+    if (chain_weights_in != nullptr) {
+        // the hit chain (chain_only) skipped the routing section, so take the
+        // miss chain's weights
+        weights = chain_weights_in;
+    }
+    if (hit_ids_cpu != nullptr) {
+        // the CPU chain reads the inverse remap: resident columns are -1 (zeroed natively)
+        selected_experts = hit_ids_cpu;
+    }
+    // the per-expert bias lookups ride the chain's own ids - slot ids for the hit_chain
+    // chain (its bias tables are slot-compact, moving with the weights), the masked
+    // inverse remap for the miss chain (the model's own bias tensors). add_id's -1
+    // pass-through keeps the other chain's columns at zero, so no extra ids are
+    // needed here; only the scale lookup, which get_rows must index, needs its own.
 
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
+    if (chain_only) {
+        // hit chain block head marker: the scheduler splits the GPU segment here so
+        // the hit block becomes its own split, submitted right after the layer front
+        cb(cur, "ffn_moe_hit_cur", il);
+        // the pool's resident matmul: the fills this layer's window launched must be in before this
+        // split runs (the copies hide in the CPU segment above it)
+        if (expert_pool != nullptr && cparams.expert_pool > 0) {
+            llama_expert_pool_bind_mount_head(*expert_pool, il, cur);
+        }
+    }
 
     if (weight_before_ffn) {
         // repeat cur to [n_embd, n_expert_used, n_tokens]
@@ -2385,9 +2485,18 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     if (gate_up_exps) {
         // merged gate_up path: one mul_mat_id, then split into gate and up views
-        ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, selected_experts, up_exps_s, slots); // [n_ff*2, n_expert_used, n_tokens]
+        ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, selected_experts, nullptr, slots); // [n_ff*2, n_expert_used, n_tokens]
+        if (pool_layer_p != nullptr) {
+            // the miss chain's first node (lane form: this staged mmid heads its split)
+            llama_expert_pool_bind_split_head(*expert_pool, il, gate_up, /*lane=*/true);
+        }
+        // per-expert up scale, applied where upstream applies it: right after the
+        // matmul, before the split (mm -> x scale -> +bias -> activation)
+        if (up_exps_s != nullptr) {
+            gate_up = moe_scale_mul(ctx0, gate_up, up_exps_s,
+                    ids_for_scale != nullptr ? ids_for_scale : selected_experts, n_tokens);
+        }
         cb(gate_up, "ffn_moe_gate_up", il);
-
         if (up_exps_s) {
             cb(gate_up, "ffn_moe_gate_up_scaled", il);
         }
@@ -2404,9 +2513,16 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(up, "ffn_moe_up", il);
     } else {
         // separate gate and up path
-        up = build_lora_mm_id(up_exps, cur, selected_experts, up_exps_s, slots); // [n_ff, n_expert_used, n_tokens]
+        up = build_lora_mm_id(up_exps, cur, selected_experts, nullptr, slots); // [n_ff, n_expert_used, n_tokens]
+        if (pool_layer_p != nullptr) {
+            llama_expert_pool_bind_split_head(*expert_pool, il, up, /*lane=*/true);
+        }
+        if (up_exps_s != nullptr) {
+            // per-expert up scale, right after the matmul like upstream
+            up = moe_scale_mul(ctx0, up, up_exps_s,
+                    ids_for_scale != nullptr ? ids_for_scale : selected_experts, n_tokens);
+        }
         cb(up, "ffn_moe_up", il);
-
         if (up_exps_s) {
             cb(up, "ffn_moe_up_scaled", il);
         }
@@ -2417,12 +2533,23 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }
 
         if (gate_exps) {
-            cur = build_lora_mm_id(gate_exps, cur, selected_experts, gate_exps_s, slots); // [n_ff, n_expert_used, n_tokens]
-            cb(cur, "ffn_moe_gate", il);
+            cur = build_lora_mm_id(gate_exps, cur, selected_experts, nullptr, slots); // [n_ff, n_expert_used, n_tokens]
+            if (pool_layer_p != nullptr) {
+                llama_expert_pool_bind_split_head(*expert_pool, il, cur, /*lane=*/true);
+            }
         } else {
             cur = up;
         }
 
+        if (gate_exps_s != nullptr) {
+            // per-expert gate scale, right after the matmul like upstream
+            cur = moe_scale_mul(ctx0, cur, gate_exps_s,
+                    ids_for_scale != nullptr ? ids_for_scale : selected_experts, n_tokens);
+        }
+
+        if (gate_exps) {
+            cb(cur, "ffn_moe_gate", il);
+        }
         if (gate_exps_s) {
             cb(cur, "ffn_moe_gate_scaled", il);
         }
@@ -2530,13 +2657,26 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             cur = amax_src1.res;
         }
 
-        experts = build_lora_mm_id(down_exps, cur, selected_experts, down_exps_s, slots); // [n_embd, n_expert_used, n_tokens]
-        //ggml_prec_set_src(experts, GGML_PREC_BF16, 1); // (see TODO above)
-        cb(experts, "ffn_moe_down", il);
-
+        // the scale lookup rides the clean ids: the pooled chains carry -1 (the skip mask) in theirs
+        experts = build_lora_mm_id(down_exps, cur, selected_experts, nullptr, slots); // [n_embd, n_expert_used, n_tokens]
+        if (down_exps_s != nullptr) {
+            // per-expert down scale, right after the matmul like upstream
+            experts = moe_scale_mul(ctx0, experts, down_exps_s,
+                    ids_for_scale != nullptr ? ids_for_scale : selected_experts, n_tokens);
+            // the scale is part of the miss chain and must stay on its backend: a device-placed
+            // scale becomes a split of its own between the miss chain and the hit block (the
+            // hit_chain is cut there and submitted early from the anchor)
+            if (pool_layer_p != nullptr && n_tokens < llama_expert_pool_offload_min_batch()) {
+                ggml_backend_sched_set_tensor_backend(sched, experts, backend_cpu);
+            }
+        }
         if (amax_src1.scale_s) {
             experts = ggml_mul(ctx0, experts, amax_src1.scale_s);
         }
+        cb(experts, "ffn_moe_down", il);
+    }
+    if (pool_layer_p != nullptr) {
+        llama_expert_pool_bind_split_head(*expert_pool, il, experts, /*lane=*/true);
     }
 
     if (down_exps_s) {
@@ -2555,12 +2695,47 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(experts, "ffn_moe_post_exp_norm", il);
     }
 
-    if (!weight_before_ffn) {
+    // chain_only mode: return the raw down output; the caller handles weighting/merging
+    if (chain_only) {
+        ggml_build_forward_expand(gf, experts);
+        return experts;
+    }
+
+    // the pool hit block: self-contained (A1-final inputs only) and computes only the unweighted expert outputs, so the scheduler can split it out. it is built before the miss chain: the device split precedes the CPU miss split, so the early CPU inputs can copy the miss inputs before the hit tail and let both run concurrently.
+    // the graph order equals the execution order in the serial form: the sequential galloc model reads the same order.
+
+    const bool chain_plain = pool_layer_p != nullptr && pool_layer_p->form == llama_expert_pool_layer::FORM_PLAIN;
+    auto chain_op = [&](int k) { return llama_expert_pool_operand(*expert_pool, il, k, chain_plain); };
+    auto build_hit_block = [&]() {
+        hit_out = build_moe_ffn(cur_hit_in, gate_inp, gate_inp_b,
+            chain_op(PK_UP), chain_op(PK_UP_B), chain_op(PK_GATE), chain_op(PK_GATE_B), chain_op(PK_DOWN), chain_op(PK_DOWN_B), exp_probs_b,
+            n_expert, n_expert_used, type_op, norm_w, w_scale, gating_op, il,
+            nullptr, chain_op(PK_GATE_UP), chain_op(PK_GATE_UP_B),
+            pool_layer_p->scale_up, pool_layer_p->scale_gate, pool_layer_p->scale, ids_remap,
+            post_exp_norm, post_exp_norm_eps, weights,
+            ids_for_scale, true);
+        cb(hit_out, "ffn_moe_hit", il);
+    };
+    // the miss columns are weighted once, on the merge result; without a hit block they are the whole
+    // output, and this is the only weighting. keyed on the plan (pool_layer_p), never on hit_out: the hit
+    // chain is built after this point, so keying on the tensor would weight these columns twice
+    if (pool_layer_p == nullptr && !weight_before_ffn) {
         experts = ggml_mul(ctx0, experts, weights);
         cb(experts, "ffn_moe_weighted", il);
     }
 
+    if (pool_layer_p != nullptr) {
+        build_hit_block();
+    }
+
     ggml_build_forward_expand(gf, experts);
+
+    // merged expert output [n_embd, n_used, T]: the two chains own disjoint columns (-1 skip ids), so
+    // the merge is one exact element-wise add; the weighting then happens once, on that result
+    ggml_tensor * moe_out = experts;
+    if (hit_out != nullptr) {
+        moe_out = build_expert_pool_merge(experts, hit_out, weights, weight_before_ffn, il);
+    }
 
     ggml_tensor * cur_experts[LLAMA_MAX_EXPERTS] = { nullptr };
 
@@ -2572,13 +2747,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // value is correct). ref: https://github.com/ggml-org/llama.cpp/pull/14753
     const uint32_t n_expert_used_il = hparams.n_expert_used(il);
     for (uint32_t i = 0; i < n_expert_used_il; ++i) {
-        cur_experts[i] = ggml_view_2d(ctx0, experts, n_embd, n_tokens, experts->nb[2], i*experts->nb[1]);
+        cur_experts[i] = ggml_view_2d(ctx0, moe_out, n_embd, n_tokens, moe_out->nb[2], i*moe_out->nb[1]);
 
         ggml_build_forward_expand(gf, cur_experts[i]);
     }
 
     // aggregate experts
-    ggml_tensor * moe_out = cur_experts[0];
+    moe_out = cur_experts[0];
 
     for (uint32_t i = 1; i < n_expert_used_il; ++i) {
         moe_out = ggml_add(ctx0, moe_out, cur_experts[i]);
@@ -2596,6 +2771,139 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     return moe_out;
 }
 
+llm_graph_context::expert_pool_chain llm_graph_context::build_expert_pool_chain(
+             int   il,
+     ggml_tensor * cur,
+     ggml_tensor * selected_experts,
+         int64_t   n_expert,
+         int64_t   n_expert_used,
+     ggml_tensor * ids_for_scale_in,
+     ggml_tensor * & up_exps_s,
+     ggml_tensor * & gate_exps_s,
+     ggml_tensor * & down_exps_s) const {
+    expert_pool_chain out;
+    out.ids_for_scale = ids_for_scale_in;
+    if (expert_pool == nullptr || cparams.expert_pool <= 0 || il < 0) {
+        return out;
+    }
+    const int64_t n_tokens = cur->ne[1];
+    const llama_expert_pool_layer & lyr = expert_pool->layers[il];
+    // the pool's accounting needs every pool layer's top-k rows. the hit chain below builds its
+    // own contiguous copy of them; a plain-path pool layer (fully resident, or at width 0) hands
+    // them over here: at one token the sorted output is a single contiguous row, beyond that a
+    // copy makes it so. the pool reads the copy back at the ubatch boundary
+    auto hand_rows = [&]() {
+        ggml_tensor * shadow = llama_expert_pool_ids_shadow(*expert_pool, il);
+        if (shadow == nullptr) {
+            return;
+        }
+        // the copy lands in the pool's own buffer: the pool reads it after the graph ran, and a
+        // graph-arena tensor's memory is reused by later nodes before that
+        ggml_tensor * ids_dst = ggml_view_2d(ctx0, shadow, n_expert_used, n_tokens,
+                                             n_expert_used * ggml_type_size(GGML_TYPE_I32), 0);
+        ggml_tensor * ids_cpy = ggml_cpy(ctx0, selected_experts, ids_dst);
+        ggml_build_forward_expand(gf, ids_cpy);
+        llama_expert_pool_bind_ids(*expert_pool, il, (int32_t) n_expert_used, ids_dst);
+    };
+    if (lyr.form != llama_expert_pool_layer::FORM_CHAIN) {
+        // the plain path: no hit chain, only the rows the accounting needs
+        if (llama_expert_pool_is_pool_layer(*expert_pool, il)) {
+            hand_rows();
+        }
+        return out;
+    }
+    if (!llama_expert_pool_has_resident(*expert_pool, il)) {
+        // the partial layout starts with nothing resident and the plan fills it from the layer point's
+        // ids: until the first slots land there is no chain to build, the plain path serves the layer
+        // (the plan still sees the layer: the form stays FORM_CHAIN)
+        hand_rows();
+        return out;
+    }
+    // prefill: one host-weight mmid per layer, the same shape as the -ncmoe path; the scheduler
+    // offloads it at this batch size and its copy callback stages only the selected expert rows
+    if (n_tokens >= llama_expert_pool_offload_min_batch()) {
+        hand_rows();
+        return out;
+    }
+    // all tables live on the device, so every gather runs on the GPU segment from the same topk
+    // ids (ids_cpu and the scale values reach the CPU segment as 32B split inputs, keeping it
+    // lookup-free). the I32 tables fill the mul_mat_id ids directly (get_rows keeps the table
+    // type on every backend, no cast).
+    // get_rows needs src0.ne[2] == ids.ne[1], so the ids are flattened to [n_used*T, 1] (an I32
+    // REPEAT has no CUDA kernel) and copied contiguous first (topk is a strided view; get_rows
+    // tolerates that, a reshape does not) - one gather then serves every batch size
+    ggml_tensor * ids_shadow = llama_expert_pool_ids_shadow(*expert_pool, il);
+    ggml_tensor * ids_c = ids_shadow != nullptr
+        ? ggml_view_2d(ctx0, ids_shadow, n_expert_used, n_tokens,
+                       n_expert_used * ggml_type_size(GGML_TYPE_I32), 0)
+        : ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_expert_used, n_tokens);
+    ggml_tensor * ids_cpy = ggml_cpy(ctx0, selected_experts, ids_c);
+    ggml_tensor * ids_flat = ggml_reshape_2d(ctx0, ids_cpy, n_expert_used * n_tokens, 1);
+    // register the layer's clean topk rows for the split-head observer
+    llama_expert_pool_bind_ids(*expert_pool, il, (int32_t) n_expert_used, ids_flat);
+    // both remap gathers share this one clean contiguous topk copy; each side produces its own -1
+    ggml_tensor * remap_3d = ggml_reshape_3d(ctx0, lyr.remap, 1, n_expert, 1);
+    out.ids_remap = ggml_get_rows(ctx0, remap_3d, ids_flat);
+    out.ids_remap = ggml_reshape_2d(ctx0, out.ids_remap, n_expert_used, n_tokens);
+    // no private copy: the gather rides inside the hit_chain split
+    cb(out.ids_remap, "ffn_moe_ids_remap", il);
+
+    // inverse table for the miss chain: resident -> -1, else the expert id, so the miss
+    // mul_mat_id zeroes the hit columns natively. below the offload threshold the chain runs on
+    // the CPU and reads the CPU-hosted copy (pinned there; the device slot is shared with the
+    // pool remap and would race), at/above it the ids never leave the device. below the offload
+    // threshold the scales then read the model's host tables instead of the pool's device copies
+    const bool miss_on_cpu = n_tokens < llama_expert_pool_offload_min_batch();
+    // the CPU part's table is an I32 [1, n_expert] host tensor of its own (upstream's cpu_map shape, not a view),
+    // so the gather is placed on the CPU by its source alone; the lane keeps reading the device copy
+    ggml_tensor * inv_tab = miss_on_cpu ? llama_expert_pool_cpu_map(*expert_pool, il) : lyr.remap_inv;
+    ggml_tensor * ids_cpu = ggml_get_rows(ctx0, inv_tab, ids_flat);
+    // the miss chain's first node (cpu forms: this gather heads the CPU split)
+    llama_expert_pool_bind_split_head(*expert_pool, il, ids_cpu, /*lane=*/false);
+    ids_cpu = ggml_reshape_2d(ctx0, ids_cpu, n_expert_used, n_tokens);
+    cb(ids_cpu, "ffn_moe_ids_cpu", il);
+    out.ids_miss = ids_cpu;
+
+    // the per-expert scales ride their native form (matmul -> scale lookup -> mul, see
+    // moe_scale_mul): the lookup indexes the table with the CLEAN topk rows, because the chain
+    // ids carry the -1 skip mask that get_rows cannot index. each chain reads the table that
+    // lives where it runs - the CPU miss chain the model's host copies, the lane and the hit
+    // chain the pool's device copies (same values) - so no scale crosses a backend
+    if (!miss_on_cpu) {
+        if (lyr.scale != nullptr) {
+            down_exps_s = lyr.scale;
+        }
+        if (lyr.scale_up != nullptr) {
+            up_exps_s = lyr.scale_up;
+        }
+        if (lyr.scale_gate != nullptr) {
+            gate_exps_s = lyr.scale_gate;
+        }
+    }
+    // the 2D clean rows (get_rows requires the ids' ne[1] to match the table's ne[2])
+    out.ids_for_scale = ids_c;
+
+    // the 2D input of the hit block: the miss chain reshapes it to 3d before its matmuls
+    out.cur_hit_in = cur;
+    out.layer = &lyr;
+    return out;
+}
+
+// the pool's merge: the hit chain and the miss chain own disjoint columns, so one element-wise add is
+// exact (0 + x == x) and the weights apply once, on the result
+ggml_tensor * llm_graph_context::build_expert_pool_merge(ggml_tensor * experts, ggml_tensor * hit_out,
+        ggml_tensor * weights, bool weight_before_ffn, int il) const {
+    ggml_tensor * merged = ggml_add(ctx0, hit_out, experts);
+    cb(merged, "ffn_moe_merged", il);
+    ggml_backend_sched_set_tensor_backend(sched, merged, ggml_backend_sched_get_backend(sched, 0));
+    // scale first, weights second: the plain path scales inside build_lora_mm_id and applies the weights
+    // afterwards, so this keeps the per-column arithmetic bit-equal to the no-pool path
+    if (!weight_before_ffn) {
+        merged = ggml_mul(ctx0, merged, weights);
+        cb(merged, "ffn_moe_weighted", il);
+    }
+    return merged;
+}
 ggml_tensor * llm_graph_context::build_moe_cache_slots(
          ggml_tensor * selected_experts,
          ggml_tensor * up_exps,
@@ -2604,6 +2912,12 @@ ggml_tensor * llm_graph_context::build_moe_cache_slots(
          ggml_tensor * gate_up_exps,
                  int   il) const {
     if (moe_cache == nullptr) {
+        return nullptr;
+    }
+    // the expert pool and the MoE cache are alternative homes for a layer's experts: a pooled
+    // layer reads the host weights through the pool's own tables, so it is not a cache layer.
+    // when both are configured the pool owns its layers and the cache skips them
+    if (expert_pool != nullptr && cparams.expert_pool > 0 && llama_expert_pool_is_pool_layer(*expert_pool, il)) {
         return nullptr;
     }
 

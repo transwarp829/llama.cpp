@@ -43,6 +43,10 @@ struct llama_memory_buffer {
 using llama_memory_buffers = std::map<ggml_backend_buffer_type_t, llama_memory_buffer>;
 
 struct llama_context {
+    // the expert pool owns its state/buffers and reaches a few context-owned handles
+    // (the sched, the reserve flag, the cached graph result) - see llama-moe-cache.h
+    friend struct llama_expert_pool;
+
     // init scheduler and compute buffers, reserve worst-case graphs
     llama_context(
             const llama_model & model,
@@ -250,6 +254,10 @@ private:
 public:
     uint32_t graph_max_nodes(uint32_t n_tokens) const;
 
+    // print-and-reset the pool segment (public API support)
+    void expert_pool_finalize(int32_t id_slot);
+
+
     // can reuse the llm_graph_result instance of the context (for example to update a memory module)
     llm_graph_result * get_gf_res_reserve() const;
 
@@ -307,7 +315,8 @@ private:
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
 
     llama_memory_ptr memory;
-    llama_moe_cache_ptr moe_cache;
+    // the mechanism holds both arrangements; this is its device path (null when the run takes one of ours)
+    llama_moe_cache * moe_cache() const { return expert_pool != nullptr ? expert_pool->moe_cache() : nullptr; }
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};
@@ -410,6 +419,10 @@ private:
     std::vector<ggml_backend_t>             backend_ptrs;
     std::vector<ggml_backend_buffer_type_t> backend_buft;
     std::vector<size_t>                     backend_buf_exp_size; // expected buffer sizes
+
+    // expert pool (per context): state, pool weights/tables, worker and stats all live
+    // in this object; the pooled layer set is derived from the model at init
+    llama_expert_pool_ptr expert_pool;
 
     // Separate arenas give batches with and without outputs distinct CUDA graph cache keys.
     std::array<llm_graph_result_ptr, 2> gf_res_prev;

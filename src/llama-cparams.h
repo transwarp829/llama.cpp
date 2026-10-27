@@ -58,6 +58,15 @@ struct llama_cparams {
     bool training;           // set by llama_opt_init()
 
     size_t moe_cache_size;
+    // the same budget per device, in --device order, in BYTES (empty = split moe_cache_size among the
+    // devices like the layers); the pool reads this form, the MoE cache reads moe_cache_size
+    std::vector<size_t> moe_cache_size_dev;
+    // how many of each device's deepest MoE layers take part, in --device order (empty = all eligible)
+    std::vector<int32_t> moe_cache_layers;
+    int32_t expert_pool;       // BOOLEAN PROXY for "a pool is configured" (the graph gates read it)
+    int32_t expert_pool_fill_cap; // swap on/off: > 0 swaps, <= 0 freezes the resident set
+    int32_t expert_pool_cnt_decay;  // decaying activation counter: half-life in layer ticks (default 4096)
+    int32_t expert_pool_miss_method; // miss path: 0 = cpu-serial, 1 = cpu-parallel, 2 = gpu (the MoE cache path)
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
 

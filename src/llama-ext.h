@@ -189,3 +189,38 @@ LLAMA_API uint32_t llama_model_get_tok_embd_rows(const struct llama_model * mode
 
 // realtime models: number of tokens the output lags behind the audio input, used by mtmd; 0 if not applicable
 LLAMA_API uint32_t llama_model_n_tokens_delay(const struct llama_model * model);
+//
+// expert pool: configuration (fork-private)
+//
+
+// The pool's knobs (llama_context_params.expert_pool; a null pointer there means
+// "no pool", the default). Start from llama_expert_pool_default_params() - a
+// zeroed struct means a frozen pool, not a default one.
+// The budget and the layer set are the cache's parameters, not the pool's: --moe-cache-mib
+// (per device, in --device order) and --moe-cache-layers. Nothing here is per device: every
+// device gets its own pool bundle, the budget decides its size.
+// the pool's behavioral knobs; the budget and the layer set are the cache's own parameters
+// (--moe-cache-mib / --moe-cache-layers), carried here as fixed arrays: llama_context_params is a C
+// struct and cannot hold containers
+#define LLAMA_EXPERT_POOL_MAX_DEV 8
+
+struct llama_expert_pool_params {
+    int32_t fill_cap;        // swap on/off: > 0 swaps, <= 0 freezes the resident set; code-set, no CLI flag
+    int32_t cnt_decay;       // decaying activation counter: half-life in layer ticks (0 = library default); code-set, no CLI flag
+    int32_t miss_method;     // how a miss runs: 0 = cpu-serial, 1 = cpu-parallel, 2 = gpu (the MoE cache path)
+    int32_t n_dev;                                // entries in size_dev[] and layers[] below
+    size_t  size_dev[LLAMA_EXPERT_POOL_MAX_DEV];  // per-device budget in BYTES, --device order (0 = off)
+    int32_t layers[LLAMA_EXPERT_POOL_MAX_DEV];    // that device's deepest N layers (0 = all eligible)
+};
+
+// swap on (fill_cap > 0), cnt_decay 128 layer ticks, miss_method cpu-parallel, everything else off; the
+// struct must outlive the context's first reserve, like the other pointer args.
+LLAMA_API struct llama_expert_pool_params llama_expert_pool_default_params(void);
+
+//
+// expert pool: segment accounting (fork-private)
+
+// end of a generation segment: print the accumulated hit rate at info verbosity and reset
+// the segment counters (call once after the decode loop). the report is segment-scoped; the
+// slot id is kept for the API and is not used.
+LLAMA_API void llama_expert_pool_finalize(struct llama_context * ctx, int32_t id_slot);

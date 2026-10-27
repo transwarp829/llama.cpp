@@ -7,6 +7,7 @@
 #include "ggml-opt.h"
 #include "ggml.h"
 #include "llama.h"
+#include "../src/llama-ext.h" // fork-private expert pool params (llama_context_params.expert_pool)
 
 #include <array>
 #include <list>
@@ -581,6 +582,10 @@ struct common_params {
     bool swa_full          = false; // use full-size SWA cache (https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055)
     bool kv_unified        = false; // enable unified KV cache
 
+    // fork-private expert pool knobs (llama-ext.h); common_context_params_to_llama
+    // passes a pointer to this struct through llama_context_params
+    llama_expert_pool_params expert_pool = llama_expert_pool_default_params();
+
     bool input_prefix_bos  = false; // prefix BOS to user inputs, preceding input_prefix
     bool verbose_prompt    = false; // print prompt tokens before generation
     bool display_prompt    = true;  // print prompt before generation
@@ -1017,7 +1022,9 @@ using common_init_result_ptr = std::unique_ptr<common_init_result>;
 common_init_result_ptr common_init_from_params(common_params & params, bool model_only = false);
 
 struct llama_model_params   common_model_params_to_llama  (      common_params & params);
-struct llama_context_params common_context_params_to_llama(const common_params & params);
+// non-const: the fork-private pool params are referenced from the context params,
+// so the caller's struct must stay alive (it does: common_params outlives the context)
+struct llama_context_params common_context_params_to_llama(common_params & params);
 
 // apply --fit to mparams and cparams, no-op if params.fit_params is false
 void common_fit_apply(common_params & params, struct llama_model_params & mparams, struct llama_context_params & cparams);

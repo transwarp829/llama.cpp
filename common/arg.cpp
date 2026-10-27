@@ -1354,6 +1354,25 @@ bool common_arg_utils::is_autoy(const std::string & value) {
     return value == "auto" || value == "-1";
 }
 
+// one non-negative integer per comma-separated entry, in order; throws naming the option and the entry
+static std::vector<int64_t> parse_int_list(const std::string & value, const char * opt) {
+    std::vector<int64_t> res;
+    for (const std::string & s : string_split<std::string>(value, ',')) {
+        size_t n_read = 0;
+        long   v      = -1;
+        try {
+            v = std::stol(s, &n_read);
+        } catch (const std::exception &) {
+            n_read = 0;
+        }
+        if (n_read != s.size() || v < 0) {
+            throw std::invalid_argument(string_format("%s: '%s' is not a non-negative integer", opt, s.c_str()));
+        }
+        res.push_back((int64_t) v);
+    }
+    return res;
+}
+
 // Simple CSV parser that handles quoted fields and escaped quotes
 // example:
 //    input:  value1,"value, with, commas","value with ""escaped"" quotes",value4
@@ -1705,6 +1724,27 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.swa_full = true;
         }
     ).set_env("LLAMA_ARG_SWA_FULL"));
+    add_opt(common_arg(
+        {"--expert-pool-miss-method"}, "{cpu-serial,cpu-parallel,gpu}",
+        "how the expert pool runs a miss below the offload batch threshold (default: cpu-serial). "
+        "cpu-serial = the CPU chain stays one split, cpu-parallel = the mount chain is handed to the device ahead of the CPU chain, "
+        "gpu = the cold experts fill the same-level cache and are computed on the device in the same chain (the MoE cache path, needs --moe-cache-mib)",
+        [](common_params & params, const std::string & value) {
+            if (value == "cpu-serial") {
+                params.expert_pool.miss_method = 0;
+                return;
+            }
+            if (value == "cpu-parallel") {
+                params.expert_pool.miss_method = 1;
+                return;
+            }
+            if (value == "gpu") {
+                params.expert_pool.miss_method = 2;
+                return;
+            }
+            throw std::invalid_argument(string_format("expert-pool-miss-method: unknown value '%s'", value.c_str()));
+        }
+    ));
     add_opt(common_arg(
         {"-ctxcp", "--ctx-checkpoints", "--swa-checkpoints"}, "N",
         string_format("max number of context checkpoints to create per slot (default: %d)"
@@ -2786,15 +2826,41 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_N_CPU_MOE"));
     add_opt(common_arg(
-        {"--moe-cache-mib"}, "N",
-        "GPU cache size in MiB for the MoE experts kept in the CPU. with multiple GPUs, it is split among them like the layers (--tensor-split) (default: 0, disabled)",
-        [](common_params & params, int value) {
-            if (value < 0) {
-                throw std::invalid_argument("invalid value");
+        {"--moe-cache-mib"}, "N1[,N2,...]",
+        "GPU cache size in MiB for the MoE experts kept in the CPU, one entry per device in --device order; a single value is split among the devices like the layers (--tensor-split) (default: 0, disabled)",
+        [](common_params & params, const std::string & value) {
+            llama_expert_pool_params & ep = params.expert_pool;
+            memset(ep.size_dev, 0, sizeof(ep.size_dev));
+            const std::vector<int64_t> list = parse_int_list(value, "--moe-cache-mib");
+            if (list.size() > LLAMA_EXPERT_POOL_MAX_DEV) {
+                throw std::invalid_argument(string_format("--moe-cache-mib: at most %d device entries", LLAMA_EXPERT_POOL_MAX_DEV));
             }
-            params.moe_cache_size = (size_t) value*1024*1024;
+            size_t total = 0;
+            for (size_t i = 0; i < list.size(); ++i) {
+                ep.size_dev[i] = (size_t) list[i]*1024*1024;
+                ep.n_dev = ep.n_dev < (int32_t) i + 1 ? (int32_t) i + 1 : ep.n_dev;
+                total += (size_t) list[i]*1024*1024;
+            }
+            // the MoE cache itself keeps upstream's single value: with a list it gets their sum
+            params.moe_cache_size = total;
         }
     ).set_env("LLAMA_ARG_MOE_CACHE_MIB"));
+    add_opt(common_arg(
+        {"--moe-cache-layers"}, "N1[,N2,...]",
+        "how many of each device's deepest MoE layers take part in the cache, one entry per device in --device order (default: all eligible layers of that device)",
+        [](common_params & params, const std::string & value) {
+            llama_expert_pool_params & ep = params.expert_pool;
+            memset(ep.layers, 0, sizeof(ep.layers));
+            const std::vector<int64_t> list = parse_int_list(value, "--moe-cache-layers");
+            if (list.size() > LLAMA_EXPERT_POOL_MAX_DEV) {
+                throw std::invalid_argument(string_format("--moe-cache-layers: at most %d device entries", LLAMA_EXPERT_POOL_MAX_DEV));
+            }
+            for (size_t i = 0; i < list.size(); ++i) {
+                ep.layers[i] = (int32_t) list[i];
+                ep.n_dev = ep.n_dev < (int32_t) i + 1 ? (int32_t) i + 1 : ep.n_dev;
+            }
+        }
+    ).set_env("LLAMA_ARG_MOE_CACHE_LAYERS"));
     add_opt(common_arg(
         {"-ncffn", "--n-cpu-ffn"}, "N",
         "keep the dense FFN weights of the first N layers in the CPU\n"

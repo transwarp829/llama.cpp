@@ -425,6 +425,11 @@ extern "C" {
         // a source/target/parent context
         // can be utilized in various ways, for example by sharing results or llama_memory between 2 contexts
         struct llama_context * ctx_other;
+
+        // fork-specific expert pool configuration (defined in llama-ext.h); null = no pool.
+        // the struct must outlive the context's first reserve, like the other pointer fields here.
+        // appended last: a field added mid-struct shifts the offsets of everything after it.
+        const struct llama_expert_pool_params * expert_pool;
     };
 
     struct llama_model_tensor_override {
