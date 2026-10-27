@@ -977,6 +977,9 @@ static int32_t bind_ilx(const llama_expert_pool_state & st, int32_t il);
 // mark one layer's slot map as needing a publish (inference thread only, at a layer point).
 // the two entry points name what changed; both enqueue the layer's slice for the next publish
 static void slot_map_mark(llama_expert_pool_state & st, int32_t il) {
+    if (il >= 0 && (size_t) il < st.rank.size()) {
+        st.rank[(size_t) il].dirty = true; // its residency moved, so its ends did too
+    }
     for (const int32_t v : st.slot_map_publish_q) {
         if (v == il) {
             return;
@@ -1051,6 +1054,9 @@ static void pool_count_ids(llama_expert_pool_state & st, int32_t il, const int32
     const int32_t n_expert = st.n_expert;
     float * c = st.ids_cnt_per_token.data() + (size_t) il * (size_t) n_expert;
     float   tot = 0.0f;
+    if ((size_t) il < st.rank.size()) {
+        st.rank[(size_t) il].dirty = true; // the counters moved, so its ends did too
+    }
     for (int32_t e = 0; e < n_expert; ++e) {
         c[e] *= st.cnt_lambda;
         tot  += c[e];
@@ -1415,9 +1421,14 @@ void llama_expert_pool_account_ids(llama_expert_pool_state & st) {
         any = true;
     }
     if (any) {
-        // the ubatch is closed: its in-use experts no longer protect anything
+        // the ubatch is closed: its in-use experts no longer protect anything. every layer's victim
+        // side changes with that, so every cached end has to be re-derived - once per ubatch, not per
+        // layer point, which is what keeps the cache cheap
         if (!st.ub_use.empty()) {
             std::fill(st.ub_use.begin(), st.ub_use.end(), 0);
+            for (llama_expert_pool_state::layer_rank & rk : st.rank) {
+                rk.dirty = true;
+            }
         }
         // one accounted ubatch is one counted unit, planned or not: the dump and any future reader need it to advance even in the frozen arm
         st.hook_step += 1;
@@ -1459,120 +1470,100 @@ static void slot_map_install(llama_expert_pool_state & st) {
 // for a few of each per layer point, so a walk per query is the cheap side; ties follow the smaller key.
 // the candidate side takes every layer: a fill for a layer that already ran this ubatch serves the next
 // ubatch of the same layer, which is the same kind of reuse a fill for a later layer serves
+// one layer's two ends of the rank. the counters only move at a fold, the residency only at a move,
+// and the plan only consumes keys - each of those marks the layer, so a cached pair answers every
+// query in between
+static void pool_rank_layer(llama_expert_pool_state & st, int32_t il) {
+    llama_expert_pool_state::layer_rank & rk = st.rank[(size_t) il];
+    rk.cand      = -1;
+    rk.cand_rate = 0.0f;
+    rk.vict      = -1;
+    rk.vict_rate = 0.0f;
+    rk.dirty     = false;
+    if (st.layers[il].form != llama_expert_pool_layer::FORM_CHAIN) {
+        return; // not in the index
+    }
+    const int32_t n_expert = st.n_expert;
+    // the group is one rank space, so the counters are compared as rates: a layer folds evidence only on
+    // the ubatches that reach it, so its mass carries its visit count as a factor
+    const float inv = (size_t) il < st.ids_cnt_tot.size() && st.ids_cnt_tot[(size_t) il] > 0.0f
+                      ? 1.0f / st.ids_cnt_tot[(size_t) il] : 0.0f;
+    const float * cl = st.ids_cnt_per_token.data() + (size_t) il * (size_t) n_expert;
+    for (int32_t e = 0; e < n_expert; ++e) {
+        const int32_t key = il * n_expert + e;
+        const float   r   = cl[e] * inv;
+        if (st.slot_of[(size_t) key] >= 0) {
+            if (!st.ub_use.empty() && st.ub_use[(size_t) key] != 0) {
+                continue; // in use by the ubatch being served
+            }
+            if (rk.vict < 0 || r < rk.vict_rate || (r == rk.vict_rate && key < rk.vict)) {
+                rk.vict      = key;
+                rk.vict_rate = r;
+            }
+        } else {
+            if (!st.plan_taken.empty() && st.plan_taken[(size_t) key] != 0) {
+                continue; // already consumed by this plan
+            }
+            if (rk.cand < 0 || r > rk.cand_rate || (r == rk.cand_rate && key < rk.cand)) {
+                rk.cand      = key;
+                rk.cand_rate = r;
+            }
+        }
+    }
+}
+
+// the two sides of a pair, merged off the cached ends: the hottest candidate and the coldest victim of
+// the group. ties follow the smaller key, like the single scans this replaces
 static bool pool_rank_pair(llama_expert_pool_state & st, size_t ai,
                            int32_t & key_in, float & cnt_in, int32_t & key_out, float & cnt_out) {
     key_in  = -1;
     cnt_in  = 0.0f;
     key_out = -1;
     cnt_out = 0.0f;
-    if (st.ids_cnt_per_token.empty() || ai >= st.groups.size() || st.plan_taken.empty()) {
+    if (st.ids_cnt_per_token.empty() || ai >= st.groups.size() || st.plan_taken.empty() || st.rank.empty()) {
         return false;
     }
-    const int32_t n_expert = st.n_expert;
-    const float * c = st.ids_cnt_per_token.data();
-    int32_t best_in      = -1;
-    float   best_in_rate = 0.0f;
-    int32_t best_out      = -1;
-    float   best_out_rate = 0.0f;
     for (int32_t il : st.groups[ai].layers) {
         if (st.layers[il].form != llama_expert_pool_layer::FORM_CHAIN) {
             continue; // not in the index
         }
-        const float inv = (size_t) il < st.ids_cnt_tot.size() && st.ids_cnt_tot[(size_t) il] > 0.0f
-                          ? 1.0f / st.ids_cnt_tot[(size_t) il] : 0.0f;
-        const float * cl = c + (size_t) il * (size_t) n_expert;
-        for (int32_t e = 0; e < n_expert; ++e) {
-            const int32_t key = il * n_expert + e;
-            const float   r   = cl[e] * inv;
-            if (st.slot_of[(size_t) key] >= 0) {
-                if (!st.ub_use.empty() && st.ub_use[(size_t) key] != 0) {
-                    continue; // in use by the ubatch being served
-                }
-                if (best_out < 0 || r < best_out_rate || (r == best_out_rate && key < best_out)) {
-                    best_out      = key;
-                    best_out_rate = r;
-                }
-            } else {
-                if (st.plan_taken[(size_t) key] != 0) {
-                    continue; // already consumed by this plan
-                }
-                if (best_in < 0 || r > best_in_rate || (r == best_in_rate && key < best_in)) {
-                    best_in      = key;
-                    best_in_rate = r;
-                }
-            }
+        if (st.rank[(size_t) il].dirty) {
+            pool_rank_layer(st, il);
+        }
+        const llama_expert_pool_state::layer_rank & rk = st.rank[(size_t) il];
+        if (rk.cand >= 0 && (key_in < 0 || rk.cand_rate > cnt_in || (rk.cand_rate == cnt_in && rk.cand < key_in))) {
+            key_in  = rk.cand;
+            cnt_in  = rk.cand_rate;
+        }
+        if (rk.vict >= 0 && (key_out < 0 || rk.vict_rate < cnt_out || (rk.vict_rate == cnt_out && rk.vict < key_out))) {
+            key_out = rk.vict;
+            cnt_out = rk.vict_rate;
         }
     }
-    if (best_in < 0 || best_in_rate <= 0.0f || best_out < 0) {
-        return false;
-    }
-    key_in  = best_in;
-    cnt_in  = best_in_rate;
-    key_out = best_out;
-    cnt_out = best_out_rate;
-    return true;
+    return key_in >= 0 && cnt_in > 0.0f && key_out >= 0; // a spent counter is no candidate
 }
 
-static bool pool_rank_next(llama_expert_pool_state & st, size_t ai, bool sel,
-                           int32_t & key_out, float & cnt_out) {
+// the hottest candidate of the group, off the cached ends
+static bool pool_rank_cand(llama_expert_pool_state & st, size_t ai, int32_t & key_out, float & cnt_out) {
     key_out = -1;
     cnt_out = 0.0f;
-    if (st.ids_cnt_per_token.empty() || ai >= st.groups.size()) {
+    if (st.ids_cnt_per_token.empty() || ai >= st.groups.size() || st.plan_taken.empty() || st.rank.empty()) {
         return false;
     }
-    if (sel && st.plan_taken.empty()) {
-        return false;
-    }
-    const int32_t n_expert = st.n_expert;
-    const float * c = st.ids_cnt_per_token.data();
-    int32_t best      = -1;
-    float   best_rate = 0.0f;
     for (int32_t il : st.groups[ai].layers) {
         if (st.layers[il].form != llama_expert_pool_layer::FORM_CHAIN) {
             continue; // not in the index
         }
-        // the group is one rank space, so the counters are compared as rates: a layer folds evidence only on
-        // the ubatches that reach it, so its mass carries its visit count as a factor
-        const float inv = (size_t) il < st.ids_cnt_tot.size() && st.ids_cnt_tot[(size_t) il] > 0.0f
-                          ? 1.0f / st.ids_cnt_tot[(size_t) il] : 0.0f;
-        const float * cl = c + (size_t) il * (size_t) n_expert;
-        for (int32_t e = 0; e < n_expert; ++e) {
-            const int32_t key = il * n_expert + e;
-            const float   r   = cl[e] * inv;
-            if (sel) {
-                if (st.slot_of[(size_t) key] >= 0) {
-                    continue; // resident: a victim, not a candidate
-                }
-                if (st.plan_taken[(size_t) key] != 0) {
-                    continue; // already consumed by this plan
-                }
-                if (best < 0 || r > best_rate || (r == best_rate && key < best)) {
-                    best      = key;
-                    best_rate = r;
-                }
-            } else {
-                if (st.slot_of[(size_t) key] < 0) {
-                    continue; // not resident
-                }
-                if (!st.ub_use.empty() && st.ub_use[(size_t) key] != 0) {
-                    continue; // in use by the ubatch being served
-                }
-                if (best < 0 || r < best_rate || (r == best_rate && key < best)) {
-                    best      = key;
-                    best_rate = r;
-                }
-            }
+        if (st.rank[(size_t) il].dirty) {
+            pool_rank_layer(st, il);
+        }
+        const llama_expert_pool_state::layer_rank & rk = st.rank[(size_t) il];
+        if (rk.cand >= 0 && (key_out < 0 || rk.cand_rate > cnt_out || (rk.cand_rate == cnt_out && rk.cand < key_out))) {
+            key_out = rk.cand;
+            cnt_out = rk.cand_rate;
         }
     }
-    if (best < 0) {
-        return false;
-    }
-    if (sel && best_rate <= 0.0f) {
-        return false; // a spent counter is no candidate
-    }
-    key_out = best;
-    cnt_out = best_rate;
-    return true;
+    return key_out >= 0 && cnt_out > 0.0f; // a spent counter is no candidate
 }
 
 static void pool_admit(llama_expert_pool_state & st, llama_expert_pool_state::pool_dev & d, int32_t key, int32_t slot);
@@ -1598,7 +1589,7 @@ static int32_t pool_plan_rank(llama_expert_pool_state & st, llama_expert_pool_st
         }
         int32_t key_in = -1;
         float   cnt_in = 0.0f;
-        if (!pool_rank_next(st, ai, /*sel=*/true, key_in, cnt_in)) {
+        if (!pool_rank_cand(st, ai, key_in, cnt_in)) {
             break;
         }
         admit(key_in, slot);
@@ -1616,6 +1607,7 @@ static int32_t pool_plan_rank(llama_expert_pool_state & st, llama_expert_pool_st
             break;
         }
         st.plan_taken[(size_t) key_out] = 1; // evicted: it must not come back as a candidate
+        st.rank_consumed.push_back(key_out / n_expert);
         const int32_t slot = st.slot_of[key_out];
         st.slot_of[key_out] = -1;
         slot_map_mark(st, key_out / n_expert);
@@ -1651,6 +1643,7 @@ static void pool_admit(llama_expert_pool_state & st, llama_expert_pool_state::po
     slot_map_mark(st, il);
     if (!st.plan_taken.empty()) {
         st.plan_taken[(size_t) key] = 1; // consumed: neither table may pick it again
+        st.rank_consumed.push_back(il);
     }
     d.stats.fills += 1;
 }
@@ -1664,6 +1657,14 @@ static int32_t pool_plan_layer(llama_expert_pool_state & st, llama_expert_pool_s
         return 0;
     }
     const int32_t ai = st.layers[il].ig;
+    // the consumed set is about to empty, so the ends derived under it are stale - but only for the
+    // layers a key was taken from: other layers read the same counters either way
+    for (const int32_t lt : st.rank_consumed) {
+        if (lt >= 0 && (size_t) lt < st.rank.size()) {
+            st.rank[(size_t) lt].dirty = true;
+        }
+    }
+    st.rank_consumed.clear();
     std::fill(st.plan_taken.begin(), st.plan_taken.end(), 0);
 
     int32_t n_fill = 0;
@@ -2120,6 +2121,7 @@ void llama_expert_pool::expert_pool_build() {
         st.ids_cnt_tot.assign(st.layers.size(), 0.0f);
         st.ub_use.assign(st.layers.size() * (size_t) st.n_expert, 0);
         st.plan_taken.assign(st.layers.size() * (size_t) st.n_expert, 0);
+        st.rank.assign(st.layers.size(), {});
         st.miss_snap.assign(st.layers.size(), std::vector<int32_t>());
     }
 

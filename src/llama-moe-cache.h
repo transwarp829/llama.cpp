@@ -257,6 +257,19 @@ struct llama_expert_pool_state {
     std::vector<uint8_t> ub_use;
     // scratch of one plan call: keys already consumed by the point's matching
     std::vector<uint8_t> plan_taken;
+
+    // per layer, the two ends of the rank: the hottest candidate and the coldest victim. they only move
+    // when the layer's counters fold, its residency moves, or the plan consumes one of its keys, so a
+    // cached pair answers every query until one of those
+    struct layer_rank {
+        float   cand_rate = 0.0f;
+        float   vict_rate = 0.0f;
+        int32_t cand      = -1;
+        int32_t vict      = -1;
+        bool    dirty     = true;
+    };
+    std::vector<layer_rank> rank;
+    std::vector<int32_t>    rank_consumed; // layers whose keys the last plan took: their ends must be re-derived
     // per layer: the inverse half as this ubatch's graph saw it (the hit rate classifies against that, not
     // the live table, which a later promotion in the ubatch has already moved)
     std::vector<std::vector<int32_t>> miss_snap;
