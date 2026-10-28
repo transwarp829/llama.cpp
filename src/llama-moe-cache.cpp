@@ -1684,9 +1684,6 @@ static int32_t pool_plan_layer(llama_expert_pool_state & st, llama_expert_pool_s
     return pool_plan_rank(st, d, il, ai);
 }
 
-// (the ubatch boundary advanced hook_step above; the workers keep copying fills)
-
-
 // ---------------------------------------------------------------
 // the pool driver: llama_context holds one instance. the entry points were moved verbatim from
 // llama-context.cpp; the context-owned names they reach go through `ctx`
@@ -1909,10 +1906,10 @@ void llama_expert_pool::expert_pool_init() {
     if (cparams.expert_pool <= 0) {
         return;
     }
-    // one bundle per serving device, each with its own weight buffer, tables and upload worker
+    // one bundle per serving device, each with its own weight buffer and tables
     if (model.n_devices() > 1) {
-        LLAMA_LOG_WARN("%s: %d devices: the pool runs one bundle and one upload worker per serving "
-                       "device, but this path is NOT verified on this build (single-GPU host)\n",
+        LLAMA_LOG_WARN("%s: %d devices: the pool runs one bundle per serving device, but this "
+                       "path is NOT verified on this build (single-GPU host)\n",
                 __func__, model.n_devices());
     }
     const int32_t n_layer = model.hparams.n_layer();
@@ -2704,7 +2701,7 @@ void llama_expert_pool::release_devs() {
         d.slot_map_buf.reset();
         d.buf_host.reset();
         d.slot_map_dev = nullptr;
-        // the queues are empty here: the caller stops the worker first
+        // the copies run in the compute stream: the caller synchronizes before the buffers go away
         d.slot_map_ctx.reset();
         d.ctx_host.reset();
     }

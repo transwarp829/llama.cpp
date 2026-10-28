@@ -92,7 +92,7 @@ enum llama_expert_pool_layout {
 // what one miss method means to the run. the three values are peers: each names where a miss is
 // computed, and with it the chain the layer's experts run in
 struct llama_expert_pool_miss_strategy {
-    bool pool_active     = true;  // the dual chain: the pool's own tables, worker and tables
+    bool pool_active     = true;  // the dual chain: the pool's own tables and its plan
     bool cache_required  = false; // the same-level cache takes the misses (the device form)
     bool layer_parallel  = false; // the hit chain is handed to the device ahead of the CPU chain
 };
@@ -231,14 +231,12 @@ struct llama_expert_pool_state {
     bool plan_active = false;
     int32_t plan_per_layer = 1;             // swap on/off (> 0 swaps; <= 0 freezes the set)
     int32_t n_expert = 0;                  // experts per layer (set at init)
-    // ubatch counter (the decode path advances it; the markers carry it to the workers)
+    // ubatch counter: the decode path advances it at the boundary, a layer point compares it
     int32_t hook_step = 0;
     // a batch at or above the offload threshold has been served (the setup decodes must not decide the regime)
     bool prefill_seen = false;
 
-    // the marker queue, its mutex/condvar and the worker thread live per bundle (pool_dev)
-
-    // the counters are shared but the columns are disjoint: a worker decays and increments only its own bundle's layers
+    // the counters are shared but the columns are disjoint: a bundle decays and increments only its own layers
     float   cnt_lambda   = 0.0f;          // per-tick decay, lambda = 2^(-1/H)
     float   plan_margin  = 0.02f;         // a swap needs the candidate's rate to beat the victim's by this share; code-set, no CLI flag
     int32_t cnt_decay_hl = 4096;          // decay half-life in layer ticks
@@ -286,7 +284,7 @@ struct llama_expert_pool_state {
     phase_t phase = PHASE_NONE;
 
     // per device pool bundle: one entry per device that serves pooled layers.
-    // every bundle owns its tables and its worker state; the tables keep the absolute layer-column layout
+    // every bundle owns its tables; the tables keep the absolute layer-column layout
     // (only this device's layers are written), so the per-layer views and their offsets are unchanged
     // the per-device bundle (defined in llama-moe-cache.cpp)
     struct pool_dev;

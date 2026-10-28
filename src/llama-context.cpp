@@ -393,7 +393,7 @@ llama_context::llama_context(
     cparams.kv_unified     = params.kv_unified;
     cparams.moe_cache_size = params.moe_cache_size;
 
-    // the pool's worker and the cache's copy callback are exclusive: a pool with cpu misses
+    // the pool's own fill path and the cache's copy callback are exclusive: a pool with cpu misses
     // owns the fills, a cache/gpu miss path keeps the callback
     const llama_expert_pool_miss_strategy miss_strategy_c =
         llama_expert_pool_miss_strategy_of(cparams.expert_pool_miss_method);
@@ -647,8 +647,8 @@ llama_context::~llama_context() {
     // the pool tensors, which the frees below would invalidate (use-after-free at exit)
     sched.reset();
 
-    // stop the swap worker and free the pool (single teardown owner; the worker's
-    // sync tensor_set calls reference the pool tensors)
+    // free the pool (single teardown owner; the release syncs the stream, whose copies
+    // still reference the pool tensors)
     if (expert_pool != nullptr) {
         expert_pool->expert_pool_release();
     }
@@ -803,7 +803,7 @@ void llama_context::sched_reserve() {
     gf_res_prev_active = nullptr;
 
     sched_new(max_nodes, cparams.pipeline_parallel);
-    // the pool owns its state, buffers and worker; the context hands it the handles it needs.
+    // the pool owns its state and buffers; the context hands it the handles it needs.
     // it is created ONCE per context: a re-reserve must not drop the layout state (a crossing
     // re-lays the pool and then forces this reserve) nor copy the pool weights again
     // the three miss methods are peers; this run's takes one of them. a method that is not the

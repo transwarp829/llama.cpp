@@ -420,7 +420,7 @@ private:
     std::vector<ggml_backend_buffer_type_t> backend_buft;
     std::vector<size_t>                     backend_buf_exp_size; // expected buffer sizes
 
-    // expert pool (per context): state, pool weights/tables, worker and stats all live
+    // expert pool (per context): state, pool weights/tables and stats all live
     // in this object; the pooled layer set is derived from the model at init
     llama_expert_pool_ptr expert_pool;
 
