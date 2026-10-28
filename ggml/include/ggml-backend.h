@@ -386,6 +386,11 @@ extern "C" {
     // right before the split runs; the expert pool is the consumer (matched by pointer).
     typedef void (*ggml_backend_sched_split_head_fn)(void * user_data, struct ggml_tensor * head, struct ggml_backend * backend);
     GGML_API void                 ggml_backend_sched_set_split_head_observer(ggml_backend_sched_t sched, ggml_backend_sched_split_head_fn fn, void * user_data);
+    // fork-private: a split may be skipped instead of run. the callback sees the split's head and its
+    // backend; returning true means the split has no work this step, so the scheduler does not submit it
+    // and zeroes the tensors it would have produced (they are read by a later split)
+    typedef bool (*ggml_backend_sched_skip_split_fn)(void * user_data, struct ggml_tensor * head, struct ggml_backend * backend);
+    GGML_API void                 ggml_backend_sched_set_skip_split(ggml_backend_sched_t sched, ggml_backend_sched_skip_split_fn fn, void * user_data);
     // Set a callback to be called when the compute buffers of a graph are being reallocated
     GGML_API void                 ggml_backend_sched_set_realloc_callback(ggml_backend_sched_t sched, ggml_backend_sched_realloc_callback callback, void * user_data);
 

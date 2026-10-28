@@ -231,6 +231,10 @@ struct llama_expert_pool_state {
     bool plan_active = false;
     int32_t plan_per_layer = 1;             // swap on/off (> 0 swaps; <= 0 freezes the set)
     int32_t n_expert = 0;                  // experts per layer (set at init)
+    // a layer whose misses the CPU half would compute nothing for this step has its miss split skipped
+    // by the scheduler (the tables the merge reads are zeroed instead); LLAMA_EXPERT_POOL_SKIP_EMPTY=0 off
+    bool     skip_on   = true;
+    std::vector<uint8_t> skip_miss; // [layers] 1 = this step's miss split has no work
     // ubatch counter: the decode path advances it at the boundary, a layer point compares it
     int32_t hook_step = 0;
     // a batch at or above the offload threshold has been served (the setup decodes must not decide the regime)
@@ -333,6 +337,8 @@ void llama_expert_pool_bind_split_head(const llama_expert_pool_state & st, int32
 // the layer's resident matmul: the fills the layer launched must be in before this split runs
 void llama_expert_pool_bind_mount_head(const llama_expert_pool_state & st, int32_t il, const ggml_tensor * head);
 void llama_expert_pool_observe_split_head(void * user_data, ggml_tensor * head, ggml_backend_t backend);
+// fork-private: the scheduler may skip a split that has no work this step (see LLAMA_EXPERT_POOL_SKIP_EMPTY)
+bool llama_expert_pool_skip_split(void * user_data, ggml_tensor * head, ggml_backend_t backend);
 
 // ---------------------------------------------------------------
 // the pool driver: owns the state, the weight context/buffers, the hit-chain tables and the entry

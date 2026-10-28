@@ -990,6 +990,8 @@ struct ggml_backend_sched {
     int early_split; // split whose inputs were staged early, -1 if none
     ggml_backend_sched_split_head_fn obs_split_head    = nullptr;
     void *                           obs_split_head_ud = nullptr;
+    ggml_backend_sched_skip_split_fn skip_split        = nullptr;
+    void *                           skip_split_ud     = nullptr;
 
     int debug;
 
@@ -1970,6 +1972,41 @@ static bool ggml_backend_sched_plan_early(ggml_backend_sched_t sched, int split_
     return true;
 }
 
+// a skipped split produces nothing: the tensors it would have written and a later split reads must be
+// zeroed instead. a host tensor is a plain memset; a device one is a copy on its own stream, so it stays
+// ordered with the consumer split
+static void ggml_backend_sched_zero_split_outputs(ggml_backend_sched_t sched, int split_id) {
+    struct ggml_backend_sched_split * split = &sched->splits[split_id];
+    static const char zeros[1 << 16] = { 0 };
+    ggml_backend_t backend = sched->backends[split->backend_id];
+    for (int j = 0; j < split->graph.n_nodes; j++) {
+        struct ggml_tensor * t = split->graph.nodes[j];
+        if (t->view_src != nullptr || t->data == nullptr) {
+            continue;
+        }
+        bool external = false;
+        for (int k = split_id + 1; k < sched->n_splits && !external; k++) {
+            for (int i = 0; i < sched->splits[k].n_inputs; i++) {
+                if (sched->splits[k].inputs[i] == t) {
+                    external = true;
+                    break;
+                }
+            }
+        }
+        if (!external) {
+            continue;
+        }
+        const size_t n = ggml_nbytes(t);
+        if (ggml_backend_buffer_is_host(t->buffer)) {
+            memset(t->data, 0, n);
+        } else {
+            for (size_t off = 0; off < n; off += sizeof(zeros)) {
+                ggml_backend_tensor_set_async(backend, t, zeros, off, n - off < sizeof(zeros) ? n - off : sizeof(zeros));
+            }
+        }
+    }
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
@@ -1989,6 +2026,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
         if (sched->obs_split_head != nullptr && split->graph.n_nodes > 0) {
             sched->obs_split_head(sched->obs_split_head_ud, split->graph.nodes[0], split_backend);
+        }
+
+        // the observer just decided whether this split has any work this step; an empty one is not
+        // submitted at all, and what a later split reads from it is zeroed instead
+        if (sched->skip_split != nullptr && split->graph.n_nodes > 0 &&
+                sched->skip_split(sched->skip_split_ud, split->graph.nodes[0], split_backend)) {
+            ggml_backend_sched_zero_split_outputs(sched, split_id);
+            continue;
         }
 
         // ensure the previous split's async work has completed before we start
@@ -2320,6 +2365,11 @@ void ggml_backend_sched_set_early_cpu_inputs(ggml_backend_sched_t sched, bool en
 void ggml_backend_sched_set_split_head_observer(ggml_backend_sched_t sched, ggml_backend_sched_split_head_fn fn, void * user_data) {
     sched->obs_split_head    = fn;
     sched->obs_split_head_ud = user_data;
+}
+
+void ggml_backend_sched_set_skip_split(ggml_backend_sched_t sched, ggml_backend_sched_skip_split_fn fn, void * user_data) {
+    sched->skip_split    = fn;
+    sched->skip_split_ud = user_data;
 }
 
 void ggml_backend_sched_set_realloc_callback(ggml_backend_sched_t sched, ggml_backend_sched_realloc_callback callback, void * user_data) {

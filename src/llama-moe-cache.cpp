@@ -1193,7 +1193,24 @@ static void pool_refresh_forms(llama_expert_pool_state & st) {
     }
 }
 
-
+// a split whose layer has no miss to compute this step is not submitted (see the sched hook)
+bool llama_expert_pool_skip_split(void * user_data, ggml_tensor * head, ggml_backend_t backend) {
+    llama_expert_pool_state & st = *static_cast<llama_expert_pool_state *>(user_data);
+    if (!st.skip_on || st.skip_miss.empty()) {
+        return false;
+    }
+    // only the miss chain runs on the CPU in a pooled layer's graph; the merge is on the device
+    if (ggml_backend_dev_type(ggml_backend_get_device(backend)) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+        return false;
+    }
+    int32_t il = -1;
+    bool lane  = false;
+    bool mount = false;
+    if (!split_head_match(st, head, il, lane, mount) || mount) {
+        return false;
+    }
+    return il >= 0 && (size_t) il < st.skip_miss.size() && st.skip_miss[il] != 0;
+}
 
 void llama_expert_pool_observe_split_head(void * user_data, ggml_tensor * head, ggml_backend_t backend) {
     llama_expert_pool_state & st = *(llama_expert_pool_state *) user_data;
@@ -1241,6 +1258,25 @@ void llama_expert_pool_observe_split_head(void * user_data, ggml_tensor * head, 
         const int32_t di = st.dev_of(il);
         if (di >= 0 && (size_t) di < st.devs.size() && st.lp_n_tok < llama_expert_pool_offload_min_batch()) {
             pool_plan_layer(st, *st.devs[di], il);
+        }
+        // how many ids will the CPU miss split actually compute? it gathers its ids from the host cpu_map,
+        // and the plan above just published, so read that table: entry >= 0 means non-resident, i.e. work
+        if (st.skip_on && (size_t) il < st.skip_miss.size()) {
+            const int32_t n_used = (size_t) il < st.ids.size() ? st.ids[il].n_used : 0;
+            const int64_t n_ids  = (int64_t) n_used * st.lp_n_tok;
+            ggml_tensor * cm = llama_expert_pool_cpu_map(st, il);
+            if (cm != nullptr && cm->data != nullptr && st.lp_n_tok > 0 &&
+                    st.lp_n_tok < llama_expert_pool_offload_min_batch() && (int64_t) st.ids_buf.size() >= n_ids) {
+                const int32_t * tab = (const int32_t *) cm->data;
+                int32_t n_post = 0;
+                for (int64_t i = 0; i < n_ids; ++i) {
+                    const int32_t e = st.ids_buf[(size_t) i];
+                    if (e >= 0 && e < st.n_expert && tab[e] >= 0) {
+                        n_post ++;
+                    }
+                }
+                st.skip_miss[il] = n_post == 0 ? 1 : 0;
+            }
         }
         // classify this layer's realized ids here: the snapshot above is the table state its lookups saw
         if (st.lp_n_ids > 0 && st.lp_n_tok > 0) {
@@ -1376,6 +1412,9 @@ void llama_expert_pool_account_ids(llama_expert_pool_state & st) {
     if (!st.direct_mount || st.pooled_layers.empty() || st.phase != llama_expert_pool_state::PHASE_FILLED) {
         return;
     }
+    // the next ubatch re-decides this at every layer point; a layer the next batch does not reach must
+    // not keep last step's answer (a stale 1 would skip a split that has work)
+    std::fill(st.skip_miss.begin(), st.skip_miss.end(), 0);
     // large batches are served by the scheduler's lane, not the pool: their ids are not pool hits
     int32_t n_tok_max = 0;
     for (size_t ilx = 0; ilx < st.pooled_layers.size(); ++ilx) {
@@ -1684,6 +1723,7 @@ static int32_t pool_plan_layer(llama_expert_pool_state & st, llama_expert_pool_s
     return pool_plan_rank(st, d, il, ai);
 }
 
+
 // ---------------------------------------------------------------
 // the pool driver: llama_context holds one instance. the entry points were moved verbatim from
 // llama-context.cpp; the context-owned names they reach go through `ctx`
@@ -1956,6 +1996,11 @@ void llama_expert_pool::expert_pool_init() {
             st.cnt_decay_hl = v;
         }
     }
+    // a layer that leaves nothing to the CPU this step does not submit its miss split (default; the
+    // env value 0 turns it off, which is the static A/B arm)
+    if (const char * s = getenv("LLAMA_EXPERT_POOL_SKIP_EMPTY")) {
+        st.skip_on = atoi(s) != 0;
+    }
     st.cnt_lambda   = std::pow(2.0f, -1.0f / (float) st.cnt_decay_hl);
     LLAMA_LOG_INFO("%s: expert pool: decaying counter, half-life %d layer visits (per-visit lambda %.6f)\n",
             __func__, st.cnt_decay_hl, st.cnt_lambda);
@@ -2102,6 +2147,7 @@ void llama_expert_pool::expert_pool_build() {
         st.plan_taken.assign(st.layers.size() * (size_t) st.n_expert, 0);
         st.rank.assign(st.layers.size(), {});
         st.miss_snap.assign(st.layers.size(), std::vector<int32_t>());
+        st.skip_miss.assign(st.layers.size(), 0);
     }
 
     // one group per (device, layout group), and one bank per kind

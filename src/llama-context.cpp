@@ -820,6 +820,7 @@ void llama_context::sched_reserve() {
     ggml_backend_sched_set_early_cpu_inputs(sched.get(), miss_strategy.layer_parallel);
     // serves the pool's statistics and the route observer: with or without a pool
     ggml_backend_sched_set_split_head_observer(sched.get(), llama_expert_pool_observe_split_head, &expert_pool->st);
+    ggml_backend_sched_set_skip_split(sched.get(), llama_expert_pool_skip_split, &expert_pool->st);
     expert_pool->st.sched = sched.get();
 
     expert_pool->expert_pool_init();
@@ -869,6 +870,7 @@ void llama_context::sched_reserve() {
                 ggml_backend_sched_set_early_cpu_inputs(sched.get(), llama_expert_pool_miss_strategy_of(cparams.expert_pool_miss_method).layer_parallel);
                 // serves the pool's statistics and the route observer: with or without a pool
                 ggml_backend_sched_set_split_head_observer(sched.get(), llama_expert_pool_observe_split_head, &expert_pool->st);
+                ggml_backend_sched_set_skip_split(sched.get(), llama_expert_pool_skip_split, &expert_pool->st);
     expert_pool->st.sched = sched.get();
                 gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
             }
